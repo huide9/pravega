@@ -252,10 +252,11 @@ public class ClientFactoryImpl implements ClientFactory, EventStreamClientFactor
         Preconditions.checkArgument(controller.isStreamCutValid(endStreamCut).equals(true));
 
         //* 2. check if the offsets are legal
-        startPositions.entrySet().stream().allMatch(s ->
+        Preconditions.checkArgument(startPositions.entrySet().stream().allMatch(s ->
                 endPositions.entrySet().stream().allMatch(e ->
                         e.getKey().getSegmentId() == s.getKey().getSegmentId() &&
-                                startPositions.get(s.getKey()) < endPositions.get(e.getKey())));
+                                startPositions.get(s.getKey()) < endPositions.get(e.getKey()))),
+                "Streamcut segment offset illegal.";
     }
 
 }
