@@ -44,17 +44,12 @@ import io.pravega.client.state.Update;
 import io.pravega.client.state.impl.RevisionedStreamClientImpl;
 import io.pravega.client.state.impl.StateSynchronizerImpl;
 import io.pravega.client.state.impl.UpdateOrInitSerializer;
-import io.pravega.client.stream.EventStreamReader;
-import io.pravega.client.stream.EventStreamWriter;
-import io.pravega.client.stream.EventWriterConfig;
-import io.pravega.client.stream.InvalidStreamException;
-import io.pravega.client.stream.ReaderConfig;
-import io.pravega.client.stream.Serializer;
-import io.pravega.client.stream.Stream;
-import io.pravega.client.stream.TransactionalEventStreamWriter;
+import io.pravega.client.stream.*;
 import io.pravega.common.concurrent.ExecutorServiceHelpers;
 import io.pravega.common.concurrent.Futures;
 import io.pravega.shared.NameUtils;
+
+import java.util.Map;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
@@ -237,6 +232,30 @@ public class ClientFactoryImpl implements ClientFactory, EventStreamClientFactor
     public void close() {
         controller.close();
         connectionFactory.close();
+    }
+
+    public void validateStartAndEndStreamCuts(final ReaderGroupConfig readerGroupConfig) {
+        readerGroupConfig.getEndingStreamCuts().entrySet().stream().filter(e -> !e.getValue().equals(StreamCut.UNBOUNDED))
+                .forEach(e -> {
+                    if (readerGroupConfig.getStartingStreamCuts().get(e.getKey()) != StreamCut.UNBOUNDED) {
+                        verifyStartAndEndStreamCuts(readerGroupConfig.getStartingStreamCuts().get(e.getKey()), e.getValue());
+                    }
+                });
+    }
+
+    private void verifyStartAndEndStreamCuts(final StreamCut startStreamCut, final StreamCut endStreamCut) {
+        final Map<Segment, Long> startPositions = startStreamCut.asImpl().getPositions();
+        final Map<Segment, Long> endPositions = endStreamCut.asImpl().getPositions();
+
+        //* 1. verify both stream cut satisfy the "cover full key space" and "no key space overlap" in each of the streamcuts
+        Preconditions.checkArgument(controller.isStreamCutValid(startStreamCut).equals(true));
+        Preconditions.checkArgument(controller.isStreamCutValid(endStreamCut).equals(true));
+
+        //* 2. check if the offsets are legal
+        startPositions.entrySet().stream().allMatch(s ->
+                endPositions.entrySet().stream().allMatch(e ->
+                        e.getKey().getSegmentId() == s.getKey().getSegmentId() &&
+                                startPositions.get(s.getKey()) < endPositions.get(e.getKey())));
     }
 
 }
