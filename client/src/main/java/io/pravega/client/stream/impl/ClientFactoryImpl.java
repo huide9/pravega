@@ -256,7 +256,7 @@ public class ClientFactoryImpl implements ClientFactory, EventStreamClientFactor
                 endPositions.entrySet().stream().allMatch(e ->
                         e.getKey().getSegmentId() == s.getKey().getSegmentId() &&
                                 startPositions.get(s.getKey()) < endPositions.get(e.getKey()))),
-                "Streamcut segment offset illegal.";
+                "Streamcut segment offset illegal.");
     }
 
 }
