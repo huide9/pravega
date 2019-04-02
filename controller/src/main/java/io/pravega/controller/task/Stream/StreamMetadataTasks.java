@@ -114,17 +114,37 @@ public class StreamMetadataTasks extends TaskBase {
     private final RequestTracker requestTracker;
 
     public StreamMetadataTasks(final StreamMetadataStore streamMetadataStore,
-                               BucketStore bucketStore, final HostControllerStore hostControllerStore, final TaskMetadataStore taskMetadataStore,
-                               final SegmentHelper segmentHelper, final ScheduledExecutorService executor, final String hostId,
-                               final ConnectionFactory connectionFactory, AuthHelper authHelper, RequestTracker requestTracker) {
-        this(streamMetadataStore, bucketStore, hostControllerStore, taskMetadataStore, segmentHelper, executor, new Context(hostId),
-                connectionFactory, authHelper, requestTracker);
+                               BucketStore bucketStore,
+                               final HostControllerStore hostControllerStore,
+                               final TaskMetadataStore taskMetadataStore,
+                               final SegmentHelper segmentHelper,
+                               final ScheduledExecutorService executor,
+                               final String hostId,
+                               final ConnectionFactory connectionFactory,
+                               AuthHelper authHelper,
+                               RequestTracker requestTracker) {
+        this(streamMetadataStore,
+                bucketStore,
+                hostControllerStore,
+                taskMetadataStore,
+                segmentHelper,
+                executor,
+                new Context(hostId),
+                connectionFactory,
+                authHelper,
+                requestTracker);
     }
 
     private StreamMetadataTasks(final StreamMetadataStore streamMetadataStore,
-                                BucketStore bucketStore, final HostControllerStore hostControllerStore, final TaskMetadataStore taskMetadataStore,
-                                final SegmentHelper segmentHelper, final ScheduledExecutorService executor, final Context context,
-                                ConnectionFactory connectionFactory, AuthHelper authHelper, RequestTracker requestTracker) {
+                                BucketStore bucketStore,
+                                final HostControllerStore hostControllerStore,
+                                final TaskMetadataStore taskMetadataStore,
+                                final SegmentHelper segmentHelper,
+                                final ScheduledExecutorService executor,
+                                final Context context,
+                                ConnectionFactory connectionFactory,
+                                AuthHelper authHelper,
+                                RequestTracker requestTracker) {
         super(taskMetadataStore, executor, context);
         this.streamMetadataStore = streamMetadataStore;
         this.bucketStore = bucketStore;
