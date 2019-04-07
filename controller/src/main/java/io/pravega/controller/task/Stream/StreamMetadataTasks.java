@@ -366,7 +366,7 @@ public class StreamMetadataTasks extends TaskBase {
                 // 4. check for truncation to complete
                 .thenCompose(truncationStarted -> {
                     if (truncationStarted) {
-                        return checkDone(() -> isTruncated(scope, stream, streamCut, context))
+                        return checkDone(() -> isTruncated(scope, stream, streamCut, context), 1000L)
                                 .thenApply(y -> UpdateStreamStatus.Status.SUCCESS);
                     } else {
                         log.warn(requestId, "Unable to start truncation for {}/{}", scope, stream);
