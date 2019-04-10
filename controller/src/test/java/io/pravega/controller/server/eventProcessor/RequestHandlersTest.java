@@ -31,14 +31,12 @@ import io.pravega.controller.server.eventProcessor.requesthandlers.StreamRequest
 import io.pravega.controller.server.eventProcessor.requesthandlers.TruncateStreamTask;
 import io.pravega.controller.server.eventProcessor.requesthandlers.UpdateStreamTask;
 import io.pravega.controller.server.rpc.auth.AuthHelper;
-import io.pravega.controller.store.host.HostControllerStore;
-import io.pravega.controller.store.host.HostStoreFactory;
-import io.pravega.controller.store.host.impl.HostMonitorConfigImpl;
 import io.pravega.controller.store.stream.BucketStore;
 import io.pravega.controller.store.stream.State;
 import io.pravega.controller.store.stream.StoreException;
 import io.pravega.controller.store.stream.StreamMetadataStore;
 import io.pravega.controller.store.stream.StreamStoreFactory;
+import io.pravega.controller.store.stream.Version;
 import io.pravega.controller.store.stream.VersionedMetadata;
 import io.pravega.controller.store.stream.VersionedTransactionData;
 import io.pravega.controller.store.stream.records.CommittingTransactionsRecord;
@@ -88,21 +86,21 @@ import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.*;
 
-public class RequestHandlersTest {
+public abstract class RequestHandlersTest {
+    protected ScheduledExecutorService executor = Executors.newScheduledThreadPool(10);
+    protected CuratorFramework zkClient;
+
     private final String scope = "scope";
     private RequestTracker requestTracker = new RequestTracker(true);
 
-    private ScheduledExecutorService executor = Executors.newScheduledThreadPool(10);
     private StreamMetadataStore streamStore;
     private BucketStore bucketStore;
     private TaskMetadataStore taskMetadataStore;
-    private HostControllerStore hostStore;
     private StreamMetadataTasks streamMetadataTasks;
     private StreamTransactionMetadataTasks streamTransactionMetadataTasks;
 
     private TestingServer zkServer;
 
-    private CuratorFramework zkClient;
     private EventStreamClientFactory clientFactory;
     private ConnectionFactoryImpl connectionFactory;
     private SegmentHelper segmentHelper;
@@ -125,24 +123,23 @@ public class RequestHandlersTest {
             hostId = UUID.randomUUID().toString();
         }
 
-        streamStore = spy(StreamStoreFactory.createZKStore(zkClient, executor));
+        streamStore = spy(getStore());
         bucketStore = StreamStoreFactory.createZKBucketStore(zkClient, executor);
 
         taskMetadataStore = TaskStoreFactory.createZKStore(zkClient, executor);
-
-        hostStore = HostStoreFactory.createInMemoryStore(HostMonitorConfigImpl.dummyConfig());
-
-        segmentHelper = SegmentHelperMock.getSegmentHelperMock();
+        
         connectionFactory = new ConnectionFactoryImpl(ClientConfig.builder().build());
+        segmentHelper = SegmentHelperMock.getSegmentHelperMock();
         clientFactory = mock(EventStreamClientFactory.class);
+        streamMetadataTasks = new StreamMetadataTasks(streamStore, bucketStore, taskMetadataStore, segmentHelper,
+                executor, hostId, AuthHelper.getDisabledAuthHelper(), requestTracker);
         doAnswer(x -> new EventStreamWriterMock<>()).when(clientFactory).createEventWriter(anyString(), any(), any());
-        streamMetadataTasks = new StreamMetadataTasks(streamStore, bucketStore, hostStore, taskMetadataStore, segmentHelper,
-                executor, hostId, connectionFactory, AuthHelper.getDisabledAuthHelper(), requestTracker);
+        streamMetadataTasks = new StreamMetadataTasks(streamStore, bucketStore, taskMetadataStore, segmentHelper,
+                executor, hostId, AuthHelper.getDisabledAuthHelper(), requestTracker);
         streamMetadataTasks.initializeStreamWriters(clientFactory, Config.SCALE_STREAM_NAME);
-        streamTransactionMetadataTasks = new StreamTransactionMetadataTasks(streamStore, hostStore,
-                segmentHelper, executor, hostId, connectionFactory, AuthHelper.getDisabledAuthHelper());
-        streamTransactionMetadataTasks.initializeStreamWriters("commitStream", new EventStreamWriterMock<>(), 
-                "abortStream", new EventStreamWriterMock<>());
+        streamTransactionMetadataTasks = new StreamTransactionMetadataTasks(streamStore, 
+                segmentHelper, executor, hostId, AuthHelper.getDisabledAuthHelper());
+        streamTransactionMetadataTasks.initializeStreamWriters(new EventStreamWriterMock<>(), new EventStreamWriterMock<>());
         long createTimestamp = System.currentTimeMillis();
 
         // add a host in zk
@@ -151,12 +148,15 @@ public class RequestHandlersTest {
         streamStore.createScope(scope).get();
     }
 
+    abstract StreamMetadataStore getStore();
+
     @After
     public void tearDown() throws Exception {
         clientFactory.close();
         connectionFactory.close();
         streamMetadataTasks.close();
         streamTransactionMetadataTasks.close();
+        streamStore.close();
         zkClient.close();
         zkServer.close();
         ExecutorServiceHelpers.shutdown(executor);
@@ -164,19 +164,22 @@ public class RequestHandlersTest {
 
     @SuppressWarnings("unchecked")
     @Test(timeout = 300000)
-    public void testConcurrentIdempotentCommitTxnRequest() {
+    public void testConcurrentIdempotentCommitTxnRequest() throws Exception {
         Map<String, Integer> map = new HashMap<>();
         map.put("startRollingTxn", 0);
         map.put("rollingTxnCreateDuplicateEpochs", 0);
         map.put("completeRollingTxn", 0);
         map.put("startCommitTransactions", 1);
+        map.put("updateVersionedState", 0);
         map.put("completeCommitTransactions", 1);
+        // first job should find no transactions and do nothing
         concurrentTxnCommit("commit1", "startCommitTransactions", false,
                 e -> Exceptions.unwrap(e) instanceof StoreException.WriteConflictException, map, 3);
         map.put("updateVersionedState", 1);
 
         map.put("startCommitTransactions", 1);
         map.put("completeCommitTransactions", 1);
+        // first job should fail to update committing transaction record with write conflict. 
         concurrentTxnCommit("commit2", "completeCommitTransactions", true,
                 e -> Exceptions.unwrap(e) instanceof StoreException.WriteConflictException, map, 2);
     }
@@ -184,44 +187,35 @@ public class RequestHandlersTest {
     private void concurrentTxnCommit(String stream, String func,
                                      boolean expectFailureOnFirstJob,
                                      Predicate<Throwable> firstExceptionPredicate,
-                                     Map<String, Integer> invocationCount, int expectedVersion) {
-        StreamMetadataStore streamStore1 = StreamStoreFactory.createZKStore(zkClient, executor);
-        StreamMetadataStore streamStore1Spied = spy(StreamStoreFactory.createZKStore(zkClient, executor));
+                                     Map<String, Integer> invocationCount, int expectedVersion) throws Exception {
+        StreamMetadataStore streamStore1 = getStore();
+        StreamMetadataStore streamStore1Spied = spy(getStore());
         StreamConfiguration config = StreamConfiguration.builder().scalingPolicy(
                 ScalingPolicy.byEventRate(1, 2, 1)).build();
         streamStore1.createStream(scope, stream, config, System.currentTimeMillis(), null, executor).join();
         streamStore1.setState(scope, stream, State.ACTIVE, null, executor).join();
 
-        StreamMetadataStore streamStore2 = StreamStoreFactory.createZKStore(zkClient, executor);
+        StreamMetadataStore streamStore2 = getStore();
 
         CommitRequestHandler requestHandler1 = new CommitRequestHandler(streamStore1Spied, streamMetadataTasks, streamTransactionMetadataTasks, executor);
         CommitRequestHandler requestHandler2 = new CommitRequestHandler(streamStore2, streamMetadataTasks, streamTransactionMetadataTasks, executor);
-        ScaleOperationTask scaleRequesthandler = new ScaleOperationTask(streamMetadataTasks, streamStore2, executor);
-
-        // create txn on epoch 0
+        
+        // create txn on epoch 0 and set it to committing
         UUID txnId = streamStore1.generateTransactionId(scope, stream, null, executor).join();
         VersionedTransactionData txnEpoch0 = streamStore1.createTransaction(scope, stream, txnId, 1000L, 10000L, null, executor).join();
         streamStore1.sealTransaction(scope, stream, txnId, true, Optional.of(txnEpoch0.getVersion()), null, executor).join();
-        // perform scale
-        ScaleOpEvent event = new ScaleOpEvent(scope, stream, Lists.newArrayList(0L),
-                Lists.newArrayList(new AbstractMap.SimpleEntry<>(0.0, 1.0)), false, System.currentTimeMillis(),
-                System.currentTimeMillis());
-        scaleRequesthandler.execute(event).join();
-
-        txnId = streamStore1.generateTransactionId(scope, stream, null, executor).join();
-        VersionedTransactionData txnEpoch1 = streamStore1.createTransaction(scope, stream, txnId, 1000L, 10000L, null, executor).join();
-        streamStore1.sealTransaction(scope, stream, txnId, true, Optional.of(txnEpoch1.getVersion()), null, executor).join();
 
         // regular commit
         // start commit transactions
         CompletableFuture<Void> wait = new CompletableFuture<>();
         CompletableFuture<Void> signal = new CompletableFuture<>();
 
-        CommitEvent commitOnEpoch1 = new CommitEvent(scope, stream, 1);
+        CommitEvent commitOnEpoch1 = new CommitEvent(scope, stream, 0);
 
         setMockCommitTxnLatch(streamStore1, streamStore1Spied, func, signal, wait);
 
-        CompletableFuture<Void> future1 = requestHandler1.execute(commitOnEpoch1);
+        CompletableFuture<Void> future1 = CompletableFuture.completedFuture(null)
+                                                           .thenComposeAsync(v -> requestHandler1.execute(commitOnEpoch1), executor);
 
         signal.join();
         // let this run to completion. this should succeed 
@@ -231,20 +225,23 @@ public class RequestHandlersTest {
 
         if (expectFailureOnFirstJob) {
             AssertExtensions.assertSuppliedFutureThrows("first commit should fail", () -> future1, firstExceptionPredicate);
-            verify(streamStore1Spied, times(invocationCount.get("startCommitTransactions")))
-                    .startCommitTransactions(anyString(), anyString(), anyInt(), any(), any());
-            verify(streamStore1Spied, times(invocationCount.get("completeCommitTransactions")))
-                    .completeCommitTransactions(anyString(), anyString(), any(), any(), any());
-            verify(streamStore1Spied, times(invocationCount.get("updateVersionedState")))
-                    .updateVersionedState(anyString(), anyString(), any(), any(), any(), any());
         } else {
             future1.join();
         }
 
+        verify(streamStore1Spied, times(invocationCount.get("startCommitTransactions")))
+                .startCommitTransactions(anyString(), anyString(), any(), any());
+        verify(streamStore1Spied, times(invocationCount.get("completeCommitTransactions")))
+                .completeCommitTransactions(anyString(), anyString(), any(), any(), any());
+        verify(streamStore1Spied, times(invocationCount.get("updateVersionedState")))
+                .updateVersionedState(anyString(), anyString(), any(), any(), any(), any());
+
         VersionedMetadata<CommittingTransactionsRecord> versioned = streamStore1.getVersionedCommittingTransactionsRecord(scope, stream, null, executor).join();
         assertEquals(CommittingTransactionsRecord.EMPTY, versioned.getObject());
-        assertEquals(expectedVersion, versioned.getVersion().asIntVersion().getIntValue());
+        assertEquals(expectedVersion, getVersionNumber(versioned.getVersion()));
         assertEquals(State.ACTIVE, streamStore1.getState(scope, stream, true, null, executor).join());
+        streamStore1.close();
+        streamStore2.close();
     }
 
 
@@ -256,25 +253,36 @@ public class RequestHandlersTest {
         map.put("rollingTxnCreateDuplicateEpochs", 0);
         map.put("completeRollingTxn", 0);
         map.put("startCommitTransactions", 1);
-        map.put("completeCommitTransactions", 1);
+        map.put("completeCommitTransactions", 0);
         map.put("updateVersionedState", 1);
+        // first job will wait at startCommitTransaction.
+        // second job will complete transaction with rolling transaction. 
+        // first job will complete having found no new transactions to commit
         concurrentRollingTxnCommit("stream1", "startCommitTransactions", false,
                 e -> Exceptions.unwrap(e) instanceof StoreException.WriteConflictException, map, 4);
 
         map.put("startRollingTxn", 1);
         map.put("completeCommitTransactions", 0);
+        // first job has created the committing transaction record. second job will mark it as rolling txn and complete
+        // rolling transaction
+        // first job will fail in its attempt to update CTR. 
         concurrentRollingTxnCommit("stream2", "startRollingTxn", true,
                 e -> Exceptions.unwrap(e) instanceof StoreException.WriteConflictException, map, 3);
 
         map.put("rollingTxnCreateDuplicateEpochs", 1);
         map.put("completeRollingTxn", 1);
         map.put("completeCommitTransactions", 1);
+        // first job has created rolling transcation's duplicate epochs. second job will complete rolling transaction
+        // first job should complete rolling transaction's steps (idempotent) but will fail with write conflict 
+        // in attempt to update CTR during completeCommitTransaction phase. 
         concurrentRollingTxnCommit("stream3", "rollingTxnCreateDuplicateEpochs", true,
                 e -> Exceptions.unwrap(e) instanceof StoreException.WriteConflictException, map, 3);
-
+        
+        // same as above
         concurrentRollingTxnCommit("stream4", "completeRollingTxn", true,
                 e -> Exceptions.unwrap(e) instanceof StoreException.WriteConflictException, map, 3);
 
+        // same as above
         concurrentRollingTxnCommit("stream5", "completeCommitTransactions", true,
                 e -> Exceptions.unwrap(e) instanceof StoreException.WriteConflictException, map, 3);
     }
@@ -283,20 +291,20 @@ public class RequestHandlersTest {
                                             boolean expectFailureOnFirstJob,
                                             Predicate<Throwable> firstExceptionPredicate,
                                             Map<String, Integer> invocationCount, int expectedVersion) {
-        StreamMetadataStore streamStore1 = StreamStoreFactory.createZKStore(zkClient, executor);
-        StreamMetadataStore streamStore1Spied = spy(StreamStoreFactory.createZKStore(zkClient, executor));
+        StreamMetadataStore streamStore1 = getStore();
+        StreamMetadataStore streamStore1Spied = spy(getStore());
         StreamConfiguration config = StreamConfiguration.builder().scalingPolicy(
                 ScalingPolicy.byEventRate(1, 2, 1)).build();
         streamStore1.createStream(scope, stream, config, System.currentTimeMillis(), null, executor).join();
         streamStore1.setState(scope, stream, State.ACTIVE, null, executor).join();
 
-        StreamMetadataStore streamStore2 = StreamStoreFactory.createZKStore(zkClient, executor);
+        StreamMetadataStore streamStore2 = getStore();
 
         CommitRequestHandler requestHandler1 = new CommitRequestHandler(streamStore1Spied, streamMetadataTasks, streamTransactionMetadataTasks, executor);
         CommitRequestHandler requestHandler2 = new CommitRequestHandler(streamStore2, streamMetadataTasks, streamTransactionMetadataTasks, executor);
         ScaleOperationTask scaleRequesthandler = new ScaleOperationTask(streamMetadataTasks, streamStore2, executor);
 
-        // create txn on epoch 0
+        // create txn on epoch 0 and set it to committing
         UUID txnId = streamStore1.generateTransactionId(scope, stream, null, executor).join();
         VersionedTransactionData txnEpoch0 = streamStore1.createTransaction(scope, stream, txnId, 1000L, 10000L, null, executor).join();
         streamStore1.sealTransaction(scope, stream, txnId, true, Optional.of(txnEpoch0.getVersion()), null, executor).join();
@@ -305,24 +313,21 @@ public class RequestHandlersTest {
                 Lists.newArrayList(new AbstractMap.SimpleEntry<>(0.0, 1.0)), false, System.currentTimeMillis(),
                 System.currentTimeMillis());
         scaleRequesthandler.execute(event).join();
-
-        txnId = streamStore1.generateTransactionId(scope, stream, null, executor).join();
-        VersionedTransactionData txnEpoch1 = streamStore1.createTransaction(scope, stream, txnId, 1000L, 10000L, null, executor).join();
-        streamStore1.sealTransaction(scope, stream, txnId, true, Optional.of(txnEpoch1.getVersion()), null, executor).join();
-
+        
         // regular commit
         // start commit transactions
         CompletableFuture<Void> wait = new CompletableFuture<>();
         CompletableFuture<Void> signal = new CompletableFuture<>();
 
-        // test rolling transaction
+        // test rolling transaction --> since transaction on epoch 0 is committing, it will get committed first.
         CommitEvent commitOnEpoch0 = new CommitEvent(scope, stream, 0);
 
         setMockCommitTxnLatch(streamStore1, streamStore1Spied, func, signal, wait);
 
         // start rolling txn
         // stall rolling transaction in different stages
-        CompletableFuture<Void> future1Rolling = requestHandler1.execute(commitOnEpoch0);
+        CompletableFuture<Void> future1Rolling = CompletableFuture.completedFuture(null)
+                                                                  .thenComposeAsync(v -> requestHandler1.execute(commitOnEpoch0), executor);
         signal.join();
         requestHandler2.execute(commitOnEpoch0).join();
         wait.complete(null);
@@ -330,7 +335,7 @@ public class RequestHandlersTest {
         if (expectFailureOnFirstJob) {
             AssertExtensions.assertSuppliedFutureThrows("first commit should fail", () -> future1Rolling, firstExceptionPredicate);
             verify(streamStore1Spied, times(invocationCount.get("startCommitTransactions")))
-                    .startCommitTransactions(anyString(), anyString(), anyInt(), any(), any());
+                    .startCommitTransactions(anyString(), anyString(), any(), any());
             verify(streamStore1Spied, times(invocationCount.get("startRollingTxn"))).startRollingTxn(anyString(), anyString(), anyInt(), any(), any(), any());
             verify(streamStore1Spied, times(invocationCount.get("rollingTxnCreateDuplicateEpochs")))
                     .rollingTxnCreateDuplicateEpochs(anyString(), anyString(), any(), anyLong(), any(), any(), any());
@@ -343,10 +348,10 @@ public class RequestHandlersTest {
         } else {
             future1Rolling.join();
         }
-        // validate rolling txn done
+        // validate rolling txn done and first job has updated the CTR with new txn record
         VersionedMetadata<CommittingTransactionsRecord> versioned = streamStore1.getVersionedCommittingTransactionsRecord(scope, stream, null, executor).join();
         assertEquals(CommittingTransactionsRecord.EMPTY, versioned.getObject());
-        assertEquals(expectedVersion, versioned.getVersion().asIntVersion().getIntValue());
+        assertEquals(expectedVersion, getVersionNumber(versioned.getVersion()));
         assertEquals(3, streamStore1.getActiveEpoch(scope, stream, null, true, executor).join().getEpoch());
         assertEquals(State.ACTIVE, streamStore1.getState(scope, stream, true, null, executor).join());
     }
@@ -359,8 +364,8 @@ public class RequestHandlersTest {
                     signal.complete(null);
                     waitOn.join();
                     return store.startCommitTransactions(x.getArgument(0), x.getArgument(1),
-                            x.getArgument(2), x.getArgument(3), x.getArgument(4));
-                }).when(spied).startCommitTransactions(anyString(), anyString(), anyInt(), any(), any());
+                            x.getArgument(2), x.getArgument(3));
+                }).when(spied).startCommitTransactions(anyString(), anyString(), any(), any());
                 break;
             case "completeCommitTransactions":
                 doAnswer(x -> {
@@ -411,16 +416,16 @@ public class RequestHandlersTest {
     // concurrent update stream
     @SuppressWarnings("unchecked")
     @Test(timeout = 300000)
-    public void concurrentUpdateStream() {
+    public void concurrentUpdateStream() throws Exception {
         String stream = "update";
-        StreamMetadataStore streamStore1 = StreamStoreFactory.createZKStore(zkClient, executor);
-        StreamMetadataStore streamStore1Spied = spy(StreamStoreFactory.createZKStore(zkClient, executor));
+        StreamMetadataStore streamStore1 = getStore();
+        StreamMetadataStore streamStore1Spied = spy(getStore());
         StreamConfiguration config = StreamConfiguration.builder().scalingPolicy(
                 ScalingPolicy.byEventRate(1, 2, 1)).build();
         streamStore1.createStream(scope, stream, config, System.currentTimeMillis(), null, executor).join();
         streamStore1.setState(scope, stream, State.ACTIVE, null, executor).join();
 
-        StreamMetadataStore streamStore2 = StreamStoreFactory.createZKStore(zkClient, executor);
+        StreamMetadataStore streamStore2 = getStore();
 
         UpdateStreamTask requestHandler1 = new UpdateStreamTask(streamMetadataTasks, streamStore1Spied, bucketStore, executor);
         UpdateStreamTask requestHandler2 = new UpdateStreamTask(streamMetadataTasks, streamStore2, bucketStore, executor);
@@ -439,7 +444,8 @@ public class RequestHandlersTest {
                     x.getArgument(2), x.getArgument(3), x.getArgument(4));
         }).when(streamStore1Spied).completeUpdateConfiguration(anyString(), anyString(), any(), any(), any());
 
-        CompletableFuture<Void> future1 = requestHandler1.execute(event);
+        CompletableFuture<Void> future1 = CompletableFuture.completedFuture(null)
+                                                           .thenComposeAsync(v -> requestHandler1.execute(event), executor);
         signal.join();
         requestHandler2.execute(event).join();
         wait.complete(null);
@@ -450,23 +456,27 @@ public class RequestHandlersTest {
         // validate rolling txn done
         VersionedMetadata<StreamConfigurationRecord> versioned = streamStore1.getConfigurationRecord(scope, stream, null, executor).join();
         assertFalse(versioned.getObject().isUpdating());
-        assertEquals(2, versioned.getVersion().asIntVersion().getIntValue());
+        assertEquals(2, getVersionNumber(versioned.getVersion()));
         assertEquals(State.ACTIVE, streamStore1.getState(scope, stream, true, null, executor).join());
+        streamStore1.close();
+        streamStore2.close();
     }
+
+    abstract int getVersionNumber(Version version); 
 
     // concurrent truncate stream
     @SuppressWarnings("unchecked")
     @Test(timeout = 300000)
-    public void concurrentTruncateStream() {
+    public void concurrentTruncateStream() throws Exception {
         String stream = "update";
-        StreamMetadataStore streamStore1 = StreamStoreFactory.createZKStore(zkClient, executor);
-        StreamMetadataStore streamStore1Spied = spy(StreamStoreFactory.createZKStore(zkClient, executor));
+        StreamMetadataStore streamStore1 = getStore();
+        StreamMetadataStore streamStore1Spied = spy(getStore());
         StreamConfiguration config = StreamConfiguration.builder().scalingPolicy(
                 ScalingPolicy.byEventRate(1, 2, 1)).build();
         streamStore1.createStream(scope, stream, config, System.currentTimeMillis(), null, executor).join();
         streamStore1.setState(scope, stream, State.ACTIVE, null, executor).join();
 
-        StreamMetadataStore streamStore2 = StreamStoreFactory.createZKStore(zkClient, executor);
+        StreamMetadataStore streamStore2 = getStore();
 
         TruncateStreamTask requestHandler1 = new TruncateStreamTask(streamMetadataTasks, streamStore1Spied, executor);
         TruncateStreamTask requestHandler2 = new TruncateStreamTask(streamMetadataTasks, streamStore2, executor);
@@ -488,7 +498,8 @@ public class RequestHandlersTest {
                     x.getArgument(2), x.getArgument(3), x.getArgument(4));
         }).when(streamStore1Spied).completeTruncation(anyString(), anyString(), any(), any(), any());
 
-        CompletableFuture<Void> future1 = requestHandler1.execute(event);
+        CompletableFuture<Void> future1 = CompletableFuture.completedFuture(null)
+                         .thenComposeAsync(v -> requestHandler1.execute(event), executor);
         signal.join();
         requestHandler2.execute(event).join();
         wait.complete(null);
@@ -499,8 +510,10 @@ public class RequestHandlersTest {
         // validate rolling txn done
         VersionedMetadata<StreamTruncationRecord> versioned = streamStore1.getTruncationRecord(scope, stream, null, executor).join();
         assertFalse(versioned.getObject().isUpdating());
-        assertEquals(2, versioned.getVersion().asIntVersion().getIntValue());
+        assertEquals(2, getVersionNumber(versioned.getVersion()));
         assertEquals(State.ACTIVE, streamStore1.getState(scope, stream, true, null, executor).join());
+        streamStore1.close();
+        streamStore2.close();
     }
     
     @Test
@@ -570,7 +583,7 @@ public class RequestHandlersTest {
 
         // 1. set segment helper mock to throw exception
         doAnswer(x -> Futures.failedFuture(new RuntimeException()))
-                .when(segmentHelper).sealSegment(anyString(), anyString(), anyLong(), any(), any(), anyString(), anyLong());
+                .when(segmentHelper).sealSegment(anyString(), anyString(), anyLong(), anyString(), anyLong());
         
         // 2. start scale --> this should fail with a retryable exception while talking to segment store!
         ScaleOpEvent scaleEvent = new ScaleOpEvent(fairness, fairness, Collections.singletonList(0L), 
@@ -586,7 +599,7 @@ public class RequestHandlersTest {
         
         // 4. reset segment helper to return success
         doAnswer(x -> CompletableFuture.completedFuture(true))
-                .when(segmentHelper).sealSegment(anyString(), anyString(), anyLong(), any(), any(), anyString(), anyLong());
+                .when(segmentHelper).sealSegment(anyString(), anyString(), anyLong(), anyString(), anyLong());
         
         // 5. process again. it should succeed while ignoring waiting processor
         streamRequestHandler.process(scaleEvent).join();
@@ -620,7 +633,7 @@ public class RequestHandlersTest {
 
         // 1. set segment helper mock to throw exception
         doAnswer(x -> Futures.failedFuture(new RuntimeException()))
-                .when(segmentHelper).updatePolicy(anyString(), anyString(), any(), anyLong(), any(), any(), anyString(), anyLong());
+                .when(segmentHelper).updatePolicy(anyString(), anyString(), any(), anyLong(), anyString(), anyLong());
         
         // 2. start process --> this should fail with a retryable exception while talking to segment store!
         streamStore.startUpdateConfiguration(fairness, fairness, StreamConfiguration.builder().scalingPolicy(ScalingPolicy.fixed(1)).build(),
@@ -632,14 +645,14 @@ public class RequestHandlersTest {
         AssertExtensions.assertFutureThrows("", streamRequestHandler.process(event),
                 e -> Exceptions.unwrap(e) instanceof RuntimeException);
 
-        verify(segmentHelper, atLeastOnce()).updatePolicy(anyString(), anyString(), any(), anyLong(), any(), any(), anyString(), anyLong());
+        verify(segmentHelper, atLeastOnce()).updatePolicy(anyString(), anyString(), any(), anyLong(), anyString(), anyLong());
         
         // 3. set waiting processor to "random name"
         streamStore.createWaitingRequestIfAbsent(fairness, fairness, "myProcessor", null, executor).join();
         
         // 4. reset segment helper to return success
         doAnswer(x -> CompletableFuture.completedFuture(null))
-                .when(segmentHelper).updatePolicy(anyString(), anyString(), any(), anyLong(), any(), any(), anyString(), anyLong());
+                .when(segmentHelper).updatePolicy(anyString(), anyString(), any(), anyLong(), anyString(), anyLong());
         
         // 5. process again. it should succeed while ignoring waiting processor
         streamRequestHandler.process(event).join();
@@ -669,7 +682,7 @@ public class RequestHandlersTest {
 
         // 1. set segment helper mock to throw exception
         doAnswer(x -> Futures.failedFuture(new RuntimeException()))
-                .when(segmentHelper).truncateSegment(anyString(), anyString(), anyLong(), anyLong(), any(), any(), anyString(), anyLong());
+                .when(segmentHelper).truncateSegment(anyString(), anyString(), anyLong(), anyLong(), anyString(), anyLong());
         
         // 2. start process --> this should fail with a retryable exception while talking to segment store!
         streamStore.startTruncation(fairness, fairness, Collections.singletonMap(0L, 0L), null, executor).join();
@@ -680,14 +693,14 @@ public class RequestHandlersTest {
         AssertExtensions.assertFutureThrows("", streamRequestHandler.process(event),
                 e -> Exceptions.unwrap(e) instanceof RuntimeException);
 
-        verify(segmentHelper, atLeastOnce()).truncateSegment(anyString(), anyString(), anyLong(), anyLong(), any(), any(), anyString(), anyLong());
+        verify(segmentHelper, atLeastOnce()).truncateSegment(anyString(), anyString(), anyLong(), anyLong(), anyString(), anyLong());
         
         // 3. set waiting processor to "random name"
         streamStore.createWaitingRequestIfAbsent(fairness, fairness, "myProcessor", null, executor).join();
         
         // 4. reset segment helper to return success
         doAnswer(x -> CompletableFuture.completedFuture(null))
-                .when(segmentHelper).truncateSegment(anyString(), anyString(), anyLong(), anyLong(), any(), any(), anyString(), anyLong());
+                .when(segmentHelper).truncateSegment(anyString(), anyString(), anyLong(), anyLong(), anyString(), anyLong());
         
         // 5. process again. it should succeed while ignoring waiting processor
         streamRequestHandler.process(event).join();
@@ -713,9 +726,9 @@ public class RequestHandlersTest {
         
         // 1. set segment helper mock to throw exception
         doAnswer(x -> Futures.failedFuture(new RuntimeException()))
-                .when(segmentHelper).commitTransaction(anyString(), anyString(), anyLong(), anyLong(), any(), any(), any(), anyString());
+                .when(segmentHelper).commitTransaction(anyString(), anyString(), anyLong(), anyLong(), any(), anyString());
         
-        streamStore.startCommitTransactions(fairness, fairness, 0, null, executor).join();
+        streamStore.startCommitTransactions(fairness, fairness, null, executor).join();
         
         // 2. start process --> this should fail with a retryable exception while talking to segment store!
         streamStore.setState(fairness, fairness, State.COMMITTING_TXN, null, executor).join();
@@ -726,14 +739,14 @@ public class RequestHandlersTest {
         AssertExtensions.assertFutureThrows("", requestHandler.process(event),
                 e -> Exceptions.unwrap(e) instanceof RuntimeException);
 
-        verify(segmentHelper, atLeastOnce()).commitTransaction(anyString(), anyString(), anyLong(), anyLong(), any(), any(), any(), anyString());
+        verify(segmentHelper, atLeastOnce()).commitTransaction(anyString(), anyString(), anyLong(), anyLong(), any(), anyString());
         
         // 3. set waiting processor to "random name"
         streamStore.createWaitingRequestIfAbsent(fairness, fairness, "myProcessor", null, executor).join();
         
         // 4. reset segment helper to return success
         doAnswer(x -> CompletableFuture.completedFuture(null))
-                .when(segmentHelper).commitTransaction(anyString(), anyString(), anyLong(), anyLong(), any(), any(), any(), anyString());
+                .when(segmentHelper).commitTransaction(anyString(), anyString(), anyLong(), anyLong(), any(), anyString());
         
         // 5. process again. it should succeed while ignoring waiting processor
         requestHandler.process(event).join();
@@ -763,7 +776,7 @@ public class RequestHandlersTest {
 
         // 1. set segment helper mock to throw exception
         doAnswer(x -> Futures.failedFuture(new RuntimeException()))
-                .when(segmentHelper).sealSegment(anyString(), anyString(), anyLong(), any(), any(), anyString(), anyLong());
+                .when(segmentHelper).sealSegment(anyString(), anyString(), anyLong(), anyString(), anyLong());
 
         // 2. start process --> this should fail with a retryable exception while talking to segment store!
         streamStore.setState(fairness, fairness, State.SEALING, null, executor).join();
@@ -774,14 +787,14 @@ public class RequestHandlersTest {
                 e -> Exceptions.unwrap(e) instanceof RuntimeException);
 
         verify(segmentHelper, atLeastOnce())
-                .sealSegment(anyString(), anyString(), anyLong(), any(), any(), anyString(), anyLong());
+                .sealSegment(anyString(), anyString(), anyLong(), anyString(), anyLong());
 
         // 3. set waiting processor to "random name"
         streamStore.createWaitingRequestIfAbsent(fairness, fairness, "myProcessor", null, executor).join();
 
         // 4. reset segment helper to return success
         doAnswer(x -> CompletableFuture.completedFuture(null))
-                .when(segmentHelper).sealSegment(anyString(), anyString(), anyLong(), any(), any(), anyString(), anyLong());
+                .when(segmentHelper).sealSegment(anyString(), anyString(), anyLong(), anyString(), anyLong());
 
         // 5. process again. it should succeed while ignoring waiting processor
         streamRequestHandler.process(event).join();
@@ -812,7 +825,7 @@ public class RequestHandlersTest {
 
         // 1. set segment helper mock to throw exception
         doAnswer(x -> Futures.failedFuture(new RuntimeException()))
-                .when(segmentHelper).deleteSegment(anyString(), anyString(), anyLong(), any(), any(), anyString(), anyLong());
+                .when(segmentHelper).deleteSegment(anyString(), anyString(), anyLong(), anyString(), anyLong());
 
         // 2. start process --> this should fail with a retryable exception while talking to segment store!
         streamStore.setState(fairness, fairness, State.SEALED, null, executor).join();
@@ -823,14 +836,14 @@ public class RequestHandlersTest {
                 e -> Exceptions.unwrap(e) instanceof RuntimeException);
 
         verify(segmentHelper, atLeastOnce())
-                .deleteSegment(anyString(), anyString(), anyLong(), any(), any(), anyString(), anyLong());
+                .deleteSegment(anyString(), anyString(), anyLong(), anyString(), anyLong());
 
         // 3. set waiting processor to "random name"
         streamStore.createWaitingRequestIfAbsent(fairness, fairness, "myProcessor", null, executor).join();
 
         // 4. reset segment helper to return success
         doAnswer(x -> CompletableFuture.completedFuture(null))
-                .when(segmentHelper).deleteSegment(anyString(), anyString(), anyLong(), any(), any(), anyString(), anyLong());
+                .when(segmentHelper).deleteSegment(anyString(), anyString(), anyLong(), anyString(), anyLong());
 
         // 5. process again. it should succeed while ignoring waiting processor
         streamRequestHandler.process(event).join();
