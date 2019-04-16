@@ -1207,7 +1207,7 @@ public abstract class StreamMetadataTasksTest {
 
         VersionedMetadata<StreamConfigurationRecord> configurationRecord = streamStorePartialMock.getConfigurationRecord(SCOPE, test, null, executor).join();
         assertTrue(configurationRecord.getObject().isUpdating());
-        streamStorePartialMock.completeUpdateConfiguration(SCOPE, test, configurationRecord, null, executor);
+        streamStorePartialMock.completeUpdateConfiguration(SCOPE, test, configurationRecord, null, executor).join();
 
         assertFalse(streamMetadataTasks.isUpdated(SCOPE, test, configuration2, null).get());
 
@@ -1251,7 +1251,7 @@ public abstract class StreamMetadataTasksTest {
 
         VersionedMetadata<StreamTruncationRecord> truncationRecord = streamStorePartialMock.getTruncationRecord(SCOPE, test, null, executor).join();
         assertTrue(truncationRecord.getObject().isUpdating());
-        streamStorePartialMock.completeTruncation(SCOPE, test, truncationRecord, null, executor);
+        streamStorePartialMock.completeTruncation(SCOPE, test, truncationRecord, null, executor).join();
 
         assertFalse(streamMetadataTasks.isTruncated(SCOPE, test, map, null).get());
 
@@ -1271,7 +1271,20 @@ public abstract class StreamMetadataTasksTest {
         assertFalse(streamMetadataTasks.isTruncated(SCOPE, test, map2, null).get());
         // end region
     }
-    
+
+    @Test(timeout = 10000)
+    public void testThrowSynchronousExceptionOnWriteEvent() {
+        EventStreamWriter<ControllerEvent> requestEventWriter = mock(EventStreamWriter.class);
+        doAnswer(x -> {
+            throw new RuntimeException();
+        }).when(requestEventWriter).writeEvent(anyString(), any());
+        
+        streamMetadataTasks.setRequestEventWriter(requestEventWriter);
+        AssertExtensions.assertFutureThrows("",
+                streamMetadataTasks.writeEvent(new UpdateStreamEvent("scope", "stream", 0L)),
+                e -> Exceptions.unwrap(e) instanceof TaskExceptions.PostEventException);
+    }
+
     private CompletableFuture<Void> processEvent(WriterMock requestEventWriter) throws InterruptedException {
         return Retry.withExpBackoff(100, 10, 5, 1000)
                 .retryingOn(TaskExceptions.StartException.class)
