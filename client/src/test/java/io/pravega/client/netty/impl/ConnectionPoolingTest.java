@@ -29,12 +29,14 @@ import io.netty.handler.ssl.SslContext;
 import io.netty.handler.ssl.SslContextBuilder;
 import io.netty.handler.ssl.SslHandler;
 import io.pravega.client.ClientConfig;
+import io.pravega.test.common.SecurityConfigDefaults;
 import io.pravega.shared.protocol.netty.CommandDecoder;
 import io.pravega.shared.protocol.netty.CommandEncoder;
 import io.pravega.shared.protocol.netty.ConnectionFailedException;
 import io.pravega.shared.protocol.netty.FailingReplyProcessor;
 import io.pravega.shared.protocol.netty.PravegaNodeUri;
 import io.pravega.shared.protocol.netty.WireCommands;
+import io.pravega.test.common.AssertExtensions;
 import io.pravega.test.common.TestUtils;
 import java.io.File;
 import java.net.URI;
@@ -103,7 +105,10 @@ public class ConnectionPoolingTest {
         final SslContext sslCtx;
         if (ssl) {
             try {
-                sslCtx = SslContextBuilder.forServer(new File("../config/cert.pem"), new File("../config/key.pem")).build();
+                sslCtx = SslContextBuilder.forServer(
+                        new File(SecurityConfigDefaults.TLS_SERVER_CERT_PATH),
+                        new File(SecurityConfigDefaults.TLS_SERVER_PRIVATE_KEY_PATH))
+                        .build();
             } catch (SSLException e) {
                 throw new RuntimeException(e);
             }
@@ -157,13 +162,16 @@ public class ConnectionPoolingTest {
     }
 
     @Test
-    public void testConnectionPooling() throws ConnectionFailedException, InterruptedException {
+    public void testConnectionPooling() throws Exception {
+        ClientConfig clientConfig = ClientConfig.builder()
+                .controllerURI(URI.create((this.ssl ? "tls://" : "tcp://")
+                                          + "localhost"))
+                .trustStore(SecurityConfigDefaults.TLS_CA_CERT_PATH)
+                .maxConnectionsPerSegmentStore(1)
+                .build();
+        ConnectionPoolImpl connectionPool = new ConnectionPoolImpl(clientConfig);
         @Cleanup
-        ConnectionFactoryImpl factory = new ConnectionFactoryImpl(ClientConfig.builder()
-                                                                              .controllerURI(URI.create((this.ssl ? "tls://" : "tcp://") + "localhost"))
-                                                                              .trustStore("../config/cert.pem")
-                                                                              .maxConnectionsPerSegmentStore(1)
-                                                                              .build());
+        ConnectionFactoryImpl factory = new ConnectionFactoryImpl(clientConfig, connectionPool, 1);
 
         ArrayBlockingQueue<WireCommands.SegmentRead> msgRead = new ArrayBlockingQueue<>(10);
         FailingReplyProcessor rp = new FailingReplyProcessor() {
@@ -228,17 +236,24 @@ public class ConnectionPoolingTest {
         // close connection1
         connection1.close();
         assertThrows(ConnectionFailedException.class, () -> connection1.send(readRequestGenerator.apply(flow2.asLong())));
+        AssertExtensions.assertEventuallyEquals(0, () -> {
+            connectionPool.pruneUnusedConnections();
+            return factory.getActiveChannelCount();
+        }, 10000);
 
     }
 
     @Test
-    public void testConcurrentRequests() throws ConnectionFailedException, InterruptedException {
+    public void testConcurrentRequests() throws Exception {
+        ClientConfig clientConfig = ClientConfig.builder()
+                                                .controllerURI(URI.create((this.ssl ? "tls://" : "tcp://")
+                                                        + "localhost"))
+                                                .trustStore(SecurityConfigDefaults.TLS_CA_CERT_PATH)
+                                                .maxConnectionsPerSegmentStore(1)
+                                                .build();
+        ConnectionPoolImpl connectionPool = new ConnectionPoolImpl(clientConfig);
         @Cleanup
-        ConnectionFactoryImpl factory = new ConnectionFactoryImpl(ClientConfig.builder()
-                                                                              .controllerURI(URI.create((this.ssl ? "tls://" : "tcp://") + "localhost"))
-                                                                              .trustStore("../config/cert.pem")
-                                                                              .maxConnectionsPerSegmentStore(1)
-                                                                              .build());
+        ConnectionFactoryImpl factory = new ConnectionFactoryImpl(clientConfig, connectionPool, 1);
 
         ArrayBlockingQueue<WireCommands.SegmentRead> msgRead = new ArrayBlockingQueue<>(10);
         FailingReplyProcessor rp = new FailingReplyProcessor() {
@@ -264,12 +279,10 @@ public class ConnectionPoolingTest {
         };
 
         Flow flow1 = new Flow(1, 0);
-        @Cleanup
         ClientConnection connection1 = factory.establishConnection(flow1, new PravegaNodeUri("localhost", port), rp).join();
 
         // create a second connection, since the max number of connections is 1 this should reuse the same connection.
         Flow flow2 = new Flow(2, 0);
-        @Cleanup
         ClientConnection connection2 = factory.establishConnection(flow2, new PravegaNodeUri("localhost", port), rp).join();
 
         connection1.send(readRequestGenerator.apply(flow1.asLong()));
@@ -280,6 +293,13 @@ public class ConnectionPoolingTest {
         msgs.add(msgRead.take());
         assertTrue(msgs.contains(readResponseGenerator.apply(flow1.asLong())));
         assertTrue(msgs.contains(readResponseGenerator.apply(flow1.asLong())));
+        assertEquals(1, factory.getActiveChannelCount());
+        connection1.close();
+        connection2.close();
+        AssertExtensions.assertEventuallyEquals(0, () -> {
+            connectionPool.pruneUnusedConnections();
+            return factory.getActiveChannelCount();
+        }, 10000);
     }
 
 }

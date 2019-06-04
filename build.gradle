@@ -818,7 +818,9 @@ project('test:system') {
         if (System.getProperty("imageVersion") == null) {
             systemProperty "imageVersion", "INVALID_IMAGE_VERSION"
         }
-
+        
+        systemProperty "securityEnabled", System.getProperty("securityEnabled", "false")
+       
         maxParallelForks = 1
     }
 
@@ -913,7 +915,7 @@ project('test:system') {
 
 def getProjectVersion() {
     String ver = pravegaVersion
-    if (ver.contains("-SNAPSHOT")) {
+    if (grgit && ver.contains("-SNAPSHOT")) {
         String versionLabel = ver.substring(0, ver.indexOf("-SNAPSHOT"))
         def count = grgit.log(includes:['HEAD']).size()
         def commitId = "${grgit.head().abbreviatedId}"

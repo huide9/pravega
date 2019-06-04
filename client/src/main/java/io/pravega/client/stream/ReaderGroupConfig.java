@@ -51,7 +51,7 @@ public class ReaderGroupConfig implements Serializable {
 
    public static class ReaderGroupConfigBuilder implements ObjectBuilder<ReaderGroupConfig> {
        private long groupRefreshTimeMillis = 3000; //default value
-       private long automaticCheckpointIntervalMillis = 120000; //default value
+       private long automaticCheckpointIntervalMillis = 30000; //default value
        // maximum outstanding checkpoint request that is allowed at any given time.
        private int maxOutstandingCheckpointRequest = 3; //default value
 
@@ -220,8 +220,15 @@ public class ReaderGroupConfig implements Serializable {
            final Map<Segment, Long> endPositions = endStreamCut.asImpl().getPositions();
            //check offsets for overlapping segments.
            startPositions.keySet().stream().filter(endPositions::containsKey)
-                        .forEach(s -> Preconditions.checkArgument(startPositions.get(s) <= endPositions.get(s),
-                                "Segment offset in startStreamCut should be <= segment offset in endStreamCut."));
+                        .forEach(s -> {
+                            if (startPositions.get(s) == -1) {
+                                Preconditions.checkArgument(endPositions.get(s) == -1,
+                                                            "Segment offset in startStreamCut should be <= segment offset in endStreamCut");
+                            } else if (endPositions.get(s) != -1) {
+                                Preconditions.checkArgument(startPositions.get(s) <= endPositions.get(s),
+                                                            "Segment offset in startStreamCut should be <= segment offset in endStreamCut.");
+                            }
+                        });
 
            val fromSCSummary = startPositions.keySet()
                                              .stream().collect(summarizingLong(Segment::getSegmentId));
