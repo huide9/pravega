@@ -1,19 +1,25 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.test.system;
 
 import io.pravega.client.ClientConfig;
 import io.pravega.client.admin.ReaderGroupManager;
 import io.pravega.client.admin.StreamManager;
-import io.pravega.client.netty.impl.ConnectionFactory;
-import io.pravega.client.netty.impl.ConnectionFactoryImpl;
+import io.pravega.client.connection.impl.ConnectionFactory;
+import io.pravega.client.connection.impl.SocketConnectionFactoryImpl;
 import io.pravega.client.stream.Checkpoint;
 import io.pravega.client.stream.ReaderGroup;
 import io.pravega.client.stream.ReaderGroupConfig;
@@ -22,8 +28,8 @@ import io.pravega.client.stream.Stream;
 import io.pravega.client.stream.StreamConfiguration;
 import io.pravega.client.stream.StreamCut;
 import io.pravega.client.stream.impl.ClientFactoryImpl;
-import io.pravega.client.stream.impl.ControllerImpl;
-import io.pravega.client.stream.impl.ControllerImplConfig;
+import io.pravega.client.control.impl.ControllerImpl;
+import io.pravega.client.control.impl.ControllerImplConfig;
 import io.pravega.common.concurrent.ExecutorServiceHelpers;
 import io.pravega.common.concurrent.Futures;
 import io.pravega.common.hash.RandomFactory;
@@ -108,12 +114,12 @@ public class OffsetTruncationTest extends AbstractReadWriteTest {
 
         final ClientConfig clientConfig = Utils.buildClientConfig(controllerURI);
         @Cleanup
-        ConnectionFactory connectionFactory = new ConnectionFactoryImpl(clientConfig);
+        ConnectionFactory connectionFactory = new SocketConnectionFactoryImpl(clientConfig);
         ControllerImpl controller = new ControllerImpl(ControllerImplConfig.builder()
                                                                            .clientConfig(clientConfig).build(),
                                                                            connectionFactory.getInternalExecutor());
         @Cleanup
-        ClientFactoryImpl clientFactory = new ClientFactoryImpl(SCOPE, controller, new ConnectionFactoryImpl(clientConfig));
+        ClientFactoryImpl clientFactory = new ClientFactoryImpl(SCOPE, controller, connectionFactory);
         log.info("Invoking offsetTruncationTest test with Controller URI: {}", controllerURI);
 
         @Cleanup
@@ -128,10 +134,15 @@ public class OffsetTruncationTest extends AbstractReadWriteTest {
         // Instantiate readers to consume from Stream up to truncatedEvents.
         List<CompletableFuture<Integer>> futures = readEventFutures(clientFactory, READER_GROUP, PARALLELISM, truncatedEvents);
         Futures.allOf(futures).join();
+        // Ensure that we have read all the events required before initiating the checkpoint.
+        assertEquals("Number of events read is not the expected one.", (Integer) truncatedEvents,
+                futures.stream().map(f -> Futures.getAndHandleExceptions(f, RuntimeException::new)).reduce(Integer::sum).get());
 
         // Perform truncation on stream segment.
         Checkpoint cp = readerGroup.initiateCheckpoint("truncationCheckpoint", executor).join();
         StreamCut streamCut = cp.asImpl().getPositions().values().iterator().next();
+        StreamCut alternativeStreamCut = readerGroup.generateStreamCuts(executor).join().get(Stream.of(SCOPE, STREAM));
+        assertEquals("StreamCuts for reader group differ depending on how they are generated.", streamCut, alternativeStreamCut);
         assertTrue(streamManager.truncateStream(SCOPE, STREAM, streamCut));
 
         // Just after the truncation, read events from the offset defined in truncate call onwards.
@@ -140,7 +151,7 @@ public class OffsetTruncationTest extends AbstractReadWriteTest {
         futures = readEventFutures(clientFactory, newGroupName, PARALLELISM);
         Futures.allOf(futures).join();
         assertEquals("Expected read events: ", totalEvents - truncatedEvents,
-                (int) futures.stream().map(CompletableFuture::join).reduce((a, b) -> a + b).get());
+                (int) futures.stream().map(CompletableFuture::join).reduce(Integer::sum).get());
         log.debug("The stream has been successfully truncated at event {}. Offset truncation test passed.", truncatedEvents);
     }
 }

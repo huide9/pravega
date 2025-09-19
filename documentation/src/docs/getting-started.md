@@ -1,11 +1,17 @@
 <!--
-Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+Copyright Pravega Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
 -->
 # Getting Started
 
@@ -19,7 +25,7 @@ application.
 **Verify the following prerequisite**
 
 ```
-Java 8
+Java 11
 ```
 
 **Download Pravega**
@@ -39,11 +45,17 @@ This launches all the components of Pravega on your local machine.
 **Note:** This is for testing/demo purposes only, **do not** use this mode of deployment
 in Production!
 
+In order to remotely troubleshoot Java application, JDWP port is being used. The default JDWP port in Pravega(8050) can be overridden using the below command before starting Pravega in standalone mode. 0 to 65535 are allowed range of port numbers.
+
+```
+$ export JDWP_PORT=8888
+```
+
 More options and additional ways to run Pravega can be found in [Running Pravega](deployment/deployment.md) guide.
 
 ```
 $ cd pravega-<version>
-$ bin/pravega-standalone
+$ ./bin/pravega-standalone
 ```
 
 The command above runs Pravega locally for development and testing purposes. It does not persist in the storage tiers like we do with a real deployment of Pravega and as such you shouldn't expect it to recover from crashes, and further, not rely on it for production use. For production use, we strongly encourage a full deployment of Pravega.
@@ -56,7 +68,7 @@ Download and run the "Hello World" Pravega sample reader and writer applications
 dependencies will be pulled from maven central.
 
 **Note:** The samples can also use a locally compiled version of Pravega. For more information,
-please see the [README](../../../README.md) note on maven publishing.
+please see the [README](https://github.com/pravega/pravega/blob/master/README.md) note on maven publishing.
 
 **Download the Pravega-Samples git repo**
 
@@ -77,7 +89,7 @@ This runs a simple Java application that writes a "hello world" message
         as an event into a Pravega stream.
 ```
 $ cd pravega-samples/pravega-client-examples/build/install/pravega-client-examples
-$ bin/helloWorldWriter
+$ ./bin/helloWorldWriter
 ```
 _Example HelloWorldWriter output_
 ```
@@ -92,7 +104,7 @@ See the [README](https://github.com/pravega/pravega-samples/blob/v0.4.0/pravega-
 
 ```
 $ cd pravega-samples/pravega-client-examples/build/install/pravega-client-examples
-$ bin/helloWorldReader
+$ ./bin/helloWorldReader
 ```
 
 _Example HelloWorldReader output_
@@ -107,3 +119,10 @@ No more events from examples/helloStream
 
 See the [README](https://github.com/pravega/pravega-samples/blob/v0.4.0/pravega-client-examples/README.md) file in the pravega-client-examples for more details on running the
     HelloWorldReader application.
+
+**Serializers**
+
+The Java client by has multiple built in serializers: `UTF8StringSerializer`, `ByteArraySerializer`, `ByteBufferSerializer`, and `JavaSerializer`.
+
+Additional pre-made serializers are available in: https://github.com/pravega/pravega-serializer
+You can also write your own implementation of the interface.

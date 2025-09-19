@@ -1,11 +1,17 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.segmentstore.server.logs;
 
@@ -15,12 +21,19 @@ import io.pravega.common.Timer;
 import io.pravega.segmentstore.contracts.ContainerException;
 import io.pravega.segmentstore.contracts.StreamSegmentException;
 import io.pravega.segmentstore.server.DataCorruptionException;
+import io.pravega.segmentstore.server.SegmentStoreMetrics;
+import io.pravega.segmentstore.server.ServiceHaltException;
 import io.pravega.segmentstore.server.UpdateableContainerMetadata;
+import io.pravega.segmentstore.server.logs.operations.CheckpointOperationBase;
 import io.pravega.segmentstore.server.logs.operations.MetadataCheckpointOperation;
 import io.pravega.segmentstore.server.logs.operations.Operation;
 import io.pravega.segmentstore.server.logs.operations.OperationSerializer;
+import io.pravega.segmentstore.server.logs.operations.StreamSegmentAppendOperation;
 import io.pravega.segmentstore.storage.DurableDataLog;
+import io.pravega.segmentstore.storage.DurableDataLogException;
 import io.pravega.segmentstore.storage.LogAddress;
+import lombok.AccessLevel;
+import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
 
 /**
@@ -30,7 +43,13 @@ import lombok.extern.slf4j.Slf4j;
 class RecoveryProcessor {
     //region Members
 
+    // Determines how many entries we keep track of in order to compare for duplicate log entries in the recent past
+    // upon recovery. If there is a duplicate entry, but it is beyond that point, an exception will be thrown anyway.
+    private final static int MAX_OVERLAP_TO_CHECK_DUPLICATES = 25;
+
+    @Getter (AccessLevel.PROTECTED)
     private final UpdateableContainerMetadata metadata;
+    @Getter (AccessLevel.PROTECTED)
     private final DurableDataLog durableDataLog;
     private final MemoryStateUpdater stateUpdater;
     private final String traceObjectId;
@@ -70,6 +89,7 @@ class RecoveryProcessor {
      *                   * DataLogWriterNotPrimaryException: If unable to acquire DurableDataLog ownership or the ownership
      *                   has been lost in the process.
      *                   * DataCorruptionException: If an unrecoverable corruption has been detected with the recovered data.
+     *                   * ServiceHaltException: If an unrecoverable state has been detected with the recovered data.
      *                   * SerializationException: If a DataFrame or Operation was unable to be deserialized.
      *                   * IOException: If a general IO exception occurred.
      */
@@ -92,8 +112,10 @@ class RecoveryProcessor {
         try {
             recoveredItemCount = recoverAllOperations(metadataUpdater);
             this.metadata.setContainerEpoch(this.durableDataLog.getEpoch());
+            long timeElapsed = timer.getElapsedMillis();
             log.info("{} Recovery completed. Epoch = {}, Items Recovered = {}, Time = {}ms.", this.traceObjectId,
-                    this.metadata.getContainerEpoch(), recoveredItemCount, timer.getElapsedMillis());
+                    this.metadata.getContainerEpoch(), recoveredItemCount, timeElapsed);
+            SegmentStoreMetrics.recoveryCompleted(timeElapsed, this.metadata.getContainerId());
             successfulRecovery = true;
         } finally {
             // We must exit recovery mode when done, regardless of outcome.
@@ -115,7 +137,7 @@ class RecoveryProcessor {
      * @param metadataUpdater The OperationMetadataUpdater to use for updates.
      * @return The number of Operations recovered.
      */
-    private int recoverAllOperations(OperationMetadataUpdater metadataUpdater) throws Exception {
+    protected int recoverAllOperations(OperationMetadataUpdater metadataUpdater) throws Exception {
         long traceId = LoggerHelpers.traceEnterWithContext(log, this.traceObjectId, "recoverAllOperations");
         int skippedOperationCount = 0;
         int skippedDataFramesCount = 0;
@@ -123,7 +145,7 @@ class RecoveryProcessor {
 
         // Read all entries from the DataFrameLog and append them to the InMemoryOperationLog.
         // Also update metadata along the way.
-        try (DataFrameReader<Operation> reader = new DataFrameReader<>(this.durableDataLog, OperationSerializer.DEFAULT, this.metadata.getContainerId())) {
+        try (DataFrameReader<Operation> reader = createDataFrameReader()) {
             DataFrameRecord<Operation> dataFrameRecord;
 
             // We can only recover starting from a MetadataCheckpointOperation; find the first one.
@@ -167,10 +189,24 @@ class RecoveryProcessor {
         return recoveredItemCount;
     }
 
-    protected void recoverOperation(DataFrameRecord<Operation> dataFrameRecord, OperationMetadataUpdater metadataUpdater) throws DataCorruptionException {
+    /**
+     * Returns the DataFrameReader instance.
+     * @return the instantiated DataFrameReader
+     * @throws DurableDataLogException If the given log threw an exception while initializing a Reader
+     */
+    protected DataFrameReader<Operation> createDataFrameReader() throws DurableDataLogException {
+       return new DataFrameReader<>(this.durableDataLog, OperationSerializer.DEFAULT, this.metadata.getContainerId(), MAX_OVERLAP_TO_CHECK_DUPLICATES);
+    }
+
+    protected void recoverOperation(DataFrameRecord<Operation> dataFrameRecord, OperationMetadataUpdater metadataUpdater) throws ServiceHaltException {
         // Update Metadata Sequence Number.
         Operation operation = dataFrameRecord.getItem();
         metadataUpdater.setOperationSequenceNumber(operation.getSequenceNumber());
+
+        // Compute integrity check for recovered Appends.
+        if (operation instanceof StreamSegmentAppendOperation) {
+            ((StreamSegmentAppendOperation) operation).setContentHash(((StreamSegmentAppendOperation) operation).getData().hash());
+        }
 
         // Update the metadata with the information from the Operation.
         try {
@@ -184,6 +220,11 @@ class RecoveryProcessor {
 
         // Update in-memory structures.
         this.stateUpdater.process(operation);
+
+        // Perform necessary read index cleanups if possible.
+        if (operation instanceof CheckpointOperationBase) {
+            this.stateUpdater.cleanupReadIndex();
+        }
     }
 
     private void recordTruncationMarker(DataFrameRecord<Operation> dataFrameRecord) {

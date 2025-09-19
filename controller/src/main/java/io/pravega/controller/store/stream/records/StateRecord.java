@@ -1,11 +1,17 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.controller.store.stream.records;
 
@@ -22,13 +28,13 @@ import lombok.extern.slf4j.Slf4j;
 
 import java.io.IOException;
 
+/**
+ * A serializable class that encapsulates a Stream's State.
+ */
 @Data
 @Builder
 @Slf4j
 @AllArgsConstructor
-/**
- * A serializable class that encapsulates a Stream's State. 
- */
 public class StateRecord {
     public static final StateRecordSerializer SERIALIZER = new StateRecordSerializer();
 
@@ -47,7 +53,12 @@ public class StateRecord {
     public byte[] toBytes() {
         return SERIALIZER.serialize(this).getCopy();
     }
-    
+
+    @Override
+    public String toString() {
+        return String.format("%s = %s", "state", state);
+    }
+
     private static class StateRecordSerializer extends VersionedSerializer.WithBuilder<StateRecord, StateRecord.StateRecordBuilder> {
         @Override
         protected byte getWriteVersion() {

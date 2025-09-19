@@ -1,20 +1,24 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.controller.store.stream.records;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
-import io.pravega.common.Exceptions;
-import io.pravega.shared.segment.StreamSegmentNameUtils;
-
+import io.pravega.shared.NameUtils;
 import java.util.AbstractMap;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -25,8 +29,8 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.stream.Collectors;
 
-import static io.pravega.shared.segment.StreamSegmentNameUtils.computeSegmentId;
-import static io.pravega.shared.segment.StreamSegmentNameUtils.getSegmentNumber;
+import static io.pravega.shared.NameUtils.computeSegmentId;
+import static io.pravega.shared.NameUtils.getSegmentNumber;
 
 public class RecordHelper {
     
@@ -94,12 +98,12 @@ public class RecordHelper {
 
         if (newRangeMatch) {
             final Set<Integer> segmentNumbersToSeal = isManualScale ? 
-                    segmentsToSeal.stream().map(StreamSegmentNameUtils::getSegmentNumber).collect(Collectors.toSet()) :
+                    segmentsToSeal.stream().map(NameUtils::getSegmentNumber).collect(Collectors.toSet()) :
                     null;
             return segmentsToSeal.stream().allMatch(segmentId -> {
                 if (isManualScale) {
                     // compare segmentNumbers
-                    return segmentNumbersToSeal.contains(StreamSegmentNameUtils.getSegmentNumber(segmentId));
+                    return segmentNumbersToSeal.contains(NameUtils.getSegmentNumber(segmentId));
                 } else {
                     // compare segmentIds
                     return record.getSegmentsToSeal().contains(segmentId);
@@ -164,21 +168,6 @@ public class RecordHelper {
     // endregion
     
     // region streamCut
-    /**
-     * Method to validate a given stream Cut.
-     * A stream cut is valid if it covers the entire key space without any overlaps in ranges for segments that form the
-     * streamcut. It throws {@link IllegalArgumentException} if the supplied stream cut does not satisfy the invariants.
-     *
-     * @param streamCutSegments supplied stream cut.
-     */
-    public static void validateStreamCut(List<Map.Entry<Double, Double>> streamCutSegments) {
-        // verify that stream cut covers the entire range of 0.0 to 1.0 keyspace without overlaps.
-        List<Map.Entry<Double, Double>> reduced = reduce(streamCutSegments);
-        Exceptions.checkArgument(reduced.size() == 1 && reduced.get(0).getKey().equals(0.0) &&
-                        reduced.get(0).getValue().equals(1.0), "streamCut",
-                " Invalid input, Stream Cut does not cover full key range.");
-    }
-
     /**
      * Method to compare two stream cuts given their spans.  
      *

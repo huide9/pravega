@@ -1,11 +1,17 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.test.system.framework.metronome;
 
@@ -25,8 +31,8 @@ import mesosphere.marathon.client.auth.TokenAuthRequestInterceptor;
 import mesosphere.client.common.ModelUtils;
 import java.util.Calendar;
 
-import static io.netty.handler.codec.http.HttpResponseStatus.INTERNAL_SERVER_ERROR;
-import static io.netty.handler.codec.http.HttpResponseStatus.SERVICE_UNAVAILABLE;
+import static javax.ws.rs.core.Response.Status.INTERNAL_SERVER_ERROR;
+import static javax.ws.rs.core.Response.Status.SERVICE_UNAVAILABLE;
 import static java.util.Arrays.asList;
 import static java.util.concurrent.TimeUnit.SECONDS;
 
@@ -42,8 +48,8 @@ public class MetronomeClient {
         @Override
         public Exception decode(String methodKey, Response response) {
             //Retry in case Metronome service returns 503 or 500
-            if (response.status() == SERVICE_UNAVAILABLE.code() || response.status() ==
-                    INTERNAL_SERVER_ERROR.code()) {
+            if (response.status() == SERVICE_UNAVAILABLE.getStatusCode() || response.status() ==
+                    INTERNAL_SERVER_ERROR.getStatusCode()) {
                 //retry after 5 seconds.
                 Calendar retryAfter = Calendar.getInstance();
                 retryAfter.add(Calendar.SECOND, 5);

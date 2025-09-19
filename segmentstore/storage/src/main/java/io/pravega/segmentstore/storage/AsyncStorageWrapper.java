@@ -1,11 +1,17 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.segmentstore.storage;
 
@@ -15,9 +21,11 @@ import io.pravega.common.Exceptions;
 import io.pravega.common.concurrent.MultiKeySequentialProcessor;
 import io.pravega.common.function.RunnableWithException;
 import io.pravega.segmentstore.contracts.SegmentProperties;
+
 import java.io.InputStream;
 import java.time.Duration;
 import java.util.Arrays;
+import java.util.Iterator;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
@@ -119,6 +127,12 @@ public class AsyncStorageWrapper implements Storage {
     }
 
     @Override
+    public boolean supportsAtomicWrites() {
+        // RollingStorage (non-Chunked Storage) does not support atomic writes if the underlying Storage implementation does not.
+        return false;
+    }
+
+    @Override
     public CompletableFuture<SegmentHandle> openRead(String streamSegmentName) {
         return supplyAsync(() -> this.syncStorage.openRead(streamSegmentName), streamSegmentName);
     }
@@ -136,6 +150,15 @@ public class AsyncStorageWrapper implements Storage {
     @Override
     public CompletableFuture<Boolean> exists(String streamSegmentName, Duration timeout) {
         return supplyAsync(() -> this.syncStorage.exists(streamSegmentName), streamSegmentName);
+    }
+
+    @Override
+    public CompletableFuture<Iterator<SegmentProperties>> listSegments() {
+        try {
+            return CompletableFuture.completedFuture(this.syncStorage.listSegments());
+        } catch (Exception ex) {
+            return CompletableFuture.failedFuture(ex);
+        }
     }
 
     //endregion

@@ -1,11 +1,17 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.controller.server.rest.v1;
 
@@ -140,6 +146,24 @@ public final class ApiV1 {
                 @ApiParam(value = "Stream name", required = true) @PathParam("streamName") String streamName,
                 @Context SecurityContext securityContext, @Suspended final AsyncResponse asyncResponse);
 
+        @DELETE
+        @Path("/{scopeName}/readergroups/{readerGroupName}")
+        @io.swagger.annotations.ApiOperation(value = "", notes = "Delete a reader group", response = void.class,
+                tags = { "ReaderGroups", })
+        @io.swagger.annotations.ApiResponses(value = {
+                @io.swagger.annotations.ApiResponse(code = 204, message = "Successfully deleted the reader group",
+                        response = void.class),
+
+                @io.swagger.annotations.ApiResponse(code = 404, message = "Reader group with given name not found",
+                        response = void.class),
+
+                @io.swagger.annotations.ApiResponse(code = 500, message = "Internal server error while deleting a reader group",
+                        response = void.class) })
+        void deleteReaderGroup(@ApiParam(value = "Scope name", required = true) @PathParam("scopeName") String scopeName,
+                               @ApiParam(value = "Reader group name", required = true)
+                               @PathParam("readerGroupName") String readerGroupName,
+                               @Context SecurityContext securityContext, @Suspended final AsyncResponse asyncResponse);
+
         @GET
         @Path("/{scopeName}/readergroups/{readerGroupName}")
         @Produces({ "application/json" })
@@ -262,9 +286,9 @@ public final class ApiV1 {
                 @ApiResponse(
                         code = 500, message = "Server error", response = StreamsList.class) })
         void listStreams(@ApiParam(value = "Scope name", required = true) @PathParam("scopeName") String scopeName,
-                         @ApiParam(value = "Flag whether to display only system created streams")
-                         @QueryParam("showInternalStreams") String showInternalStreams,
-                @Context SecurityContext securityContext, @Suspended final AsyncResponse asyncResponse);
+                         @ApiParam(value = "Filter options", allowableValues = "showInternalStreams, tag") @QueryParam("filter_type") String filterType,
+                 @ApiParam(value = "value to be passed. must match the type passed with it.") @QueryParam("filter_value") String filterValue,
+                         @Context SecurityContext securityContext, @Suspended final AsyncResponse asyncResponse);
 
         @PUT
         @Path("/{scopeName}/streams/{streamName}")

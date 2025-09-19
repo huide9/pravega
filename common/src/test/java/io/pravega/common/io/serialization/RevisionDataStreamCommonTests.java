@@ -1,16 +1,24 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.common.io.serialization;
 
 import com.google.common.collect.ImmutableMap;
-import io.pravega.common.io.EnhancedByteArrayOutputStream;
+import io.pravega.common.io.ByteBufferOutputStream;
+import io.pravega.common.util.BufferView;
+import io.pravega.common.util.ByteArraySegment;
 import io.pravega.test.common.AssertExtensions;
 import java.io.ByteArrayOutputStream;
 import java.io.DataInput;
@@ -249,7 +257,7 @@ public class RevisionDataStreamCommonTests {
     }
 
     /**
-     * Tests the ability to encode and decode a byte array.
+     * Tests the ability to encode and decode {@link BufferView}s.
      */
     @Test
     public void testByteArrays() throws Exception {
@@ -263,8 +271,17 @@ public class RevisionDataStreamCommonTests {
                 new byte[0],
                 numbers);
         for (byte[] value : toTest) {
+            // Raw byte arrays.
             testEncodeDecode(
                     RevisionDataOutput::writeArray,
+                    RevisionDataInput::readArray,
+                    (s, v) -> s.getCollectionLength(v == null ? 0 : v.length, 1),
+                    value,
+                    (s, t) -> Arrays.equals(s == null ? new byte[0] : s, t));
+
+            // Buffer Views.
+            testEncodeDecode(
+                    (RevisionDataOutputStream s, byte[] t) -> s.writeBuffer(t == null ? null : new ByteArraySegment(t)),
                     RevisionDataInput::readArray,
                     (s, v) -> s.getCollectionLength(v == null ? 0 : v.length, 1),
                     value,
@@ -310,7 +327,43 @@ public class RevisionDataStreamCommonTests {
         }
     }
 
-    private <T> void testGetCompactLength(Map<T, Integer> expectedValues, BiFunction<RevisionDataOutputStream, T, Integer> getLength, BiConsumerWithException<RevisionDataOutputStream, T> writeNumber) throws Exception {
+    /**
+     * Tests {@link RevisionDataInput#getRemaining()}.
+     */
+    @Test
+    public void testGetRemaining() throws Exception {
+        @Cleanup
+        val os = new ByteBufferOutputStream();
+        @Cleanup
+        val rdos = RevisionDataOutputStream.wrap(os);
+        rdos.writeInt(1);
+        rdos.writeLong(2L);
+        rdos.writeBuffer(new ByteArraySegment(new byte[3]));
+        rdos.flush();
+        rdos.close();
+        int expectedRemaining = os.getData().getLength() - Integer.BYTES; // BoundedInputStream header.
+
+        // Use a SequenceInputStream - this will always have available() set to 0.
+        @Cleanup
+        val rdis = RevisionDataInputStream.wrap(os.getData().getReader());
+        Assert.assertEquals(expectedRemaining, rdis.getRemaining());
+
+        Assert.assertEquals(1, rdis.readInt());
+        expectedRemaining -= Integer.BYTES;
+        Assert.assertEquals(expectedRemaining, rdis.getRemaining());
+
+        Assert.assertEquals(2L, rdis.readLong());
+        expectedRemaining -= Long.BYTES;
+        Assert.assertEquals(expectedRemaining, rdis.getRemaining());
+
+        Assert.assertEquals(3, rdis.readArray().length);
+        expectedRemaining = 0;
+        Assert.assertEquals(expectedRemaining, rdis.getRemaining());
+    }
+
+    private <T> void testGetCompactLength(Map<T, Integer> expectedValues,
+                                          BiFunction<RevisionDataOutputStream, T, Integer> getLength,
+                                          BiConsumerWithException<RevisionDataOutputStream, T> writeNumber) throws Exception {
         @Cleanup
         val rdos = RevisionDataOutputStream.wrap(new ByteArrayOutputStream());
         for (val e : expectedValues.entrySet()) {
@@ -333,7 +386,7 @@ public class RevisionDataStreamCommonTests {
     private <T> void testLength(BiConsumerWithException<RevisionDataOutputStream, T> write,
                                 BiFunction<RevisionDataOutputStream, T, Integer> getLength, T value) throws Exception {
         @Cleanup
-        val os = new EnhancedByteArrayOutputStream();
+        val os = new ByteBufferOutputStream();
         @Cleanup
         val rdos = RevisionDataOutputStream.wrap(os);
         val initialLength = os.getData().getLength();
@@ -364,7 +417,7 @@ public class RevisionDataStreamCommonTests {
     private <T> void testEncodeDecode(BiConsumerWithException<RevisionDataOutputStream, T> write, FunctionWithException<RevisionDataInputStream, T> read,
                                       BiFunction<RevisionDataOutputStream, T, Integer> getLength, T value, BiPredicate<T, T> equalityTester) throws Exception {
         @Cleanup
-        val os = new EnhancedByteArrayOutputStream();
+        val os = new ByteBufferOutputStream();
         @Cleanup
         val rdos = RevisionDataOutputStream.wrap(os);
         write.accept(rdos, value);

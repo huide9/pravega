@@ -1,15 +1,44 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.test.integration;
 
+import static io.pravega.test.common.AssertExtensions.assertThrows;
+import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertTrue;
+
+import io.pravega.segmentstore.server.host.handler.IndexAppendProcessor;
+import java.net.URI;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Random;
+import java.util.concurrent.ExecutionException;
+import java.util.function.Function;
+import java.util.function.Supplier;
+
+import org.apache.curator.test.TestingServer;
+import org.junit.After;
+import org.junit.Assert;
+import org.junit.Before;
+import org.junit.Test;
+
 import com.google.common.collect.ImmutableMap;
+
 import io.pravega.client.ClientConfig;
 import io.pravega.client.EventStreamClientFactory;
 import io.pravega.client.admin.ReaderGroupManager;
@@ -27,7 +56,7 @@ import io.pravega.client.stream.Stream;
 import io.pravega.client.stream.StreamConfiguration;
 import io.pravega.client.stream.StreamCut;
 import io.pravega.client.stream.TruncatedDataException;
-import io.pravega.client.stream.impl.Controller;
+import io.pravega.client.control.impl.Controller;
 import io.pravega.client.stream.impl.JavaSerializer;
 import io.pravega.client.stream.impl.StreamCutImpl;
 import io.pravega.segmentstore.contracts.StreamSegmentStore;
@@ -35,35 +64,16 @@ import io.pravega.segmentstore.contracts.tables.TableStore;
 import io.pravega.segmentstore.server.host.handler.PravegaConnectionListener;
 import io.pravega.segmentstore.server.store.ServiceBuilder;
 import io.pravega.segmentstore.server.store.ServiceBuilderConfig;
+import io.pravega.test.common.LeakDetectorTestSuite;
 import io.pravega.test.common.TestUtils;
 import io.pravega.test.common.TestingServerStarter;
-import io.pravega.test.integration.demo.ControllerWrapper;
-import java.net.URI;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.Map;
-import java.util.Random;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.function.Function;
-import java.util.function.Supplier;
+import io.pravega.test.integration.utils.ControllerWrapper;
 import lombok.Cleanup;
+import lombok.val;
 import lombok.extern.slf4j.Slf4j;
-import org.apache.curator.test.TestingServer;
-import org.junit.After;
-import org.junit.Assert;
-import org.junit.Before;
-import org.junit.Test;
-
-import static io.pravega.test.common.AssertExtensions.assertThrows;
-import static org.junit.Assert.assertNull;
-import static org.junit.Assert.assertTrue;
 
 @Slf4j
-public class BoundedStreamReaderTest {
+public class BoundedStreamReaderTest extends LeakDetectorTestSuite {
 
     private static final String SCOPE = "testScope";
     private static final String STREAM1 = "testStream1";
@@ -82,11 +92,15 @@ public class BoundedStreamReaderTest {
     private PravegaConnectionListener server;
     private ControllerWrapper controllerWrapper;
     private ServiceBuilder serviceBuilder;
-    private ScheduledExecutorService executor;
+
+    @Override
+    protected int getThreadPoolSize() {
+        return 1;
+    }
 
     @Before
     public void setUp() throws Exception {
-        executor = Executors.newSingleThreadScheduledExecutor();
+        super.before();
         zkTestServer = new TestingServerStarter().start();
 
         serviceBuilder = ServiceBuilder.newInMemoryBuilder(ServiceBuilderConfig.getDefaultConfig());
@@ -94,7 +108,8 @@ public class BoundedStreamReaderTest {
         StreamSegmentStore store = serviceBuilder.createStreamSegmentService();
         TableStore tableStore = serviceBuilder.createTableStoreService();
 
-        server = new PravegaConnectionListener(false, servicePort, store, tableStore);
+        server = new PravegaConnectionListener(false, servicePort, store, tableStore, serviceBuilder.getLowPriorityExecutor(),
+                new IndexAppendProcessor(serviceBuilder.getLowPriorityExecutor(), store));
         server.startListening();
 
         controllerWrapper = new ControllerWrapper(zkTestServer.getConnectString(),
@@ -108,11 +123,11 @@ public class BoundedStreamReaderTest {
 
     @After
     public void tearDown() throws Exception {
-        executor.shutdown();
         controllerWrapper.close();
         server.close();
         serviceBuilder.close();
         zkTestServer.close();
+        super.after();
     }
 
     @Test(timeout = 60000)
@@ -266,7 +281,7 @@ public class BoundedStreamReaderTest {
         EventStreamReader<String> reader2 = clientFactory.createReader("readerId2", "group", serializer,
                 ReaderConfig.builder().build());
         assertNull(reader2.readNextEvent(100).getEvent());
-        readerGroup.initiateCheckpoint("c1", executor);
+        readerGroup.initiateCheckpoint("c1", executorService());
         readAndVerify(reader2, 3, 4, 5);
         Assert.assertNull("Null is expected", reader2.readNextEvent(2000).getEvent());
     }
@@ -360,7 +375,7 @@ public class BoundedStreamReaderTest {
     }
 
     private void createScope(final String scopeName) throws InterruptedException, ExecutionException {
-        controllerWrapper.getControllerService().createScope(scopeName).get();
+        controllerWrapper.getControllerService().createScope(scopeName, 0L).get();
     }
 
     private void createStream(String streamName) throws Exception {
@@ -368,13 +383,14 @@ public class BoundedStreamReaderTest {
         StreamConfiguration config = StreamConfiguration.builder()
                                                         .scalingPolicy(ScalingPolicy.fixed(1))
                                                         .build();
-        controller.createStream(SCOPE, streamName, config).get();
+        val f1 = controller.createStream(SCOPE, streamName, config);
+        f1.get();
     }
 
     private void scaleStream(final String streamName, final Map<Double, Double> keyRanges) throws Exception {
         Stream stream = Stream.of(SCOPE, streamName);
         Controller controller = controllerWrapper.getController();
-        assertTrue(controller.scaleStream(stream, Collections.singletonList(0L), keyRanges, executor).getFuture().get());
+        assertTrue(controller.scaleStream(stream, Collections.singletonList(0L), keyRanges, executorService()).getFuture().get());
     }
 
     private void truncateStream(final String streamName, final StreamCut streamCut) throws Exception {

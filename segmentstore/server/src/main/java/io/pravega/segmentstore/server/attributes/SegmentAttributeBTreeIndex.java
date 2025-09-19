@@ -1,11 +1,17 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.segmentstore.server.attributes;
 
@@ -14,15 +20,16 @@ import com.google.common.base.Preconditions;
 import com.google.common.collect.Maps;
 import io.pravega.common.Exceptions;
 import io.pravega.common.TimeoutTimer;
+import io.pravega.common.concurrent.FutureSupplier;
 import io.pravega.common.concurrent.Futures;
-import io.pravega.common.function.Callbacks;
 import io.pravega.common.util.AsyncIterator;
-import io.pravega.common.util.BitConverter;
+import io.pravega.common.util.BufferView;
 import io.pravega.common.util.ByteArraySegment;
 import io.pravega.common.util.IllegalDataFormatException;
 import io.pravega.common.util.Retry;
 import io.pravega.common.util.btree.BTreeIndex;
 import io.pravega.common.util.btree.PageEntry;
+import io.pravega.segmentstore.contracts.AttributeId;
 import io.pravega.segmentstore.contracts.Attributes;
 import io.pravega.segmentstore.contracts.BadOffsetException;
 import io.pravega.segmentstore.contracts.SegmentProperties;
@@ -35,10 +42,11 @@ import io.pravega.segmentstore.server.AttributeIterator;
 import io.pravega.segmentstore.server.CacheManager;
 import io.pravega.segmentstore.server.DataCorruptionException;
 import io.pravega.segmentstore.server.SegmentMetadata;
-import io.pravega.segmentstore.storage.Cache;
 import io.pravega.segmentstore.storage.SegmentHandle;
 import io.pravega.segmentstore.storage.Storage;
-import io.pravega.shared.segment.StreamSegmentNameUtils;
+import io.pravega.segmentstore.storage.cache.CacheFullException;
+import io.pravega.segmentstore.storage.cache.CacheStorage;
+import io.pravega.shared.NameUtils;
 import java.io.InputStream;
 import java.io.SequenceInputStream;
 import java.time.Duration;
@@ -49,7 +57,6 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ScheduledExecutorService;
@@ -57,20 +64,21 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
-import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import javax.annotation.concurrent.GuardedBy;
+import lombok.AllArgsConstructor;
 import lombok.Getter;
 import lombok.NonNull;
+import lombok.RequiredArgsConstructor;
 import lombok.SneakyThrows;
-import lombok.extern.slf4j.Slf4j;
 import lombok.val;
+import lombok.extern.slf4j.Slf4j;
 
 /**
  * Attribute Index for a single Segment, backed by a B+Tree Index implementation.
  */
 @Slf4j
-public class SegmentAttributeBTreeIndex implements AttributeIndex, CacheManager.Client, AutoCloseable {
+class SegmentAttributeBTreeIndex implements AttributeIndex, CacheManager.Client, AutoCloseable {
     //region Members
 
     /**
@@ -92,22 +100,27 @@ public class SegmentAttributeBTreeIndex implements AttributeIndex, CacheManager.
             .retryingOn(StreamSegmentTruncatedException.class)
             .throwingOn(Exception.class);
 
-    private static final int KEY_LENGTH = 2 * Long.BYTES; // UUID
+    private static final int DEFAULT_KEY_LENGTH = Attributes.ATTRIBUTE_ID_LENGTH.byteCount();
     private static final int VALUE_LENGTH = Long.BYTES;
     private final SegmentMetadata segmentMetadata;
     private final AtomicReference<SegmentHandle> handle;
     private final Storage storage;
-    private final Cache cache;
+    @GuardedBy("cacheEntries")
+    private final CacheStorage cacheStorage;
     @GuardedBy("cacheEntries")
     private int currentCacheGeneration;
     @GuardedBy("cacheEntries")
     private final Map<Long, CacheEntry> cacheEntries;
-
+    @GuardedBy("cacheEntries")
+    private boolean cacheDisabled;
+    @GuardedBy("pendingReads")
+    private final Map<Long, PendingRead> pendingReads;
     private final BTreeIndex index;
     private final AttributeIndexConfig config;
     private final ScheduledExecutorService executor;
     private final String traceObjectId;
     private final AtomicBoolean closed;
+    private final KeySerializer keySerializer;
 
     //endregion
 
@@ -118,31 +131,46 @@ public class SegmentAttributeBTreeIndex implements AttributeIndex, CacheManager.
      *
      * @param segmentMetadata The SegmentMetadata of the Segment whose attributes we want to manage.
      * @param storage         A Storage adapter which can be used to access the Attribute Segment.
-     * @param cache           The Cache to use.
      * @param config          Attribute Index Configuration.
      * @param executor        An Executor to run async tasks.
      */
-    SegmentAttributeBTreeIndex(@NonNull SegmentMetadata segmentMetadata, @NonNull Storage storage, @NonNull Cache cache,
+    SegmentAttributeBTreeIndex(@NonNull SegmentMetadata segmentMetadata, @NonNull Storage storage, @NonNull CacheStorage cacheStorage,
                                @NonNull AttributeIndexConfig config, @NonNull ScheduledExecutorService executor) {
         this.segmentMetadata = segmentMetadata;
         this.storage = storage;
-        this.cache = cache;
+        this.cacheStorage = cacheStorage;
         this.config = config;
         this.executor = executor;
         this.handle = new AtomicReference<>();
+        this.traceObjectId = String.format("AttributeIndex[%d-%d]", this.segmentMetadata.getContainerId(), this.segmentMetadata.getId());
+        this.keySerializer = getKeySerializer(segmentMetadata);
         this.index = BTreeIndex.builder()
-                               .keyLength(KEY_LENGTH)
+                               .keyLength(this.keySerializer.getKeyLength())
                                .valueLength(VALUE_LENGTH)
                                .maxPageSize(this.config.getMaxIndexPageSize())
                                .executor(this.executor)
                                .getLength(this::getLength)
                                .readPage(this::readPage)
                                .writePages(this::writePages)
+                               .maintainStatistics(shouldMaintainStatistics(segmentMetadata))
+                               .traceObjectId(this.traceObjectId)
                                .build();
 
         this.cacheEntries = new HashMap<>();
-        this.traceObjectId = String.format("AttributeIndex[%d-%d]", this.segmentMetadata.getContainerId(), this.segmentMetadata.getId());
+        this.pendingReads = new HashMap<>();
         this.closed = new AtomicBoolean();
+        this.cacheDisabled = false;
+    }
+
+    private KeySerializer getKeySerializer(SegmentMetadata segmentMetadata) {
+        long keyLength = segmentMetadata.getAttributeIdLength();
+        Preconditions.checkArgument(keyLength <= AttributeId.MAX_LENGTH, "Invalid value %s for attribute `%s` for Segment `%s'. Expected at most %s.",
+                Attributes.ATTRIBUTE_ID_LENGTH, segmentMetadata.getName(), AttributeId.MAX_LENGTH);
+        return keyLength <= 0 ? new UUIDKeySerializer() : new BufferKeySerializer((int) keyLength);
+    }
+
+    private boolean shouldMaintainStatistics(SegmentMetadata segmentMetadata) {
+        return segmentMetadata.getType().isFixedKeyLengthTableSegment();
     }
 
     /**
@@ -154,7 +182,7 @@ public class SegmentAttributeBTreeIndex implements AttributeIndex, CacheManager.
     CompletableFuture<Void> initialize(Duration timeout) {
         TimeoutTimer timer = new TimeoutTimer(timeout);
         Preconditions.checkState(!this.index.isInitialized(), "SegmentAttributeIndex is already initialized.");
-        String attributeSegmentName = StreamSegmentNameUtils.getAttributeSegmentName(this.segmentMetadata.getName());
+        String attributeSegmentName = NameUtils.getAttributeSegmentName(this.segmentMetadata.getName());
 
         // Attempt to open the Attribute Segment; if it does not exist do not create it now. It will be created when we
         // make the first write.
@@ -179,7 +207,7 @@ public class SegmentAttributeBTreeIndex implements AttributeIndex, CacheManager.
      */
     static CompletableFuture<Void> delete(String segmentName, Storage storage, Duration timeout) {
         TimeoutTimer timer = new TimeoutTimer(timeout);
-        String attributeSegmentName = StreamSegmentNameUtils.getAttributeSegmentName(segmentName);
+        String attributeSegmentName = NameUtils.getAttributeSegmentName(segmentName);
         return Futures.exceptionallyExpecting(
                 storage.openWrite(attributeSegmentName)
                        .thenCompose(handle -> storage.delete(handle, timer.getRemaining())),
@@ -193,29 +221,23 @@ public class SegmentAttributeBTreeIndex implements AttributeIndex, CacheManager.
 
     @Override
     public void close() {
-        // Quick close (no cache cleanup) this should be used only in case of container shutdown, when the cache will
-        // be erased anyway.
-        close(false);
-    }
-
-    /**
-     * Closes the SegmentAttributeIndex and optionally cleans the cache.
-     *
-     * @param cleanCache If true, the Cache will be cleaned up of all entries pertaining to this Index. If false, the
-     *                   Cache will not be touched.
-     */
-    void close(boolean cleanCache) {
         if (!this.closed.getAndSet(true)) {
             // Close storage reader (and thus cancel those reads).
-            if (cleanCache) {
-                this.executor.execute(() -> {
-                    removeAllCacheEntries();
-                    log.info("{}: Closed.", this.traceObjectId);
-                });
-            } else {
-                log.info("{}: Closed (no cache cleanup).", this.traceObjectId);
-            }
+            this.executor.execute(() -> {
+                removeAllCacheEntries();
+                cancelPendingReads();
+                log.info("{}: Closed.", this.traceObjectId);
+            });
         }
+    }
+
+    private void cancelPendingReads() {
+        List<PendingRead> toCancel;
+        synchronized (this.pendingReads) {
+            toCancel = new ArrayList<>(this.pendingReads.values());
+            this.pendingReads.clear();
+        }
+        toCancel.forEach(f -> f.completion.cancel(true));
     }
 
     /**
@@ -241,43 +263,34 @@ public class SegmentAttributeBTreeIndex implements AttributeIndex, CacheManager.
 
     @Override
     public CacheManager.CacheStatus getCacheStatus() {
-        int minGen = 0;
-        int maxGen = 0;
-        long size = 0;
         synchronized (this.cacheEntries) {
-            for (CacheEntry e : this.cacheEntries.values()) {
-                if (e != null) {
-                    int g = e.getGeneration();
-                    minGen = Math.min(minGen, g);
-                    maxGen = Math.max(maxGen, g);
-                    size += e.getSize();
-                }
-            }
+            return CacheManager.CacheStatus.fromGenerations(
+                    this.cacheEntries.values().stream().filter(Objects::nonNull).map(CacheEntry::getGeneration).iterator());
         }
-
-        return new CacheManager.CacheStatus(size, minGen, maxGen);
     }
 
     @Override
-    public long updateGenerations(int currentGeneration, int oldestGeneration) {
+    public boolean updateGenerations(int currentGeneration, int oldestGeneration, boolean essentialOnly) {
         Exceptions.checkNotClosed(this.closed.get(), this);
 
         // Remove those entries that have a generation below the oldest permissible one.
-        long sizeRemoved = 0;
+        boolean anyRemoved;
         synchronized (this.cacheEntries) {
+            // All of our data are non-essential as we only cache BTreeIndex pages that are already durable persisted.
+            this.cacheDisabled = essentialOnly;
             this.currentCacheGeneration = currentGeneration;
             ArrayList<CacheEntry> toRemove = new ArrayList<>();
             for (val entry : this.cacheEntries.values()) {
                 if (entry.getGeneration() < oldestGeneration) {
-                    sizeRemoved += entry.getSize();
                     toRemove.add(entry);
                 }
             }
 
             removeFromCache(toRemove);
+            anyRemoved = !toRemove.isEmpty();
         }
 
-        return sizeRemoved;
+        return anyRemoved;
     }
 
     //endregion
@@ -285,7 +298,7 @@ public class SegmentAttributeBTreeIndex implements AttributeIndex, CacheManager.
     //region AttributeIndex Implementation
 
     @Override
-    public CompletableFuture<Void> update(@NonNull Map<UUID, Long> values, @NonNull Duration timeout) {
+    public CompletableFuture<Long> update(@NonNull Map<AttributeId, Long> values, @NonNull Duration timeout) {
         ensureInitialized();
         if (values.isEmpty()) {
             // Nothing to do.
@@ -297,7 +310,7 @@ public class SegmentAttributeBTreeIndex implements AttributeIndex, CacheManager.
     }
 
     @Override
-    public CompletableFuture<Map<UUID, Long>> get(@NonNull Collection<UUID> keys, @NonNull Duration timeout) {
+    public CompletableFuture<Map<AttributeId, Long>> get(@NonNull Collection<AttributeId> keys, @NonNull Duration timeout) {
         ensureInitialized();
         if (keys.isEmpty()) {
             // Nothing to do.
@@ -305,11 +318,11 @@ public class SegmentAttributeBTreeIndex implements AttributeIndex, CacheManager.
         }
 
         // Keep two lists, one of keys (in some order) and one of serialized keys (in the same order).
-        val keyList = new ArrayList<UUID>(keys.size());
-        val serializedKeys = new ArrayList<ByteArraySegment>(keyList.size());
-        for (UUID key : keys) {
+        val keyList = new ArrayList<AttributeId>(keys.size());
+        val serializedKeys = new ArrayList<ByteArraySegment>(keys.size());
+        for (AttributeId key : keys) {
             keyList.add(key);
-            serializedKeys.add(serializeKey(key));
+            serializedKeys.add(this.keySerializer.serialize(key));
         }
 
         // Fetch the raw data from the index, but retry (as needed) if we run across a truncated part of the attribute
@@ -320,7 +333,7 @@ public class SegmentAttributeBTreeIndex implements AttributeIndex, CacheManager.
 
                     // The index search result is a list of values in the same order as the keys we passed in, so we need
                     // to use the list index to match them.
-                    Map<UUID, Long> result = new HashMap<>();
+                    Map<AttributeId, Long> result = new HashMap<>();
                     for (int i = 0; i < keyList.size(); i++) {
                         ByteArraySegment v = entries.get(i);
                         if (v != null) {
@@ -352,10 +365,16 @@ public class SegmentAttributeBTreeIndex implements AttributeIndex, CacheManager.
     }
 
     @Override
-    public AttributeIterator iterator(UUID fromId, UUID toId, Duration fetchTimeout) {
+    public AttributeIterator iterator(AttributeId fromId, AttributeId toId, Duration fetchTimeout) {
         ensureInitialized();
         return new AttributeIteratorImpl(fromId, (id, inclusive) ->
-                this.index.iterator(serializeKey(id), inclusive, serializeKey(toId), true, fetchTimeout));
+                this.index.iterator(this.keySerializer.serialize(id), inclusive, this.keySerializer.serialize(toId), true, fetchTimeout));
+    }
+
+    @Override
+    public long getCount() {
+        val s = this.index.getStatistics();
+        return s == null ? -1 : s.getEntryCount();
     }
 
     //endregion
@@ -368,6 +387,13 @@ public class SegmentAttributeBTreeIndex implements AttributeIndex, CacheManager.
     @VisibleForTesting
     SegmentHandle getAttributeSegmentHandle() {
         return this.handle.get();
+    }
+
+    @VisibleForTesting
+    int getPendingReadCount() {
+        synchronized (this.pendingReads) {
+            return this.pendingReads.size();
+        }
     }
 
     @Override
@@ -384,9 +410,9 @@ public class SegmentAttributeBTreeIndex implements AttributeIndex, CacheManager.
      * @param <T>     Return type.
      * @return A CompletableFuture that will be completed with the result (or failure cause) of the given task toRun.
      */
-    private <T> CompletableFuture<T> createAttributeSegmentIfNecessary(Supplier<CompletableFuture<T>> toRun, Duration timeout) {
+    private <T> CompletableFuture<T> createAttributeSegmentIfNecessary(FutureSupplier<T> toRun, Duration timeout) {
         if (this.handle.get() == null) {
-            String attributeSegmentName = StreamSegmentNameUtils.getAttributeSegmentName(this.segmentMetadata.getName());
+            String attributeSegmentName = NameUtils.getAttributeSegmentName(this.segmentMetadata.getName());
             return Futures
                     .exceptionallyComposeExpecting(
                             this.storage.create(attributeSegmentName, this.config.getAttributeSegmentRollingPolicy(), timeout),
@@ -397,11 +423,11 @@ public class SegmentAttributeBTreeIndex implements AttributeIndex, CacheManager.
                             })
                     .thenComposeAsync(handle -> {
                         this.handle.set(handle);
-                        return toRun.get();
+                        return toRun.getFuture();
                     }, this.executor);
         } else {
             // Attribute Segment already exists.
-            return toRun.get();
+            return toRun.getFuture();
         }
     }
 
@@ -414,12 +440,11 @@ public class SegmentAttributeBTreeIndex implements AttributeIndex, CacheManager.
      * @param timeout        Timeout for the operation.
      * @return A CompletableFuture that will indicate when the operation completes.
      */
-    private CompletableFuture<Void> executeConditionally(Function<Duration, CompletableFuture<Long>> indexOperation, Duration timeout) {
+    private CompletableFuture<Long> executeConditionally(Function<Duration, CompletableFuture<Long>> indexOperation, Duration timeout) {
         TimeoutTimer timer = new TimeoutTimer(timeout);
         return UPDATE_RETRY
                 .runAsync(() -> executeConditionallyOnce(indexOperation, timer), this.executor)
-                .exceptionally(this::handleIndexOperationException)
-                .thenAccept(Callbacks::doNothing);
+                .exceptionally(this::handleIndexOperationException);
     }
 
     /**
@@ -450,24 +475,8 @@ public class SegmentAttributeBTreeIndex implements AttributeIndex, CacheManager.
                 });
     }
 
-    private PageEntry serialize(Map.Entry<UUID, Long> entry) {
-        return new PageEntry(serializeKey(entry.getKey()), serializeValue(entry.getValue()));
-    }
-
-    private ByteArraySegment serializeKey(UUID key) {
-        // Keys are serialized using Unsigned Longs. This ensures that they will be stored in the Attribute Index in their
-        // natural order (i.e., the same as the one done by UUID.compare()).
-        byte[] result = new byte[KEY_LENGTH];
-        BitConverter.writeUnsignedLong(result, 0, key.getMostSignificantBits());
-        BitConverter.writeUnsignedLong(result, Long.BYTES, key.getLeastSignificantBits());
-        return new ByteArraySegment(result);
-    }
-
-    private UUID deserializeKey(ByteArraySegment key) {
-        Preconditions.checkArgument(key.getLength() == KEY_LENGTH, "Unexpected key length.");
-        long msb = BitConverter.readUnsignedLong(key, 0);
-        long lsb = BitConverter.readUnsignedLong(key, Long.BYTES);
-        return new UUID(msb, lsb);
+    private PageEntry serialize(Map.Entry<AttributeId, Long> entry) {
+        return new PageEntry(this.keySerializer.serialize(entry.getKey()), serializeValue(entry.getValue()));
     }
 
     private ByteArraySegment serializeValue(Long value) {
@@ -476,27 +485,64 @@ public class SegmentAttributeBTreeIndex implements AttributeIndex, CacheManager.
             return null;
         }
 
-        byte[] result = new byte[VALUE_LENGTH];
-        BitConverter.writeLong(result, 0, value);
-        return new ByteArraySegment(result);
+        ByteArraySegment result = new ByteArraySegment(new byte[VALUE_LENGTH]);
+        result.setLong(0, value);
+        return result;
     }
 
     private long deserializeValue(ByteArraySegment value) {
         Preconditions.checkArgument(value.getLength() == VALUE_LENGTH, "Unexpected value length.");
-        return BitConverter.readLong(value, 0);
+        return value.getLong(0);
     }
 
-    private CompletableFuture<Long> getLength(Duration timeout) {
+    private CompletableFuture<BTreeIndex.IndexInfo> getLength(Duration timeout) {
+        Exceptions.checkNotClosed(this.closed.get(), this);
         SegmentHandle handle = this.handle.get();
         if (handle == null) {
-            return CompletableFuture.completedFuture(0L);
+            return CompletableFuture.completedFuture(BTreeIndex.IndexInfo.EMPTY);
         }
 
         return this.storage.getStreamSegmentInfo(handle.getSegmentName(), timeout)
-                           .thenApply(SegmentProperties::getLength);
+                .thenApply(segmentInfo -> {
+                    // Get the root pointer from the Segment's Core Attributes.
+                    long rootPointer = getRootPointerIfNeeded(segmentInfo);
+                    return new BTreeIndex.IndexInfo(segmentInfo.getLength(), rootPointer);
+                });
     }
 
-    private CompletableFuture<ByteArraySegment> readPage(long offset, int length, Duration timeout) {
+    /**
+     * Extracts the {@link Attributes#ATTRIBUTE_SEGMENT_ROOT_POINTER} from the given {@link SegmentProperties} if necessary.
+     * If {@link Storage#supportsAtomicWrites()} is true for {@link #storage}, then a negative value is returned and
+     * the information from the given {@link SegmentProperties} is ignored.
+     *
+     * @param segmentInfo The {@link SegmentProperties} to extract from.
+     * @return The extracted root pointer or a negative value if not needed.
+     */
+    private long getRootPointerIfNeeded(SegmentProperties segmentInfo) {
+        // Get the root pointer from the Segment's Core Attributes.
+        long rootPointer = BTreeIndex.IndexInfo.EMPTY.getRootPointer(); // -1;
+        if (this.storage.supportsAtomicWrites()) {
+            // No need to worry about Root Pointers if the underlying Storage supports atomic writes. We only need this
+            // for RollingStorage which does not make such guarantees.
+            return rootPointer;
+        }
+
+        rootPointer = this.segmentMetadata.getAttributes().getOrDefault(Attributes.ATTRIBUTE_SEGMENT_ROOT_POINTER, rootPointer);
+        if (rootPointer != BTreeIndex.IndexInfo.EMPTY.getRootPointer() && rootPointer < segmentInfo.getStartOffset()) {
+            // The Root Pointer is invalid as it points to an offset prior to the Attribute Segment's Start Offset.
+            // The Attribute Segment is updated in 3 sequential steps: 1) Write new BTree pages, 2) Truncate and
+            // 3) Update root Pointer.
+            // The purpose of the Root Pointer is to provide a location of a consistently written update in case
+            // step 1) above fails (it is not atomic). However, if both 1) and 2) complete but 3) doesn't, then
+            // it's possible that the existing Root Pointer has been truncated out. In this case, it should be
+            // safe to ignore it and let the BTreeIndex read the file from the end (as it does in this case).
+            log.info("{}: Root Pointer ({}) is below Attribute Segment's StartOffset ({}). Ignoring.", this.traceObjectId, rootPointer, segmentInfo.getStartOffset());
+            rootPointer = BTreeIndex.IndexInfo.EMPTY.getRootPointer();
+        }
+        return rootPointer;
+    }
+
+    private CompletableFuture<ByteArraySegment> readPage(long offset, int length, boolean cacheResult, Duration timeout) {
         // First, check in the cache.
         byte[] fromCache = getFromCache(offset, length);
         if (fromCache != null) {
@@ -515,49 +561,103 @@ public class SegmentAttributeBTreeIndex implements AttributeIndex, CacheManager.
                         "Attribute Index Segment has not been created yet. Cannot read %d byte(s) from offset (%d).",
                         length, offset)));
             }
-        } else {
-            byte[] buffer = new byte[length];
-            return this.storage.read(handle, offset, buffer, 0, length, timeout)
-                               .thenApplyAsync(bytesRead -> {
-                                   Preconditions.checkArgument(length == bytesRead, "Unexpected number of bytes read.");
-                                   storeInCache(offset, buffer);
-                                   return new ByteArraySegment(buffer);
-                               }, this.executor);
+        }
+
+        return readPageFromStorage(handle, offset, length, cacheResult, timeout);
+    }
+
+    /**
+     * Reads a BTreeIndex page from Storage and inserts its into the cache (no cache lookups are performed).
+     * Handles read concurrency on the same page by piggybacking on existing running reads on that page (identified by
+     * page offset). If more than one concurrent request is issued for the same page, only one will be sent to Storage,
+     * and subsequent ones will be attached to the original one.
+     *
+     * @param handle      {@link SegmentHandle} to read from.
+     * @param offset      Page offset.
+     * @param length      Page length.
+     * @param cacheResult If true, the result of this operation should be cached, if possible.
+     * @param timeout     Timeout for the operation.
+     * @return A CompletableFuture that will contain the result.
+     */
+    @VisibleForTesting
+    CompletableFuture<ByteArraySegment> readPageFromStorage(SegmentHandle handle, long offset, int length, boolean cacheResult, Duration timeout) {
+        PendingRead pr;
+        synchronized (this.pendingReads) {
+            pr = this.pendingReads.get(offset);
+            if (pr == null) {
+                // Nobody else waiting for this offset. Register ourselves.
+                pr = new PendingRead(offset, length);
+                pr.completion.whenComplete((r, ex) -> unregisterPendingRead(offset));
+                this.pendingReads.put(offset, pr);
+            } else if (pr.length < length) {
+                // Somehow the previous request wanted to read less than us. This shouldn't be the case, yet it is
+                // a situation we should handle. In his case, we will not be recording the PendingRead.
+                log.warn("{}: Concurrent read at (Offset={}, OldLength={}), but with different length ({}). Not piggybacking.", this.traceObjectId, offset, pr.length, length);
+                pr = new PendingRead(offset, length);
+            } else {
+                // Piggyback on the existing read.
+                log.debug("{}: Concurrent read (Offset={}, Length={}, NewCount={}). Piggybacking.", this.traceObjectId, offset, pr.length, pr.count);
+                pr.count.incrementAndGet();
+                return pr.completion;
+            }
+        }
+
+        // Issue the read request.
+        return readPageFromStorage(handle, pr, cacheResult, timeout);
+    }
+
+    private CompletableFuture<ByteArraySegment> readPageFromStorage(SegmentHandle handle, PendingRead pr, boolean cacheResult, Duration timeout) {
+        byte[] buffer = new byte[pr.length];
+        Futures.completeAfter(
+                () -> this.storage.read(handle, pr.offset, buffer, 0, pr.length, timeout)
+                        .thenApplyAsync(bytesRead -> {
+                            Preconditions.checkArgument(pr.length == bytesRead, "Unexpected number of bytes read.");
+                            if (cacheResult) {
+                                storeInCache(pr.offset, buffer);
+                            }
+                            return new ByteArraySegment(buffer);
+                        }, this.executor),
+                pr.completion);
+        return pr.completion;
+    }
+
+    private void unregisterPendingRead(long offset) {
+        PendingRead pr;
+        synchronized (this.pendingReads) {
+            pr = this.pendingReads.remove(offset);
+        }
+        if (pr != null && pr.count.get() > 1) {
+            // Only do it for the interesting cases (don't spam the logs if there's no concurrency).
+            log.debug("{}: Concurrent reads unregistered (Offset={}, Length={}, Count={}).", this.traceObjectId, pr.offset, pr.length, pr.count);
         }
     }
 
-    private CompletableFuture<Long> writePages(List<Map.Entry<Long, ByteArraySegment>> pages, Collection<Long> obsoleteOffsets,
+    private CompletableFuture<Long> writePages(List<BTreeIndex.WritePage> pages, Collection<Long> obsoleteOffsets,
                                                long truncateOffset, Duration timeout) {
         // The write offset is the offset of the first page to be written in the list.
-        long writeOffset = pages.get(0).getKey();
+        long writeOffset = pages.get(0).getOffset();
 
         // Collect the data to be written.
         val streams = new ArrayList<InputStream>();
         AtomicInteger length = new AtomicInteger();
-        for (val e : pages) {
+        for (val p : pages) {
             // Validate that the given pages are indeed in the correct order.
-            long pageOffset = e.getKey();
-            Preconditions.checkArgument(pageOffset == writeOffset + length.get(), "Unexpected page offset.");
+            Preconditions.checkArgument(p.getOffset() == writeOffset + length.get(), "Unexpected page offset.");
 
             // Collect the pages (as InputStreams) and record their lengths.
-            ByteArraySegment pageContents = e.getValue();
-            streams.add(pageContents.getReader());
-            length.addAndGet(pageContents.getLength());
+            streams.add(p.getContents().getReader());
+            length.addAndGet(p.getContents().getLength());
         }
 
         // Create the Attribute Segment in Storage (if needed), then write the new data to it and truncate if necessary.
         TimeoutTimer timer = new TimeoutTimer(timeout);
         return createAttributeSegmentIfNecessary(() -> writeToSegment(streams, writeOffset, length.get(), timer), timer.getRemaining())
-                .thenComposeAsync(v -> {
-                    if (this.storage.supportsTruncation() && truncateOffset >= 0) {
-                        return this.storage.truncate(this.handle.get(), truncateOffset, timer.getRemaining());
-                    } else {
-                        log.debug("{}: Not truncating attribute segment. SupportsTruncation = {}, TruncateOffset = {}.",
-                                this.traceObjectId, this.storage.supportsTruncation(), truncateOffset);
-                        return CompletableFuture.completedFuture(null);
-                    }
-                }, this.executor)
                 .thenApplyAsync(v -> {
+                    Exceptions.checkNotClosed(this.closed.get(), this);
+
+                    // Trigger an async truncation. There is no need to wait for it.
+                    truncateAsync(truncateOffset, timer.getRemaining());
+
                     // Store data in cache and remove obsolete pages.
                     storeInCache(pages, obsoleteOffsets);
 
@@ -572,16 +672,35 @@ public class SegmentAttributeBTreeIndex implements AttributeIndex, CacheManager.
         return this.storage.write(this.handle.get(), writeOffset, toWrite, length, timer.getRemaining());
     }
 
+    /**
+     * Initiates a segment truncation at the given offset, but does not wait for it. An exception listener is attached
+     * which will log any errors.
+     *
+     * Truncation is only useful for compaction so it is not a big deal if it doesn't complete or fails. A subsequent
+     * attempt (via another update) will include this one as well.
+     */
+    private void truncateAsync(long truncateOffset, Duration timeout) {
+        if (this.storage.supportsTruncation() && truncateOffset >= 0) {
+            log.debug("{}: Truncating attribute segment at offset {}.", this.traceObjectId, truncateOffset);
+            Futures.exceptionListener(this.storage.truncate(this.handle.get(), truncateOffset, timeout),
+                    ex -> log.warn("{}: Error while performing async truncation at offset {}.", this.traceObjectId, truncateOffset, ex));
+        } else {
+            log.debug("{}: Not truncating attribute segment. SupportsTruncation = {}, TruncateOffset = {}.",
+                    this.traceObjectId, this.storage.supportsTruncation(), truncateOffset);
+        }
+    }
+
     private byte[] getFromCache(long offset, int length) {
         synchronized (this.cacheEntries) {
             CacheEntry entry = this.cacheEntries.getOrDefault(offset, null);
             if (entry != null) {
-                byte[] data = this.cache.get(entry.getKey());
-                if (data != null && data.length == length) {
+                BufferView data = this.cacheStorage.get(entry.getCacheAddress());
+                if (data != null && data.getLength() == length) {
                     // We only deem a cache entry valid if it exists and has the expected length; otherwise it's best
                     // if we treat it as a cache miss and re-read it from Storage.
                     entry.setGeneration(this.currentCacheGeneration);
-                    return data;
+                    // TODO: we do need a copy since we are making changes to this thing and we shouldn't modify the cache directly.
+                    return data.getCopy();
                 }
             }
         }
@@ -591,38 +710,73 @@ public class SegmentAttributeBTreeIndex implements AttributeIndex, CacheManager.
 
     private void storeInCache(long offset, byte[] data) {
         synchronized (this.cacheEntries) {
-            CacheEntry entry = this.cacheEntries.getOrDefault(offset, null);
-            if (entry == null || entry.getSize() != data.length) {
-                // If the entry does not exist or has the wrong length, we need to re-insert it.
-                entry = new CacheEntry(offset, data.length, this.currentCacheGeneration);
-                this.cacheEntries.put(offset, entry);
-            }
-
-            // Update the entry's data.
-            this.cache.insert(entry.getKey(), data);
+            Exceptions.checkNotClosed(this.closed.get(), this);
+            storeInCache(offset, new ByteArraySegment(data));
         }
     }
 
-    private void storeInCache(List<Map.Entry<Long, ByteArraySegment>> toAdd, Collection<Long> obsoleteOffsets) {
+    private void storeInCache(List<BTreeIndex.WritePage> toAdd, Collection<Long> obsoleteOffsets) {
         synchronized (this.cacheEntries) {
+            Exceptions.checkNotClosed(this.closed.get(), this);
+
             // Remove obsolete pages.
             obsoleteOffsets.stream()
-                           .map(this.cacheEntries::get)
-                           .filter(Objects::nonNull)
-                           .forEach(this::removeFromCache);
+                    .map(this.cacheEntries::get)
+                    .filter(Objects::nonNull)
+                    .forEach(this::removeFromCache);
 
             // Add new ones.
-            for (val e : toAdd) {
-                long offset = e.getKey();
-                ByteArraySegment data = e.getValue();
-                CacheEntry entry = this.cacheEntries.getOrDefault(offset, null);
-                if (entry == null || entry.getSize() != data.getLength()) {
-                    entry = new CacheEntry(offset, data.getLength(), this.currentCacheGeneration);
-                    this.cacheEntries.put(offset, entry);
+            for (val p : toAdd) {
+                if (p.isCache()) {
+                    storeInCache(p.getOffset(), p.getContents());
                 }
-
-                this.cache.insert(entry.getKey(), data);
             }
+        }
+    }
+
+    @GuardedBy("cacheEntries")
+    private void storeInCache(long entryOffset, ByteArraySegment data) {
+        CacheEntry entry = this.cacheEntries.getOrDefault(entryOffset, null);
+        if (entry != null && entry.getSize() == data.getLength()) {
+            // Already cached.
+            return;
+        }
+
+        // All our cache entries are considered "non-essential" since they can always be reloaded from Storage. Do not
+        // try to insert/update them into the cache if such traffic is discouraged.
+        if (this.cacheDisabled) {
+            log.debug("{}: Cache update skipped for offset {}, length {}. Non-essential cache disabled.",
+                    this.traceObjectId, entryOffset, data.getLength());
+            return;
+        }
+
+        // Insert/Update the cache. There is a chance this won't go through, so be able to handle that. It's not the end
+        // of the world if we can't update the cache (as we always have the data in the attribute segment). If we are
+        // having trouble, log the error and move on.
+        int entryAddress = entry == null ? CacheEntry.NO_ADDRESS : entry.getCacheAddress();
+        try {
+            if (entry != null && entry.isStored()) {
+                // Entry exists. Replace it.
+                entryAddress = this.cacheStorage.replace(entry.getCacheAddress(), data);
+            } else {
+                // Entry does not exist. Insert it.
+                entryAddress = this.cacheStorage.insert(data);
+            }
+        } catch (CacheFullException cfe) {
+            log.warn("{}: Cache update failed for offset {}, length {} (existing entry={}). Cache full.",
+                    this.traceObjectId, entryOffset, data.getLength(), entry);
+        } catch (Throwable ex) {
+            log.error("{}: Cache update failed for offset {}, length {} (existing entry={}).",
+                    this.traceObjectId, entryOffset, data.getLength(), entry, ex);
+        }
+
+        // Create a new entry wrapper.
+        entry = new CacheEntry(entryOffset, data.getLength(), this.currentCacheGeneration, entryAddress);
+        if (entry.isStored()) {
+            this.cacheEntries.put(entryOffset, entry);
+        } else {
+            // If we were unable to store this entry, remove it from the index.
+            this.cacheEntries.remove(entry.getOffset());
         }
     }
 
@@ -634,11 +788,14 @@ public class SegmentAttributeBTreeIndex implements AttributeIndex, CacheManager.
 
     @GuardedBy("cacheEntries")
     private void removeFromCache(CacheEntry e) {
-        this.cache.remove(e.getKey());
+        if (e.isStored()) {
+            this.cacheStorage.delete(e.getCacheAddress());
+        }
         this.cacheEntries.remove(e.getOffset());
     }
 
     private void ensureInitialized() {
+        Exceptions.checkNotClosed(this.closed.get(), this);
         Preconditions.checkState(this.index.isInitialized(), "SegmentAttributeIndex is not initialized.");
     }
 
@@ -661,7 +818,9 @@ public class SegmentAttributeBTreeIndex implements AttributeIndex, CacheManager.
     /**
      * An entry in the Cache to which one or more Attributes are mapped.
      */
-    private class CacheEntry {
+    @AllArgsConstructor
+    private static class CacheEntry {
+        static final int NO_ADDRESS = -1;
         /**
          * Id of the entry. This is used to lookup cached data in the Cache.
          */
@@ -671,19 +830,11 @@ public class SegmentAttributeBTreeIndex implements AttributeIndex, CacheManager.
         private final int size;
         @GuardedBy("this")
         private int generation;
-
-        CacheEntry(long offset, int size, int currentGeneration) {
-            this.offset = offset;
-            this.size = size;
-            this.generation = currentGeneration;
-        }
-
         /**
-         * Gets a new CacheKey representing this Entry.
+         * The {@link CacheStorage} address for this Cache Entry's data.
          */
-        CacheKey getKey() {
-            return new CacheKey(SegmentAttributeBTreeIndex.this.segmentMetadata.getId(), this.offset);
-        }
+        @Getter
+        private final int cacheAddress;
 
         /**
          * Gets a value representing the current Generation of this Cache Entry.
@@ -693,12 +844,24 @@ public class SegmentAttributeBTreeIndex implements AttributeIndex, CacheManager.
         }
 
         /**
+         * Gets a value representing whether this Cache Entry does have any data stored in the {@link CacheStorage}.
+         */
+        synchronized boolean isStored() {
+            return this.cacheAddress >= 0;
+        }
+
+        /**
          * Sets the current Generation of this Cache Entry.
          *
          * @param value The current Generation to set.
          */
         synchronized void setGeneration(int value) {
             this.generation = value;
+        }
+
+        @Override
+        public String toString() {
+            return String.format("Offset = %s, Length = %s", this.offset, this.size);
         }
     }
 
@@ -712,10 +875,10 @@ public class SegmentAttributeBTreeIndex implements AttributeIndex, CacheManager.
     private class AttributeIteratorImpl implements AttributeIterator {
         private final CreatePageEntryIterator getPageEntryIterator;
         private final AtomicReference<AsyncIterator<List<PageEntry>>> pageEntryIterator;
-        private final AtomicReference<UUID> lastProcessedId;
+        private final AtomicReference<AttributeId> lastProcessedId;
         private final AtomicBoolean firstInvocation;
 
-        AttributeIteratorImpl(UUID firstId, CreatePageEntryIterator getPageEntryIterator) {
+        AttributeIteratorImpl(AttributeId firstId, CreatePageEntryIterator getPageEntryIterator) {
             this.getPageEntryIterator = getPageEntryIterator;
             this.pageEntryIterator = new AtomicReference<>();
             this.lastProcessedId = new AtomicReference<>(firstId);
@@ -724,7 +887,7 @@ public class SegmentAttributeBTreeIndex implements AttributeIndex, CacheManager.
         }
 
         @Override
-        public CompletableFuture<List<Map.Entry<UUID, Long>>> getNext() {
+        public CompletableFuture<List<Map.Entry<AttributeId, Long>>> getNext() {
             return READ_RETRY
                     .runAsync(this::getNextPageEntries, executor)
                     .thenApply(pageEntries -> {
@@ -734,7 +897,7 @@ public class SegmentAttributeBTreeIndex implements AttributeIndex, CacheManager.
                         }
 
                         val result = pageEntries.stream()
-                                                .map(e -> Maps.immutableEntry(deserializeKey(e.getKey()), deserializeValue(e.getValue())))
+                                                .map(e -> Maps.immutableEntry(keySerializer.deserialize(e.getKey()), deserializeValue(e.getValue())))
                                                 .collect(Collectors.toList());
                         if (result.size() > 0) {
                             // Update the last Attribute Id and also indicate that we have processed at least one iteration.
@@ -748,6 +911,7 @@ public class SegmentAttributeBTreeIndex implements AttributeIndex, CacheManager.
         }
 
         private CompletableFuture<List<PageEntry>> getNextPageEntries() {
+            Exceptions.checkNotClosed(SegmentAttributeBTreeIndex.this.closed.get(), SegmentAttributeBTreeIndex.this);
             return this.pageEntryIterator
                     .get().getNext()
                     .exceptionally(ex -> {
@@ -761,13 +925,94 @@ public class SegmentAttributeBTreeIndex implements AttributeIndex, CacheManager.
             // If this is the first invocation then we need to treat the lastProcessedId as "inclusive" in the iterator, since it
             // was the first value we wanted our iterator to begin at. For any other cases, we need to treat it as exclusive,
             // since it stores the last id we have ever returned, so we want to begin with the following one.
+            Exceptions.checkNotClosed(SegmentAttributeBTreeIndex.this.closed.get(), SegmentAttributeBTreeIndex.this);
             this.pageEntryIterator.set(this.getPageEntryIterator.apply(this.lastProcessedId.get(), this.firstInvocation.get()));
         }
     }
 
     @FunctionalInterface
     private interface CreatePageEntryIterator {
-        AsyncIterator<List<PageEntry>> apply(UUID firstId, boolean firstIdInclusive);
+        AsyncIterator<List<PageEntry>> apply(AttributeId firstId, boolean firstIdInclusive);
+    }
+
+    @RequiredArgsConstructor
+    private static class PendingRead {
+        final long offset;
+        final int length;
+        final AtomicInteger count = new AtomicInteger(1);
+        final CompletableFuture<ByteArraySegment> completion = new CompletableFuture<>();
+    }
+
+    //endregion
+
+    //region Key Serializers
+
+    /**
+     * Serializer for Keys.
+     */
+    private static abstract class KeySerializer {
+        /**
+         * The expected Key Length for this serializer.
+         */
+        abstract int getKeyLength();
+
+        /**
+         * Serializes the given {@link AttributeId} to a {@link ByteArraySegment} of length {@link #getKeyLength()}.
+         */
+        abstract ByteArraySegment serialize(AttributeId attributeId);
+
+        /**
+         * Deserializes a {@link ByteArraySegment} of length {@link #getKeyLength()} into an {@link AttributeId}.
+         */
+        abstract AttributeId deserialize(ByteArraySegment serializedId);
+
+        protected void checkKeyLength(int length) {
+            Preconditions.checkArgument(length == getKeyLength(), "Expected Attribute Id length %s, given %s.", getKeyLength(), length);
+        }
+    }
+
+    @RequiredArgsConstructor
+    @Getter
+    private static class BufferKeySerializer extends KeySerializer {
+        private final int keyLength;
+
+        @Override
+        ByteArraySegment serialize(AttributeId attributeId) {
+            checkKeyLength(attributeId.byteCount());
+            return attributeId.toBuffer();
+        }
+
+        @Override
+        AttributeId deserialize(ByteArraySegment serializedId) {
+            checkKeyLength(serializedId.getLength());
+            return AttributeId.from(serializedId.getCopy());
+        }
+    }
+
+    private static class UUIDKeySerializer extends KeySerializer {
+        @Override
+        int getKeyLength() {
+            return DEFAULT_KEY_LENGTH;
+        }
+
+        @Override
+        ByteArraySegment serialize(AttributeId attributeId) {
+            // Keys are serialized using Unsigned Longs. This ensures that they will be stored in the Attribute Index in their
+            // natural order (i.e., the same as the one done by AttributeId.compare()).
+            checkKeyLength(attributeId.byteCount());
+            ByteArraySegment result = new ByteArraySegment(new byte[DEFAULT_KEY_LENGTH]);
+            result.setUnsignedLong(0, attributeId.getBitGroup(0));
+            result.setUnsignedLong(Long.BYTES, attributeId.getBitGroup(1));
+            return result;
+        }
+
+        @Override
+        AttributeId deserialize(ByteArraySegment serializedId) {
+            checkKeyLength(serializedId.getLength());
+            long msb = serializedId.getUnsignedLong(0);
+            long lsb = serializedId.getUnsignedLong(Long.BYTES);
+            return AttributeId.uuid(msb, lsb);
+        }
     }
 
     //endregion

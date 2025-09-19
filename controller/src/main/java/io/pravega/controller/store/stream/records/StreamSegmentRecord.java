@@ -1,11 +1,17 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.controller.store.stream.records;
 
@@ -14,7 +20,8 @@ import io.pravega.common.ObjectBuilder;
 import io.pravega.common.io.serialization.RevisionDataInput;
 import io.pravega.common.io.serialization.RevisionDataOutput;
 import io.pravega.common.io.serialization.VersionedSerializer;
-import io.pravega.shared.segment.StreamSegmentNameUtils;
+import io.pravega.controller.store.SegmentRecord;
+import io.pravega.shared.NameUtils;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Data;
@@ -22,13 +29,13 @@ import lombok.Data;
 import java.io.IOException;
 import java.util.Map;
 
-@Data
-@Builder
-@AllArgsConstructor
 /**
  * Data class for Stream segment record.
  */
-public class StreamSegmentRecord {
+@Data
+@Builder
+@AllArgsConstructor
+public class StreamSegmentRecord implements SegmentRecord {
     public static final StreamSegmentRecordSerializer SERIALIZER = new StreamSegmentRecordSerializer();
 
     private final int segmentNumber;
@@ -41,8 +48,9 @@ public class StreamSegmentRecord {
 
     }
 
+    @Override
     public long segmentId() {
-        return StreamSegmentNameUtils.computeSegmentId(segmentNumber, creationEpoch);
+        return NameUtils.computeSegmentId(segmentNumber, creationEpoch);
     }
 
     /**
@@ -73,6 +81,15 @@ public class StreamSegmentRecord {
     public static boolean overlaps(final Map.Entry<Double, Double> first,
                                    final Map.Entry<Double, Double> second) {
         return second.getValue() > first.getKey() && second.getKey() < first.getValue();
+    }
+
+    @Override
+    public String toString() {
+        return String.format("%s = %s", "segmentNumber", segmentNumber) + "\n" +
+                String.format("%s = %s", "creationEpoch", creationEpoch) + "\n" +
+                String.format("%s = %s", "creationTime", creationTime) + "\n" +
+                String.format("%s = %s", "keyStart", keyStart) + "\n" +
+                String.format("%s = %s", "keyEnd", keyEnd);
     }
 
     @VisibleForTesting

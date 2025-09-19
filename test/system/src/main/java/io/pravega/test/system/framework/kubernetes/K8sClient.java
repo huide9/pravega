@@ -1,44 +1,55 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.test.system.framework.kubernetes;
 
 import com.google.common.collect.ImmutableMap;
 import com.google.gson.JsonSyntaxException;
 import com.google.gson.reflect.TypeToken;
-import io.kubernetes.client.ApiCallback;
-import io.kubernetes.client.ApiClient;
-import io.kubernetes.client.ApiException;
-import io.kubernetes.client.Configuration;
+import io.kubernetes.client.custom.V1Patch;
+import io.kubernetes.client.openapi.ApiCallback;
+import io.kubernetes.client.openapi.ApiClient;
+import io.kubernetes.client.openapi.ApiException;
+import io.kubernetes.client.openapi.Configuration;
 import io.kubernetes.client.PodLogs;
-import io.kubernetes.client.apis.ApiextensionsV1beta1Api;
-import io.kubernetes.client.apis.AppsV1Api;
-import io.kubernetes.client.apis.CoreV1Api;
-import io.kubernetes.client.apis.CustomObjectsApi;
-import io.kubernetes.client.apis.RbacAuthorizationV1beta1Api;
-import io.kubernetes.client.models.V1ContainerState;
-import io.kubernetes.client.models.V1ContainerStateTerminated;
-import io.kubernetes.client.models.V1ContainerStatus;
-import io.kubernetes.client.models.V1DeleteOptions;
-import io.kubernetes.client.models.V1Deployment;
-import io.kubernetes.client.models.V1Namespace;
-import io.kubernetes.client.models.V1ObjectMeta;
-import io.kubernetes.client.models.V1Pod;
-import io.kubernetes.client.models.V1PodList;
-import io.kubernetes.client.models.V1PodStatus;
-import io.kubernetes.client.models.V1ServiceAccount;
-import io.kubernetes.client.models.V1beta1ClusterRole;
-import io.kubernetes.client.models.V1beta1ClusterRoleBinding;
-import io.kubernetes.client.models.V1beta1CustomResourceDefinition;
-import io.kubernetes.client.models.V1beta1Role;
-import io.kubernetes.client.models.V1beta1RoleBinding;
+import io.kubernetes.client.openapi.apis.ApiextensionsV1Api;
+import io.kubernetes.client.openapi.apis.AppsV1Api;
+import io.kubernetes.client.openapi.apis.CoreV1Api;
+import io.kubernetes.client.openapi.apis.CustomObjectsApi;
+import io.kubernetes.client.openapi.apis.RbacAuthorizationV1Api;
+import io.kubernetes.client.openapi.models.V1ClusterRole;
+import io.kubernetes.client.openapi.models.V1ClusterRoleBinding;
+import io.kubernetes.client.openapi.models.V1ConfigMap;
+import io.kubernetes.client.openapi.models.V1ContainerState;
+import io.kubernetes.client.openapi.models.V1ContainerStateTerminated;
+import io.kubernetes.client.openapi.models.V1ContainerStatus;
+import io.kubernetes.client.openapi.models.V1CustomResourceDefinition;
+import io.kubernetes.client.openapi.models.V1DeleteOptions;
+import io.kubernetes.client.openapi.models.V1Deployment;
+import io.kubernetes.client.openapi.models.V1Namespace;
+import io.kubernetes.client.openapi.models.V1ObjectMeta;
+import io.kubernetes.client.openapi.models.V1Pod;
+import io.kubernetes.client.openapi.models.V1PodList;
+import io.kubernetes.client.openapi.models.V1PodStatus;
+import io.kubernetes.client.openapi.models.V1Role;
+import io.kubernetes.client.openapi.models.V1RoleBinding;
+import io.kubernetes.client.openapi.models.V1Secret;
+import io.kubernetes.client.openapi.models.V1ServiceAccount;
+import io.kubernetes.client.openapi.models.V1Status;
 import io.kubernetes.client.util.Config;
+import io.kubernetes.client.util.PatchUtils;
 import io.kubernetes.client.util.Watch;
 import io.pravega.common.Exceptions;
 import io.pravega.common.concurrent.ExecutorServiceHelpers;
@@ -56,9 +67,9 @@ import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Predicate;
+import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import lombok.Cleanup;
 import lombok.SneakyThrows;
@@ -73,13 +84,19 @@ import static javax.ws.rs.core.Response.Status.NOT_FOUND;
 @Slf4j
 public class K8sClient {
 
+    private static final boolean ALLOW_WATCH_BOOKMARKS = true;
+    // Indicates if an object can be returned without completing its initialization.
     private static final int DEFAULT_TIMEOUT_MINUTES = 10; // timeout of http client.
     private static final int RETRY_MAX_DELAY_MS = 1_000; // max time between retries to check if pod has completed.
     private static final int RETRY_COUNT = 50; // Max duration incase of an exception is around 50 * RETRY_MAX_DELAY_MS = 50 seconds.
     private static final int LOG_DOWNLOAD_RETRY_COUNT = 7;
     // Delay before starting to download the logs. The K8s api server responds with error code 400 if immediately requested for log download.
     private static final long LOG_DOWNLOAD_INIT_DELAY_MS = SECONDS.toMillis(20);
-    private static final String PRETTY_PRINT = "false";
+    // When present, indicates that modifications should not be persisted. Only valid value is "All", or null.
+    private static final String DRY_RUN = null;
+    private static final String FIELD_MANAGER = "pravega-k8-client";
+    private static final String PRETTY_PRINT = null;
+    private static final int POD_RUNNING_RETRIES = Byte.MAX_VALUE;
     private final ApiClient client;
     private final PodLogs logUtility;
     // size of the executor is 3 (1 thread is used to watch the pod status, 2 threads for background log copy).
@@ -112,7 +129,7 @@ public class K8sClient {
             log.debug("Initialize KUBERNETES api client");
             client = Config.defaultClient();
             client.setDebugging(false); // this can be set to true enable http dump.
-            client.getHttpClient().setReadTimeout(DEFAULT_TIMEOUT_MINUTES, TimeUnit.MINUTES);
+            client.setHttpClient(client.getHttpClient().newBuilder().readTimeout(DEFAULT_TIMEOUT_MINUTES, TimeUnit.MINUTES).build());
             Configuration.setDefaultApiClient(client);
             Runtime.getRuntime().addShutdownHook(new Thread(this::close));
         } catch (IOException e) {
@@ -130,7 +147,7 @@ public class K8sClient {
     public V1Namespace createNamespace(final String namespace) {
         CoreV1Api api = new CoreV1Api();
         try {
-            V1Namespace existing = api.readNamespace(namespace, PRETTY_PRINT, Boolean.FALSE, Boolean.FALSE);
+            V1Namespace existing = api.readNamespace(namespace, PRETTY_PRINT);
             if (existing != null) {
                 log.info("Namespace {} already exists, ignoring namespace create operation.", namespace);
                 return existing;
@@ -149,7 +166,7 @@ public class K8sClient {
         meta.setName(namespace);
         body.setMetadata(meta);
 
-        return api.createNamespace(body, PRETTY_PRINT);
+        return api.createNamespace(body, PRETTY_PRINT, DRY_RUN, FIELD_MANAGER, null);
     }
 
     /**
@@ -161,8 +178,8 @@ public class K8sClient {
     @SneakyThrows(ApiException.class)
     public CompletableFuture<V1Pod> deployPod(final String namespace, final V1Pod pod) {
         CoreV1Api api = new CoreV1Api();
-        K8AsyncCallback<V1Pod> callback = new K8AsyncCallback<>("createPod");
-        api.createNamespacedPodAsync(namespace, pod, PRETTY_PRINT, callback);
+        K8AsyncCallback<V1Pod> callback = new K8AsyncCallback<>("createPod-" + pod.getMetadata().getName());
+        api.createNamespacedPodAsync(namespace, pod, PRETTY_PRINT, DRY_RUN, FIELD_MANAGER, null, callback);
         return exceptionallyExpecting(callback.getFuture(), isConflict, null);
     }
 
@@ -176,14 +193,14 @@ public class K8sClient {
     public CompletableFuture<V1PodStatus> getStatusOfPod(final String namespace, final String podName) {
         CoreV1Api api = new CoreV1Api();
         K8AsyncCallback<V1PodList> callback = new K8AsyncCallback<>("listPods");
-        api.listNamespacedPodAsync(namespace, PRETTY_PRINT, null, null, true, "POD_NAME=" + podName, null,
-                                   null, null, false, callback);
+        api.listNamespacedPodAsync(namespace, PRETTY_PRINT, ALLOW_WATCH_BOOKMARKS, null, null, "POD_NAME=" + podName, null,
+                                  null, null, null, false, callback);
         return callback.getFuture()
-                       .thenApply(v1PodList -> {
-                           Optional<V1Pod> vpod = v1PodList.getItems().stream().filter(v1Pod -> v1Pod.getMetadata().getName().equals(podName) &&
-                                   v1Pod.getMetadata().getNamespace().equals(namespace)).findFirst();
-                           return vpod.map(V1Pod::getStatus).orElseThrow(() -> new RuntimeException("pod not found" + podName));
-                       });
+                .thenApply(v1PodList -> {
+                    Optional<V1Pod> vpod = v1PodList.getItems().stream().filter(v1Pod -> v1Pod.getMetadata().getName().equals(podName) &&
+                            v1Pod.getMetadata().getNamespace().equals(namespace)).findFirst();
+                    return vpod.map(V1Pod::getStatus).orElseThrow(() -> new RuntimeException("pod not found" + podName));
+                });
     }
 
     /**
@@ -197,7 +214,7 @@ public class K8sClient {
         return getPodsWithLabel(namespace, labelName, labelValue)
                 .thenApply(v1PodList -> {
                     List<V1Pod> podList = v1PodList.getItems();
-                    log.debug("{} pod(s) found with label {}={}.", podList.size(), labelName, labelValue);
+                    log.info("{} pod(s) found with label {}={}.", podList.size(), labelName, labelValue);
                     return podList.stream().map(V1Pod::getStatus).collect(Collectors.toList());
                 });
     }
@@ -210,7 +227,7 @@ public class K8sClient {
      * @return Future representing the list of pod status.
      */
     public CompletableFuture<V1PodList> getPodsWithLabel(String namespace, String labelName, String labelValue) {
-       return getPodsWithLabels(namespace, ImmutableMap.of(labelName, labelValue));
+        return getPodsWithLabels(namespace, ImmutableMap.of(labelName, labelValue));
     }
 
     /**
@@ -223,14 +240,12 @@ public class K8sClient {
     public CompletableFuture<V1PodList> getPodsWithLabels(String namespace, Map<String, String> labels) {
         CoreV1Api api = new CoreV1Api();
 
-        // Workaround for okhttp issue, tracked by https://github.com/pravega/pravega/issues/3361
         log.debug("Current number of http interceptors {}", api.getApiClient().getHttpClient().networkInterceptors().size());
-        api.getApiClient().getHttpClient().networkInterceptors().clear();
 
         String labelSelector = labels.entrySet().stream().map(entry -> entry.getKey() + "=" + entry.getValue()).collect(Collectors.joining());
-        K8AsyncCallback<V1PodList> callback = new K8AsyncCallback<>("listPods");
-        api.listNamespacedPodAsync(namespace, PRETTY_PRINT, null, null, true, labelSelector, null,
-                                   null, null, false, callback);
+        K8AsyncCallback<V1PodList> callback = new K8AsyncCallback<>("listPods-" + labels);
+        api.listNamespacedPodAsync(namespace, PRETTY_PRINT, ALLOW_WATCH_BOOKMARKS, null, null, labelSelector, null,
+                null, null, null, false, callback);
         return callback.getFuture();
     }
 
@@ -245,10 +260,10 @@ public class K8sClient {
     public CompletableFuture<Map<String, V1ContainerStatus>> getRestartedPods(String namespace, String labelName, String labelValue) {
         return getPodsWithLabel(namespace, labelName, labelValue)
                      .thenApply(v1PodList -> v1PodList.getItems().stream()
-                                                      .filter(pod -> !pod.getStatus().getContainerStatuses().isEmpty() &&
-                                                              (pod.getStatus().getContainerStatuses().get(0).getRestartCount() != 0))
-                                                      .collect(Collectors.toMap(pod -> pod.getMetadata().getName(),
-                                                                                pod -> pod.getStatus().getContainerStatuses().get(0))));
+                             .filter(pod -> !pod.getStatus().getContainerStatuses().isEmpty() &&
+                                     (pod.getStatus().getContainerStatuses().get(0).getRestartCount() != 0))
+                             .collect(Collectors.toMap(pod -> pod.getMetadata().getName(),
+                                     pod -> pod.getStatus().getContainerStatuses().get(0))));
     }
 
     /**
@@ -260,8 +275,8 @@ public class K8sClient {
     @SneakyThrows(ApiException.class)
     public CompletableFuture<V1Deployment> createDeployment(final String namespace, final V1Deployment deploy) {
         AppsV1Api api = new AppsV1Api();
-        K8AsyncCallback<V1Deployment> callback = new K8AsyncCallback<>("deployment");
-        api.createNamespacedDeploymentAsync(namespace, deploy, PRETTY_PRINT, callback);
+        K8AsyncCallback<V1Deployment> callback = new K8AsyncCallback<>("deployment-" + deploy.getMetadata().getName());
+        api.createNamespacedDeploymentAsync(namespace, deploy, PRETTY_PRINT, DRY_RUN, FIELD_MANAGER, null, callback);
         return exceptionallyExpecting(callback.getFuture(), isConflict, null);
     }
 
@@ -274,7 +289,7 @@ public class K8sClient {
     @SneakyThrows(ApiException.class)
     public CompletableFuture<V1Deployment> getDeploymentStatus(final String deploymentName, final String namespace) {
         AppsV1Api api = new AppsV1Api();
-        K8AsyncCallback<V1Deployment> callback = new K8AsyncCallback<>("readNamespacedDeployment");
+        K8AsyncCallback<V1Deployment> callback = new K8AsyncCallback<>("readNamespacedDeployment-" + deploymentName);
         api.readNamespacedDeploymentStatusAsync(deploymentName, namespace, PRETTY_PRINT, callback);
         return callback.getFuture();
     }
@@ -293,8 +308,8 @@ public class K8sClient {
     public CompletableFuture<Object> createCustomObject(String customResourceGroup, String version, String namespace,
                                                         String plural, Map<String, Object> request) {
         CustomObjectsApi api = new CustomObjectsApi();
-        K8AsyncCallback<Object> callback = new K8AsyncCallback<>("createCustomObject");
-        api.createNamespacedCustomObjectAsync(customResourceGroup, version, namespace, plural, request, PRETTY_PRINT, callback);
+        K8AsyncCallback<Object> callback = new K8AsyncCallback<>("createCustomObject-" + customResourceGroup);
+        api.createNamespacedCustomObjectAsync(customResourceGroup, version, namespace, plural, request, PRETTY_PRINT, null,  null, callback);
         return callback.getFuture();
     }
 
@@ -320,18 +335,30 @@ public class K8sClient {
                     try {
                         //patch object
                         K8AsyncCallback<Object> cb1 = new K8AsyncCallback<>("patchCustomObject");
-                        api.patchNamespacedCustomObjectAsync(customResourceGroup, version, namespace, plural, name, request, cb1);
+                        PatchUtils.patch(CustomObjectsApi.class,
+                                 () -> api.patchNamespacedCustomObjectCall(
+                                        customResourceGroup,
+                                        version,
+                                        namespace,
+                                        plural,
+                                        name,
+                                        request,
+                                        null,
+                                        null,
+                                        null,
+                                        cb1),
+                                V1Patch.PATCH_FORMAT_JSON_MERGE_PATCH);
                         return cb1.getFuture();
                     } catch (ApiException e) {
                         throw Exceptions.sneakyThrow(e);
                     }
                 }).exceptionally(t -> {
                     log.warn("Exception while trying to fetch instance {} of custom resource {}, try to create it. Details: {}", name,
-                             customResourceGroup, t.getMessage());
+                            customResourceGroup, t.getMessage());
                     try {
                         //create object
                         K8AsyncCallback<Object> cb = new K8AsyncCallback<>("createCustomObject");
-                        api.createNamespacedCustomObjectAsync(customResourceGroup, version, namespace, plural, request, PRETTY_PRINT, cb);
+                        api.createNamespacedCustomObjectAsync(customResourceGroup, version, namespace, plural, request, PRETTY_PRINT, null, null, cb);
                         return cb.getFuture();
                     } catch (ApiException e) {
                         throw Exceptions.sneakyThrow(e);
@@ -352,7 +379,7 @@ public class K8sClient {
     public CompletableFuture<Object> getCustomObject(String customResourceGroup, String version, String namespace,
                                                      String plural, String name) {
         CustomObjectsApi api = new CustomObjectsApi();
-        K8AsyncCallback<Object> callback = new K8AsyncCallback<>("getCustomObject");
+        K8AsyncCallback<Object> callback = new K8AsyncCallback<>("getCustomObject-" + customResourceGroup);
         api.getNamespacedCustomObjectAsync(customResourceGroup, version, namespace, plural, name, callback);
         return callback.getFuture();
     }
@@ -373,9 +400,9 @@ public class K8sClient {
         CustomObjectsApi api = new CustomObjectsApi();
         V1DeleteOptions options = new V1DeleteOptions();
         options.setOrphanDependents(false);
-        K8AsyncCallback<Object> callback = new K8AsyncCallback<>("getCustomObject");
-        api.deleteNamespacedCustomObjectAsync(customResourceGroup, version, namespace, plural, name, options,
-                                              0, false, null, callback);
+        K8AsyncCallback<Object> callback = new K8AsyncCallback<>("getCustomObject-" + customResourceGroup);
+        api.deleteNamespacedCustomObjectAsync(customResourceGroup, version, namespace, plural, name,
+                0, false, null, null, options, callback);
 
         return callback.getFuture();
     }
@@ -389,7 +416,7 @@ public class K8sClient {
     public void deletePVC(String namespace, String name) {
         CoreV1Api api = new CoreV1Api();
         try {
-            api.deleteNamespacedPersistentVolumeClaim(name, namespace, new V1DeleteOptions(), PRETTY_PRINT, null, null, null);
+            api.deleteNamespacedPersistentVolumeClaim(name, namespace, PRETTY_PRINT, DRY_RUN, null, null, null, new V1DeleteOptions());
         } catch (JsonSyntaxException e) {
             // https://github.com/kubernetes-client/java/issues/86
             if (e.getCause() instanceof IllegalStateException) {
@@ -409,10 +436,10 @@ public class K8sClient {
      * @return A future indicating the status of this operation.
      */
     @SneakyThrows(ApiException.class)
-    public CompletableFuture<V1beta1CustomResourceDefinition> createCRD(final V1beta1CustomResourceDefinition crd) {
-        ApiextensionsV1beta1Api api = new ApiextensionsV1beta1Api();
-        K8AsyncCallback<V1beta1CustomResourceDefinition> callback = new K8AsyncCallback<>("create CRD");
-        api.createCustomResourceDefinitionAsync(crd, PRETTY_PRINT, callback);
+    public CompletableFuture<V1CustomResourceDefinition> createCRD(final V1CustomResourceDefinition crd) {
+        ApiextensionsV1Api api = new ApiextensionsV1Api();
+        K8AsyncCallback<V1CustomResourceDefinition> callback = new K8AsyncCallback<>("create CRD-" + crd.getMetadata().getName());
+        api.createCustomResourceDefinitionAsync(crd, PRETTY_PRINT, DRY_RUN, FIELD_MANAGER, null, callback);
         return exceptionallyExpecting(callback.getFuture(), isConflict, null);
     }
 
@@ -422,10 +449,10 @@ public class K8sClient {
      * @return A future indicating the status of this operation.
      */
     @SneakyThrows(ApiException.class)
-    public CompletableFuture<V1beta1ClusterRole> createClusterRole(V1beta1ClusterRole role) {
-        RbacAuthorizationV1beta1Api api = new RbacAuthorizationV1beta1Api();
-        K8AsyncCallback<V1beta1ClusterRole> callback = new K8AsyncCallback<>("createClusterRole");
-        api.createClusterRoleAsync(role, PRETTY_PRINT, callback);
+    public CompletableFuture<V1ClusterRole> createClusterRole(V1ClusterRole role) {
+        RbacAuthorizationV1Api api = new RbacAuthorizationV1Api();
+        K8AsyncCallback<V1ClusterRole> callback = new K8AsyncCallback<>("createClusterRole-" + role.getMetadata().getName());
+        api.createClusterRoleAsync(role, PRETTY_PRINT, DRY_RUN, FIELD_MANAGER, null, callback);
         return exceptionallyExpecting(callback.getFuture(), isConflict, null);
     }
 
@@ -436,10 +463,10 @@ public class K8sClient {
      * @return A future indicating the status of this operation.
      */
     @SneakyThrows(ApiException.class)
-    public CompletableFuture<V1beta1Role> createRole(String namespace, V1beta1Role role) {
-        RbacAuthorizationV1beta1Api api = new RbacAuthorizationV1beta1Api();
-        K8AsyncCallback<V1beta1Role> callback = new K8AsyncCallback<>("createRole");
-        api.createNamespacedRoleAsync(namespace, role, PRETTY_PRINT, callback);
+    public CompletableFuture<V1Role> createRole(String namespace, V1Role role) {
+        RbacAuthorizationV1Api api = new RbacAuthorizationV1Api();
+        K8AsyncCallback<V1Role> callback = new K8AsyncCallback<>("createRole-" + role.getMetadata().getName());
+        api.createNamespacedRoleAsync(namespace, role, PRETTY_PRINT, DRY_RUN, FIELD_MANAGER, null, callback);
         return exceptionallyExpecting(callback.getFuture(), isConflict, null);
     }
 
@@ -449,10 +476,10 @@ public class K8sClient {
      * @return A future indicating the status of the create role binding operation.
      */
     @SneakyThrows(ApiException.class)
-    public CompletableFuture<V1beta1ClusterRoleBinding> createClusterRoleBinding(V1beta1ClusterRoleBinding binding) {
-        RbacAuthorizationV1beta1Api api = new RbacAuthorizationV1beta1Api();
-        K8AsyncCallback<V1beta1ClusterRoleBinding> callback = new K8AsyncCallback<>("createClusterRoleBinding");
-        api.createClusterRoleBindingAsync(binding, PRETTY_PRINT, callback);
+    public CompletableFuture<V1ClusterRoleBinding> createClusterRoleBinding(V1ClusterRoleBinding binding) {
+        RbacAuthorizationV1Api api = new RbacAuthorizationV1Api();
+        K8AsyncCallback<V1ClusterRoleBinding> callback = new K8AsyncCallback<>("createClusterRoleBinding");
+        api.createClusterRoleBindingAsync(binding, PRETTY_PRINT, DRY_RUN, FIELD_MANAGER, null, callback);
         return exceptionallyExpecting(callback.getFuture(), isConflict, null);
     }
 
@@ -463,10 +490,10 @@ public class K8sClient {
      * @return A future indicating the status of the create role binding operation.
      */
     @SneakyThrows(ApiException.class)
-    public CompletableFuture<V1beta1RoleBinding> createRoleBinding(String namespace, V1beta1RoleBinding binding) {
-        RbacAuthorizationV1beta1Api api = new RbacAuthorizationV1beta1Api();
-        K8AsyncCallback<V1beta1RoleBinding> callback = new K8AsyncCallback<>("createRoleBinding");
-        api.createNamespacedRoleBindingAsync(namespace, binding, PRETTY_PRINT, callback);
+    public CompletableFuture<V1RoleBinding> createRoleBinding(String namespace, V1RoleBinding binding) {
+        RbacAuthorizationV1Api api = new RbacAuthorizationV1Api();
+        K8AsyncCallback<V1RoleBinding> callback = new K8AsyncCallback<>("createRoleBinding-" + binding.getMetadata().getName());
+        api.createNamespacedRoleBindingAsync(namespace, binding, PRETTY_PRINT, DRY_RUN, FIELD_MANAGER, null, callback);
         return exceptionallyExpecting(callback.getFuture(), isConflict, null);
     }
 
@@ -479,8 +506,8 @@ public class K8sClient {
     @SneakyThrows(ApiException.class)
     public CompletableFuture<V1ServiceAccount> createServiceAccount(String namespace, V1ServiceAccount account) {
         CoreV1Api api = new CoreV1Api();
-        K8AsyncCallback<V1ServiceAccount> callback = new K8AsyncCallback<>("createServiceAccount");
-        api.createNamespacedServiceAccountAsync(namespace, account, PRETTY_PRINT, callback );
+        K8AsyncCallback<V1ServiceAccount> callback = new K8AsyncCallback<>("createServiceAccount-" + account.getMetadata().getName());
+        api.createNamespacedServiceAccountAsync(namespace, account, PRETTY_PRINT, DRY_RUN, FIELD_MANAGER, null, callback);
         return exceptionallyExpecting(callback.getFuture(), isConflict, null);
     }
 
@@ -522,11 +549,12 @@ public class K8sClient {
     private Optional<V1ContainerStateTerminated> createAWatchAndReturnOnTermination(String namespace, String podName) {
         log.debug("Creating a watch for pod {}/{}", namespace, podName);
         CoreV1Api api = new CoreV1Api();
+        K8AsyncCallback<V1ServiceAccount> callback = new K8AsyncCallback<>("createAWatchAndReturnOnTermination-" + podName);
         @Cleanup
         Watch<V1Pod> watch = Watch.createWatch(
                 client,
-                api.listNamespacedPodCall(namespace, PRETTY_PRINT, null, null, true, "POD_NAME=" + podName, null,
-                                          null, null, Boolean.TRUE, null, null),
+                api.listNamespacedPodCall(namespace, PRETTY_PRINT, ALLOW_WATCH_BOOKMARKS, null, null, "POD_NAME=" + podName, null,
+                        null, null, null, Boolean.TRUE, callback),
                 new TypeToken<Watch.Response<V1Pod>>() {
                 }.getType());
 
@@ -550,6 +578,90 @@ public class K8sClient {
     }
 
     /**
+     * Method to get V1ConfigMap.
+     * @param name Name of the ConfigMap.
+     * @param namespace Namespace on which the pod(s) reside.
+     * @return Future representing the V1ConfigMap.
+     */
+    @SneakyThrows(ApiException.class)
+    public CompletableFuture<V1ConfigMap> getConfigMap(String name, String namespace) {
+        CoreV1Api api = new CoreV1Api();
+        K8AsyncCallback<V1ConfigMap> callback = new K8AsyncCallback<>("readNamespacedConfigMap-" + name);
+        api.readNamespacedConfigMapAsync(name, namespace, PRETTY_PRINT,  callback);
+        return callback.getFuture();
+    }
+
+    /**
+     * Create ConfigMap.
+     * @param namespace The namespace where the ConfigMap should be created.
+     * @param binding The cluster ConfigMap.
+     * @return A future indicating the status of the ConfigMap operation.
+     */
+    @SneakyThrows(ApiException.class)
+    public CompletableFuture<V1ConfigMap> createConfigMap(String namespace, V1ConfigMap binding) {
+        CoreV1Api api = new CoreV1Api();
+        K8AsyncCallback<V1ConfigMap> callback = new K8AsyncCallback<>("createConfigMap-" + binding.getMetadata().getName());
+        api.createNamespacedConfigMapAsync(namespace, binding, PRETTY_PRINT, DRY_RUN, FIELD_MANAGER, null, callback);
+        return exceptionallyExpecting(callback.getFuture(), isConflict, null);
+    }
+
+    /**
+     * Method to delete V1ConfigMap.
+     * @param name Name of the ConfigMap.
+     * @param namespace Namespace on which the pod(s) reside.
+     * @return Future representing the V1ConfigMap.
+     */
+    @SneakyThrows(ApiException.class)
+    public CompletableFuture<V1Status> deleteConfigMap(String name, String namespace) {
+        CoreV1Api api = new CoreV1Api();
+        K8AsyncCallback<V1Status> callback = new K8AsyncCallback<>("deleteNamespacedConfigMap-" + name);
+        api.deleteNamespacedConfigMapAsync(name, namespace, PRETTY_PRINT, null, 0, false, null, null, callback);
+        return callback.getFuture();
+    }
+
+    /**
+     * Method to create V1Secret.
+     * @param namespace Namespace in which the secret should be created. Secrets cannot be shared outside namespace.
+     * @param secret V1Secret to create
+     * @return Future representing the V1Secret.
+     */
+    @SneakyThrows(ApiException.class)
+    public CompletableFuture<V1Secret> createSecret(String namespace, V1Secret secret) {
+        CoreV1Api api = new CoreV1Api();
+        K8AsyncCallback<V1Secret> callback = new K8AsyncCallback<>("createNamespacedSecret-" + secret.getMetadata().getName());
+        api.createNamespacedSecretAsync(namespace, secret, PRETTY_PRINT, null, null, null, callback);
+        return exceptionallyExpecting(callback.getFuture(), isConflict, null);
+    }
+
+    /**
+     * Method to get V1Secret.
+     * @param name Name of the Secret.
+     * @param namespace Namespace on which the pod(s) reside.
+     * @return Future representing the V1Secret.
+     */
+    @SneakyThrows(ApiException.class)
+    public CompletableFuture<V1Secret> getSecret(String name, String namespace) {
+        CoreV1Api api = new CoreV1Api();
+        K8AsyncCallback<V1Secret> callback = new K8AsyncCallback<>("readNamespacedSecret-" + name);
+        api.readNamespacedSecretAsync(name, namespace, PRETTY_PRINT, callback);
+        return callback.getFuture();
+    }
+
+    /**
+     * Method to delete V1Secret.
+     * @param name Name of the Secret.
+     * @param namespace Namespace on which the pod(s) reside.
+     * @return Future representing the V1Secret.
+     */
+    @SneakyThrows(ApiException.class)
+    public CompletableFuture<V1Status> deleteSecret(String name, String namespace) {
+        CoreV1Api api = new CoreV1Api();
+        K8AsyncCallback<V1Status> callback = new K8AsyncCallback<>("deleteNamespacedSecret-" + name);
+        api.deleteNamespacedSecretAsync(name, namespace, PRETTY_PRINT, null, 0, false, null, null, callback);
+        return callback.getFuture();
+    }
+
+    /**
      * A method which returns a completed future once the desired number of pod(s) are running with a given label.
      * @param namespace Namespace
      * @param labelName Label name.
@@ -559,28 +671,61 @@ public class K8sClient {
      */
     public CompletableFuture<Void> waitUntilPodIsRunning(String namespace, String labelName, String labelValue, int expectedPodCount) {
 
-        AtomicBoolean shouldRetry = new AtomicBoolean(true);
+        return waitUntilPodIsRunningRetries(namespace, labelName, labelValue, expectedPodCount, POD_RUNNING_RETRIES);
+    }
 
-        return Futures.loop(shouldRetry::get,
-                            () -> Futures.delayedFuture(Duration.ofSeconds(5), executor) // wait for 5 seconds before checking for status.
-                                         .thenCompose(v -> getStatusOfPodWithLabel(namespace, labelName, labelValue)) // fetch status of pods with the given label.
-                                         .thenApply(podStatuses -> podStatuses.stream()
-                                                                              // check for pods where all containers are running.
-                                                                              .filter(podStatus -> {
-                                                                                  if (podStatus.getContainerStatuses() == null) {
-                                                                                      return false;
-                                                                                  } else {
-                                                                                      return podStatus.getContainerStatuses()
-                                                                                                      .stream()
-                                                                                                      .allMatch(st -> st.getState().getRunning() != null);
-                                                                                  }
-                                                                              }).count()),
-                            runCount -> { // Number of pods which are running
-                                log.debug("Expected running pod count : {}, actual running pod count :{}.", expectedPodCount, runCount);
-                                if (runCount == expectedPodCount) {
-                                    shouldRetry.set(false);
-                                }
-                            }, executor);
+    /**
+     * A method which returns a CompletableFuture once *all* of the existing pods for the given label are in the running
+     * state. This means that it will wait for terminated pods to be removed in the case of a scale down event before
+     * proceeding.
+     *
+     * @param namespace Namespace
+     * @param labelName Label name.
+     * @param labelValue Value of the Label.
+     * @param expectedPodCount Number of pods that need to be running.
+     * @param retries The number of retries to attempt.
+     * @return A future which completes once the number of running pods matches the given criteria.
+     */
+    public CompletableFuture<Void> waitUntilPodIsRunningRetries(String namespace, String labelName, String labelValue, int expectedPodCount, int retries) {
+        AtomicInteger retriesRemaining = new AtomicInteger(retries);
+        Supplier<Boolean> shouldRetry = () -> retriesRemaining.getAndDecrement() > 0;
+
+        return Futures.loop(shouldRetry,
+                () -> Futures.delayedFuture(Duration.ofSeconds(5), executor) // wait for 5 seconds before checking for status.
+                        .thenCompose(v -> getPodsWithLabel(namespace, labelName, labelValue)) // fetch status of pods with the given label.
+                        .thenApply(pods -> pods),
+                pods -> {
+                    long runCount = pods.getItems().stream().map(pod -> pod.getStatus()).filter(this::isPodRunning).count();
+                    long totalCount = pods.getItems().size();
+
+                    if (runCount == totalCount && runCount == expectedPodCount) {
+                        log.info("Attempted {} retries waiting for pods.", retries - retriesRemaining.get());
+                        // Return a simplified list of the active pods (appended with their container id) to make
+                        // parsing the logs easier.
+                        List<String> names = pods.getItems()
+                                .stream()
+                                .map(pod -> pod.getMetadata().getName())
+                                .collect(Collectors.toList());
+                        log.info("Set of running pods after scale event: {}", names);
+                        // Break out of loop.
+                        retriesRemaining.set(0);
+                    } else if (retriesRemaining.get() == 0) {
+                        log.error("Retries exhausted waiting for pod(s): <{}={}>", labelName, labelValue);
+                        // Print full output in case of retry exhaustion.
+                        log.debug("{}", pods);
+                    }
+                    log.info("Running pods: {}, Terminated & Waiting Pods: {} for <{}={}>", runCount, totalCount - runCount, labelName, labelValue);
+                }, executor);
+    }
+
+    private boolean isPodRunning(V1PodStatus status) {
+        if (status.getContainerStatuses() == null) {
+            return false;
+        } else {
+            return status.getContainerStatuses()
+                    .stream()
+                    .allMatch(st -> st.getState().getRunning() != null && st.getReady());
+        }
     }
 
     /**
@@ -594,26 +739,26 @@ public class K8sClient {
 
         final AtomicInteger retryCount = new AtomicInteger(0);
         return Retry.withExpBackoff(LOG_DOWNLOAD_INIT_DELAY_MS, 10, LOG_DOWNLOAD_RETRY_COUNT, RETRY_MAX_DELAY_MS)
-                    .retryingOn(TestFrameworkException.class)
-                    .throwingOn(RuntimeException.class)
-                    .runInExecutor(() -> {
-                        final String podName = fromPod.getMetadata().getName();
-                        log.debug("Download logs from pod {}", podName);
-                        try {
-                            @Cleanup
-                            InputStream logStream = logUtility.streamNamespacedPodLog(fromPod);
-                            // On every retry this method attempts to download the complete pod logs from from K8s api-server. Due to the
-                            // amount of logs for a pod and the K8s cluster configuration it can so happen that the K8s api-server can
-                            // return truncated logs. Hence, every retry attempt does not overwrite the previously downloaded logs for
-                            // the pod.
-                            String logFile = toFile + "-" + retryCount.incrementAndGet() + ".log";
-                            Files.copy(logStream, Paths.get(logFile));
-                            log.debug("Logs downloaded from pod {} to {}", podName, logFile);
-                        } catch (ApiException | IOException e) {
-                            log.warn("Retryable error while downloading logs from pod {}. Error message: {} ", podName, e.getMessage());
-                            throw new TestFrameworkException(TestFrameworkException.Type.RequestFailed, "Error while downloading logs");
-                        }
-                    }, executor);
+                .retryingOn(TestFrameworkException.class)
+                .throwingOn(RuntimeException.class)
+                .runInExecutor(() -> {
+                    final String podName = fromPod.getMetadata().getName();
+                    log.debug("Download logs from pod {}", podName);
+                    try {
+                        @Cleanup
+                        InputStream logStream = logUtility.streamNamespacedPodLog(fromPod);
+                        // On every retry this method attempts to download the complete pod logs from from K8s api-server. Due to the
+                        // amount of logs for a pod and the K8s cluster configuration it can so happen that the K8s api-server can
+                        // return truncated logs. Hence, every retry attempt does not overwrite the previously downloaded logs for
+                        // the pod.
+                        String logFile = toFile + "-" + retryCount.incrementAndGet() + ".log";
+                        Files.copy(logStream, Paths.get(logFile));
+                        log.info("Logs downloaded from pod {} to {}", podName, logFile);
+                    } catch (ApiException | IOException e) {
+                        log.warn("Retryable error while downloading logs from pod {}. Error message: {} ", podName, e.getMessage());
+                        throw new TestFrameworkException(TestFrameworkException.Type.RequestFailed, "Error while downloading logs");
+                    }
+                }, executor);
     }
 
     /**
@@ -637,15 +782,17 @@ public class K8sClient {
         public void onFailure(ApiException e, int responseCode, Map<String, List<String>> responseHeaders) {
             if (CONFLICT.getStatusCode() == responseCode || NOT_FOUND.getStatusCode() == responseCode) {
                 log.warn("Exception observed for method {} with response code {}", method, responseCode);
+                log.warn("ResponseBody: {}", e.getResponseBody());
             } else {
                 log.error("Exception observed for method {} with response code {}", method, responseCode, e);
+                log.error("ResponseBody: {}", e.getResponseBody());
             }
             future.completeExceptionally(e);
         }
 
         @Override
         public void onSuccess(T t, int i, Map<String, List<String>> map) {
-            log.info("Method {} completed successfully with response code {} and value {}", method, i, t);
+            log.debug("Method {} completed successfully with response code {} and value {}", method, i, t);
             future.complete(t);
         }
 

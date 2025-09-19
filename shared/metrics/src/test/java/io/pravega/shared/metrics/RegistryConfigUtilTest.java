@@ -1,11 +1,17 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.shared.metrics;
 
@@ -28,6 +34,7 @@ public class RegistryConfigUtilTest {
     @Test
     public void testStatsDConfig() {
         MetricsConfig appConfig = MetricsConfig.builder()
+                .with(MetricsConfig.ENABLE_STATISTICS, true)
                 .with(MetricsConfig.OUTPUT_FREQUENCY, 37)
                 .with(MetricsConfig.METRICS_PREFIX, "statsDPrefix")
                 .with(MetricsConfig.STATSD_HOST, "localhost")
@@ -63,6 +70,19 @@ public class RegistryConfigUtilTest {
         assertEquals("admin", testConfig.userName());
         assertEquals("changeme", testConfig.password());
         assertEquals("2h", testConfig.retentionPolicy());
+        assertNull(testConfig.get("Undefined Key"));
+    }
+
+    @Test
+    public void testPrometheusConfig() {
+        MetricsConfig appConfig = MetricsConfig.builder()
+                .with(MetricsConfig.OUTPUT_FREQUENCY, 40)
+                .with(MetricsConfig.METRICS_PREFIX, "prometheusPrefix")
+                .build();
+
+        InfluxConfig testConfig = RegistryConfigUtil.createInfluxConfig(appConfig);
+        assertTrue(40 == testConfig.step().getSeconds());
+        assertEquals("prometheusPrefix", testConfig.prefix());
         assertNull(testConfig.get("Undefined Key"));
     }
 }

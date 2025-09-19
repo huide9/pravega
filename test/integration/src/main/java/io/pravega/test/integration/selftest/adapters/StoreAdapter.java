@@ -1,19 +1,25 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.test.integration.selftest.adapters;
 
 import com.google.common.base.Preconditions;
 import com.google.common.util.concurrent.AbstractIdleService;
 import io.pravega.common.concurrent.ExecutorServiceHelpers;
-import io.pravega.common.util.ArrayView;
 import io.pravega.common.util.AsyncIterator;
+import io.pravega.common.util.BufferView;
 import io.pravega.segmentstore.server.store.ServiceBuilderConfig;
 import io.pravega.segmentstore.storage.impl.bookkeeper.BookKeeperConfig;
 import io.pravega.test.integration.selftest.Event;
@@ -156,7 +162,7 @@ public abstract class StoreAdapter extends AbstractIdleService implements AutoCl
      * @param timeout        Timeout for the operation.
      * @return A CompletableFuture that, when completed, will contain the latest version of the Key.
      */
-    public abstract CompletableFuture<Long> updateTableEntry(String tableName, ArrayView key, ArrayView value, Long compareVersion, Duration timeout);
+    public abstract CompletableFuture<Long> updateTableEntry(String tableName, BufferView key, BufferView value, Long compareVersion, Duration timeout);
 
     /**
      * Removes a Table Entry from a Table.
@@ -167,7 +173,7 @@ public abstract class StoreAdapter extends AbstractIdleService implements AutoCl
      * @param timeout        Timeout for the operation.
      * @return A CompletableFuture that will be completed when the key has been removed.
      */
-    public abstract CompletableFuture<Void> removeTableEntry(String tableName, ArrayView key, Long compareVersion, Duration timeout);
+    public abstract CompletableFuture<Void> removeTableEntry(String tableName, BufferView key, Long compareVersion, Duration timeout);
 
     /**
      * Retrieves the latest value of for multiple Table Entry from a Table.
@@ -177,7 +183,7 @@ public abstract class StoreAdapter extends AbstractIdleService implements AutoCl
      * @param timeout   Timeout for the operation.
      * @return A CompletableFuture that, when completed, will contain the result.
      */
-    public abstract CompletableFuture<List<ArrayView>> getTableEntries(String tableName, List<ArrayView> keys, Duration timeout);
+    public abstract CompletableFuture<List<BufferView>> getTableEntries(String tableName, List<BufferView> keys, Duration timeout);
 
     /**
      * Iterates through all the Entries in a Table.
@@ -186,7 +192,7 @@ public abstract class StoreAdapter extends AbstractIdleService implements AutoCl
      * @param timeout   Timeout for the operation.
      * @return A CompletableFuture that will return an {@link AsyncIterator} to iterate through all entries in the table.
      */
-    public abstract CompletableFuture<AsyncIterator<List<Map.Entry<ArrayView, ArrayView>>>> iterateTableEntries(String tableName, Duration timeout);
+    public abstract CompletableFuture<AsyncIterator<List<Map.Entry<BufferView, BufferView>>>> iterateTableEntries(String tableName, Duration timeout);
 
     //endregion
 
@@ -233,10 +239,15 @@ public abstract class StoreAdapter extends AbstractIdleService implements AutoCl
             case SegmentStoreTable:
                 result = new SegmentStoreAdapter(testConfig, builderConfig, executor);
                 break;
+            case AppendProcessor:
+                result = new AppendProcessorAdapter(testConfig, builderConfig, executor);
+                break;
             case InProcessMock:
+            case InProcessMockTable:
                 result = new InProcessMockClientAdapter(testConfig, executor);
                 break;
             case InProcessStore:
+            case InProcessStoreTable:
                 result = new InProcessListenerWithRealStoreAdapter(testConfig, builderConfig, executor);
                 break;
             case OutOfProcess:

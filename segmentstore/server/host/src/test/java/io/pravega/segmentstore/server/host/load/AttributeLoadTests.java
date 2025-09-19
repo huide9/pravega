@@ -1,11 +1,17 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.segmentstore.server.host.load;
 
@@ -14,7 +20,7 @@ import io.pravega.common.Timer;
 import io.pravega.common.concurrent.Futures;
 import io.pravega.common.io.FileHelpers;
 import io.pravega.common.io.serialization.RevisionDataOutput;
-import io.pravega.common.util.ByteArraySegment;
+import io.pravega.segmentstore.contracts.AttributeId;
 import io.pravega.segmentstore.contracts.SegmentProperties;
 import io.pravega.segmentstore.contracts.StreamSegmentNotExistsException;
 import io.pravega.segmentstore.contracts.StreamSegmentTruncatedException;
@@ -26,19 +32,20 @@ import io.pravega.segmentstore.server.UpdateableContainerMetadata;
 import io.pravega.segmentstore.server.attributes.AttributeIndexConfig;
 import io.pravega.segmentstore.server.attributes.ContainerAttributeIndex;
 import io.pravega.segmentstore.server.attributes.ContainerAttributeIndexFactoryImpl;
-import io.pravega.segmentstore.storage.Cache;
-import io.pravega.segmentstore.storage.CacheFactory;
 import io.pravega.segmentstore.storage.Storage;
-import io.pravega.shared.segment.StreamSegmentNameUtils;
+import io.pravega.segmentstore.storage.chunklayer.ChunkedSegmentStorageConfig;
+import io.pravega.segmentstore.storage.mocks.InMemoryMetadataStore;
+import io.pravega.shared.NameUtils;
+import io.pravega.segmentstore.storage.cache.CacheStorage;
+import io.pravega.segmentstore.storage.cache.NoOpCache;
+import io.pravega.storage.filesystem.FileSystemSimpleStorageFactory;
 import io.pravega.storage.filesystem.FileSystemStorageConfig;
-import io.pravega.storage.filesystem.FileSystemStorageFactory;
 import io.pravega.test.common.ThreadPooledTestSuite;
 import java.io.File;
 import java.time.Duration;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Random;
-import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BiConsumer;
 import java.util.function.Predicate;
@@ -55,7 +62,7 @@ import org.junit.Test;
  */
 @Ignore
 public class AttributeLoadTests extends ThreadPooledTestSuite {
-    private static final String OUTPUT_DIR_NAME = "/tmp/pravega/attribute_load_test";
+    private static final String OUTPUT_DIR_NAME = System.getProperty("java.io.tmp", "/tmp") + "/pravega/attribute_load_test";
     private static final Duration TIMEOUT = Duration.ofSeconds(30);
     private static final int SEGMENT_ROLLING_SIZE = 16 * 1024 * 1024;
     private static final int REPORT_EVERY = 500 * 1000;
@@ -280,13 +287,13 @@ public class AttributeLoadTests extends ThreadPooledTestSuite {
                 getPerBatchMillis));
     }
 
-    private void executeInBatches(int attributeCount, int batchSize, boolean random, BiConsumer<Integer, Map<UUID, Long>> processBatch) {
+    private void executeInBatches(int attributeCount, int batchSize, boolean random, BiConsumer<Integer, Map<AttributeId, Long>> processBatch) {
         int count = 0;
         int batchId = 0;
         Random rnd = random ? new Random(0) : null;
         while (count < attributeCount) {
             int bs = Math.min(batchSize, attributeCount - count);
-            val batch = new HashMap<UUID, Long>(bs);
+            val batch = new HashMap<AttributeId, Long>(bs);
             for (int indexInBatch = 0; indexInBatch < bs; indexInBatch++) {
                 val key = random ? getRandomKey(attributeCount, rnd) : getKey(count + indexInBatch);
                 val value = getValue(batchId, indexInBatch, batchSize);
@@ -322,17 +329,17 @@ public class AttributeLoadTests extends ThreadPooledTestSuite {
         return offset - SEGMENT_ROLLING_SIZE;
     }
 
-    private UUID getKey(int count) {
-        return new UUID(count, count);
+    private AttributeId getKey(int count) {
+        return AttributeId.uuid(count, count);
     }
 
-    private UUID getRandomKey(int attributeCount, Random rnd) {
+    private AttributeId getRandomKey(int attributeCount, Random rnd) {
         int r = rnd.nextInt(attributeCount);
-        return new UUID(r, r);
+        return AttributeId.uuid(r, r);
     }
 
     private long getValue(int batchId, int indexInBatch, int batchSize) {
-        return (long) (batchId * batchSize + indexInBatch);
+        return batchId * batchSize + indexInBatch;
     }
 
     private double calculateExcessPercentage(long actualDataSize, long theoreticalDataSize) {
@@ -344,10 +351,10 @@ public class AttributeLoadTests extends ThreadPooledTestSuite {
     //region TestContext
 
     private class TestContext implements AutoCloseable {
+        final CacheStorage cacheStorage;
         final Storage storage;
         final UpdateableContainerMetadata containerMetadata;
         final ContainerAttributeIndex index;
-        final CacheFactory cacheFactory;
         final CacheManager cacheManager; // Not used, but required by the constructor.
         final long segmentId;
         final String attributeSegmentName;
@@ -356,18 +363,17 @@ public class AttributeLoadTests extends ThreadPooledTestSuite {
             val storageConfig = FileSystemStorageConfig.builder()
                                                        .with(FileSystemStorageConfig.ROOT, OUTPUT_DIR_NAME)
                                                        .build();
-            val storageFactory = new FileSystemStorageFactory(storageConfig, executorService());
-            this.storage = storageFactory.createStorageAdapter();
+            val storageFactory = new FileSystemSimpleStorageFactory(ChunkedSegmentStorageConfig.DEFAULT_CONFIG, storageConfig, executorService());
+            this.storage = storageFactory.createStorageAdapter(42, new InMemoryMetadataStore(ChunkedSegmentStorageConfig.DEFAULT_CONFIG, executorService()));
             this.containerMetadata = new MetadataBuilder(0).build();
-            this.cacheFactory = new NoOpCacheFactory();
-            //this.cacheFactory = new InMemoryCacheFactory();
+            this.cacheStorage = new NoOpCache();
             this.cacheManager = new CacheManager(CachePolicy.INFINITE, executorService());
-            val factory = new ContainerAttributeIndexFactoryImpl(config, this.cacheFactory, this.cacheManager, executorService());
+            val factory = new ContainerAttributeIndexFactoryImpl(config, this.cacheManager, executorService());
             this.index = factory.createContainerAttributeIndex(this.containerMetadata, this.storage);
 
             // Setup the segment in the metadata.
             this.segmentId = 0L;
-            this.attributeSegmentName = StreamSegmentNameUtils.getAttributeSegmentName(segmentName);
+            this.attributeSegmentName = NameUtils.getAttributeSegmentName(segmentName);
             this.containerMetadata.mapStreamSegmentId(segmentName, this.segmentId);
 
             // Cleanup any existing data.
@@ -390,62 +396,12 @@ public class AttributeLoadTests extends ThreadPooledTestSuite {
         @Override
         public void close() {
             this.index.close();
-            this.cacheFactory.close();
             this.cacheManager.close();
 
             // We generate a lot of data, we should cleanup before exiting.
             cleanup();
             this.storage.close();
-        }
-    }
-
-    //endregion
-
-    //region NoOpCache
-
-    private static class NoOpCacheFactory implements CacheFactory {
-
-        @Override
-        public Cache getCache(String id) {
-            return new NoOpCache();
-        }
-
-        @Override
-        public void close() {
-            // This method intentionally left blank.
-        }
-    }
-
-    private static class NoOpCache implements Cache {
-
-        @Override
-        public String getId() {
-            return "NoOp";
-        }
-
-        @Override
-        public void insert(Key key, byte[] data) {
-            // This method intentionally left blank.
-        }
-
-        @Override
-        public void insert(Key key, ByteArraySegment data) {
-            // This method intentionally left blank.
-        }
-
-        @Override
-        public byte[] get(Key key) {
-            return null;
-        }
-
-        @Override
-        public void remove(Key key) {
-            // This method intentionally left blank.
-        }
-
-        @Override
-        public void close() {
-            // This method intentionally left blank.
+            this.cacheStorage.close();
         }
     }
 

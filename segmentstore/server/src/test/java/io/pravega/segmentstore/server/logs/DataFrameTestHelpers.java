@@ -1,11 +1,17 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.segmentstore.server.logs;
 
@@ -83,7 +89,9 @@ class DataFrameTestHelpers {
     /**
      * Checks that the given collection of DataFrames contain the given collection of records.
      */
-    static <T> void checkReadRecords(Collection<DataFrame.DataFrameEntryIterator> dataFrames, List<T> records, Collection<Integer> knownBadRecordIndices, Function<T, ByteArraySegment> recordConverter) throws Exception {
+    static <T> void checkReadRecords(Collection<DataFrame.DataFrameEntryIterator> dataFrames, List<T> records,
+                                     Collection<Integer> knownBadRecordIndices,
+                                     Function<T, ByteArraySegment> recordConverter) throws Exception {
         ReadState state = new ReadState(records.size(), knownBadRecordIndices);
 
         for (val reader : dataFrames) {
@@ -124,7 +132,10 @@ class DataFrameTestHelpers {
                     for (byte[] data : state.getCurrentRecordEntries()) {
                         for (int i = 0; i < data.length; i++) {
                             if (currentRecord.get(recordOffset) != data[i]) {
-                                Assert.fail(String.format("Unexpected entry contents. FrameIndex = %d, RecordIndex = %d, EntryNumberInRecord = %d.", state.getFrameIndex(), state.getNextGoodRecordIndex(), i));
+                                Assert.fail(
+                                    String.format(
+                                        "Unexpected entry contents. FrameIndex = %d, RecordIndex = %d, EntryNumberInRecord = %d.",
+                                        state.getFrameIndex(), state.getNextGoodRecordIndex(), i));
                             }
 
                             recordOffset++;

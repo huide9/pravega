@@ -1,14 +1,21 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.test.common;
 
+import com.google.common.base.Preconditions;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
@@ -30,7 +37,7 @@ import static java.util.concurrent.CompletableFuture.completedFuture;
  * An Executor that runs commands that don't have a delay inline when they are submitted.
  * Delayed tasks are run on a background thread.
  */
-public class InlineExecutor implements ScheduledExecutorService {
+public class InlineExecutor implements ScheduledExecutorService, AutoCloseable {
     private final ScheduledExecutorService delayedExecutor;
 
     public InlineExecutor() {
@@ -42,6 +49,11 @@ public class InlineExecutor implements ScheduledExecutorService {
         command.run();
     }
 
+    @Override
+    public void close() {
+        shutdown();
+    }
+    
     @Override
     public void shutdown() {
         delayedExecutor.shutdown();
@@ -69,6 +81,7 @@ public class InlineExecutor implements ScheduledExecutorService {
 
     @Override
     public <T> Future<T> submit(Callable<T> task) {
+        Preconditions.checkState(!delayedExecutor.isShutdown());
         try {
             return completedFuture(task.call());
         } catch (Exception e) {
@@ -78,6 +91,7 @@ public class InlineExecutor implements ScheduledExecutorService {
 
     @Override
     public <T> Future<T> submit(Runnable task, T result) {
+        Preconditions.checkState(!delayedExecutor.isShutdown());
         try {
             task.run();
             return completedFuture(result);
@@ -88,6 +102,7 @@ public class InlineExecutor implements ScheduledExecutorService {
 
     @Override
     public Future<?> submit(Runnable task) {
+        Preconditions.checkState(!delayedExecutor.isShutdown());
         try {
             task.run();
             return completedFuture(null);
@@ -98,6 +113,7 @@ public class InlineExecutor implements ScheduledExecutorService {
 
     @Override
     public <T> List<Future<T>> invokeAll(Collection<? extends Callable<T>> tasks) throws InterruptedException {
+        Preconditions.checkState(!delayedExecutor.isShutdown());
         List<Future<T>> result = new ArrayList<>(tasks.size());
         for (Callable<T> task : tasks) {
             result.add(submit(task));
@@ -113,6 +129,7 @@ public class InlineExecutor implements ScheduledExecutorService {
 
     @Override
     public <T> T invokeAny(Collection<? extends Callable<T>> tasks) throws InterruptedException, ExecutionException {
+        Preconditions.checkState(!delayedExecutor.isShutdown());
         for (Callable<T> task : tasks) {
             try {
                 return task.call();
@@ -131,6 +148,7 @@ public class InlineExecutor implements ScheduledExecutorService {
 
     @Override
     public ScheduledFuture<?> schedule(Runnable command, long delay, TimeUnit unit) {
+        Preconditions.checkState(!delayedExecutor.isShutdown());
         if (delay == 0) {
             try {
                 command.run();
@@ -145,6 +163,7 @@ public class InlineExecutor implements ScheduledExecutorService {
 
     @Override
     public <V> ScheduledFuture<V> schedule(Callable<V> callable, long delay, TimeUnit unit) {
+        Preconditions.checkState(!delayedExecutor.isShutdown());
         if (delay == 0) {
             try {
                 return new NonScheduledFuture<>(completedFuture(callable.call()));
@@ -158,6 +177,7 @@ public class InlineExecutor implements ScheduledExecutorService {
 
     @Override
     public ScheduledFuture<?> scheduleAtFixedRate(Runnable command, long initialDelay, long period, TimeUnit unit) {
+        Preconditions.checkState(!delayedExecutor.isShutdown());
         if (initialDelay == 0) {
             try {
                 command.run();
@@ -171,6 +191,7 @@ public class InlineExecutor implements ScheduledExecutorService {
 
     @Override
     public ScheduledFuture<?> scheduleWithFixedDelay(Runnable command, long initialDelay, long delay, TimeUnit unit) {
+        Preconditions.checkState(!delayedExecutor.isShutdown());
         if (initialDelay == 0) {
             try {
                 command.run();
@@ -190,7 +211,7 @@ public class InlineExecutor implements ScheduledExecutorService {
     
     @RequiredArgsConstructor
     @EqualsAndHashCode
-    private static class NonScheduledFuture<T> implements ScheduledFuture<T> {
+    public static class NonScheduledFuture<T> implements ScheduledFuture<T> {
         private final CompletableFuture<T> wrappedFuture;
 
         @Override

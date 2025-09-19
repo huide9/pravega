@@ -1,11 +1,17 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.test.system;
 
@@ -16,8 +22,8 @@ import io.pravega.client.admin.ReaderGroupManager;
 import io.pravega.client.admin.StreamInfo;
 import io.pravega.client.admin.StreamManager;
 import io.pravega.client.batch.SegmentRange;
-import io.pravega.client.netty.impl.ConnectionFactory;
-import io.pravega.client.netty.impl.ConnectionFactoryImpl;
+import io.pravega.client.connection.impl.ConnectionFactory;
+import io.pravega.client.connection.impl.SocketConnectionFactoryImpl;
 import io.pravega.client.stream.Checkpoint;
 import io.pravega.client.stream.ReaderGroup;
 import io.pravega.client.stream.ReaderGroupConfig;
@@ -26,8 +32,8 @@ import io.pravega.client.stream.Stream;
 import io.pravega.client.stream.StreamConfiguration;
 import io.pravega.client.stream.StreamCut;
 import io.pravega.client.stream.impl.ClientFactoryImpl;
-import io.pravega.client.stream.impl.ControllerImpl;
-import io.pravega.client.stream.impl.ControllerImplConfig;
+import io.pravega.client.control.impl.ControllerImpl;
+import io.pravega.client.control.impl.ControllerImplConfig;
 import io.pravega.client.stream.impl.JavaSerializer;
 import io.pravega.common.concurrent.ExecutorServiceHelpers;
 import io.pravega.common.concurrent.Futures;
@@ -116,7 +122,7 @@ public class BatchClientSimpleTest extends AbstractReadWriteTest {
         final ClientConfig clientConfig = Utils.buildClientConfig(controllerURI);
 
         @Cleanup
-        ConnectionFactory connectionFactory = new ConnectionFactoryImpl(clientConfig);
+        ConnectionFactory connectionFactory = new SocketConnectionFactoryImpl(clientConfig);
         ControllerImpl controller = new ControllerImpl(ControllerImplConfig.builder().clientConfig(clientConfig).build(),
                                                                             connectionFactory.getInternalExecutor());
         @Cleanup
@@ -144,7 +150,7 @@ public class BatchClientSimpleTest extends AbstractReadWriteTest {
 
         // Instantiate the batch client and assert it provides correct stream info.
         log.debug("Creating batch client.");
-        StreamInfo streamInfo = streamManager.getStreamInfo(SCOPE, stream.getStreamName());
+        StreamInfo streamInfo = streamManager.fetchStreamInfo(SCOPE, stream.getStreamName()).join();
         log.debug("Validating stream metadata fields.");
         assertEquals("Expected Stream name: ", STREAM, streamInfo.getStreamName());
         assertEquals("Expected Scope name: ", SCOPE, streamInfo.getScope());
@@ -156,7 +162,7 @@ public class BatchClientSimpleTest extends AbstractReadWriteTest {
 
         // Emulate the behavior of Hadoop client: i) Get tail of Stream, ii) Read from current point until tail, iii) repeat.
         log.debug("Reading in batch iterations.");
-        StreamCut currentTailStreamCut = streamManager.getStreamInfo(SCOPE, stream.getStreamName()).getTailStreamCut();
+        StreamCut currentTailStreamCut = streamManager.fetchStreamInfo(SCOPE, stream.getStreamName()).join().getTailStreamCut();
         int readEvents = 0;
         for (int i = 0; i < batchIterations; i++) {
             writeEvents(clientFactory, STREAM, totalEvents);
@@ -166,7 +172,7 @@ public class BatchClientSimpleTest extends AbstractReadWriteTest {
             assertEquals("Expected number of segments: ", RG_PARALLELISM, ranges.size());
             readEvents += readFromRanges(ranges, batchClient);
             log.debug("Events read in parallel so far: {}.", readEvents);
-            currentTailStreamCut = streamManager.getStreamInfo(SCOPE, stream.getStreamName()).getTailStreamCut();
+            currentTailStreamCut = streamManager.fetchStreamInfo(SCOPE, stream.getStreamName()).join().getTailStreamCut();
         }
 
         assertEquals("Expected events read: .", totalEvents * batchIterations, readEvents);
@@ -176,7 +182,7 @@ public class BatchClientSimpleTest extends AbstractReadWriteTest {
         assertTrue(controller.truncateStream(SCOPE, STREAM, streamCut).join());
 
         // Test the batch client when we select to start reading a Stream from a truncation point.
-        StreamCut initialPosition = streamManager.getStreamInfo(SCOPE, stream.getStreamName()).getHeadStreamCut();
+        StreamCut initialPosition = streamManager.fetchStreamInfo(SCOPE, stream.getStreamName()).join().getHeadStreamCut();
         List<SegmentRange> newRanges = Lists.newArrayList(batchClient.getSegments(stream, initialPosition, StreamCut.UNBOUNDED).getIterator());
         assertEquals("Expected events read: ", (totalEvents - offsetEvents) + totalEvents * batchIterations,
                     readFromRanges(newRanges, batchClient));

@@ -1,11 +1,17 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.common.io.serialization;
 
@@ -34,6 +40,15 @@ public interface RevisionDataInput extends DataInput {
      * @return The InputStream.
      */
     InputStream getBaseStream();
+
+    /**
+     * Gets the number of bytes remaining to read from the {@link RevisionDataInput}.
+     * NOTE: this may be different from {@link InputStream#available()}; this returns the number of bytes remaining for
+     * reading from those that were declared using {@link RevisionDataOutput#length(int)} at writing time.
+     *
+     * @return The number of bytes remaining.
+     */
+    int getRemaining();
 
     /**
      * Decodes a Long that has been serialized using {@link RevisionDataOutput#writeCompactLong}. After this method is complete,
@@ -125,8 +140,8 @@ public interface RevisionDataInput extends DataInput {
      * {@link RevisionDataOutput#writeCollection}.
      *
      * @param elementDeserializer  A Function that will decode a single element of the Collection from the given RevisionDataInput.
-     * @param newCollectionBuilder A {@link ImmutableCollection.Builder} that will create a new instance of the
-     *                             {@link ImmutableCollection} of desired type.
+     * @param newCollectionBuilder A {@link com.google.common.collect.ImmutableCollection.Builder} that will create a new instance of the
+     *                             {@link com.google.common.collect.ImmutableCollection} of desired type.
      * @param <T>                  Type of the elements in the Collection.
      * @param <C>                  Type of the Collection whose builder needs to be populated.
      * @throws IOException If an IO Exception occurred.
@@ -204,7 +219,8 @@ public interface RevisionDataInput extends DataInput {
      *
      * @param keyDeserializer   A Function that will decode a single Key of the Map from the given RevisionDataInput.
      * @param valueDeserializer A Function that will decode a single Value of the Map from the given RevisionDataInput.
-     * @param newMapBuilder     An {@link ImmutableMap.Builder} that will create a new instance of the {@link ImmutableMap}
+     * @param newMapBuilder     An {@link com.google.common.collect.ImmutableMap.Builder} that will create a new
+     *                          instance of the {@link com.google.common.collect.ImmutableMap}
      *                          type desired.
      * @param <K>               Type of the Keys in the Map.
      * @param <V>               Type of the Values in the Map.

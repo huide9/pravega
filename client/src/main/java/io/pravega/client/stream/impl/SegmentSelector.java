@@ -1,14 +1,24 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.client.stream.impl;
 
+import com.google.common.base.Preconditions;
+import io.pravega.client.control.impl.Controller;
+import io.pravega.client.control.impl.ControllerFailureException;
+import io.pravega.client.security.auth.DelegationTokenProvider;
 import io.pravega.client.segment.impl.NoSuchSegmentException;
 import io.pravega.client.segment.impl.Segment;
 import io.pravega.client.segment.impl.SegmentOutputStream;
@@ -27,6 +37,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Random;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 import javax.annotation.concurrent.GuardedBy;
 import lombok.RequiredArgsConstructor;
@@ -53,6 +64,8 @@ public class SegmentSelector {
     @GuardedBy("$lock")
     private final Map<Segment, SegmentOutputStream> writers = new HashMap<>();
     private final EventWriterConfig config;
+    private final DelegationTokenProvider tokenProvider;
+    private final AtomicBoolean sealed = new AtomicBoolean(false);
 
     /**
      * Selects which segment an event should be written to.
@@ -93,12 +106,21 @@ public class SegmentSelector {
                 controller.getSuccessors(sealedSegment), t -> {
                     log.error("Error while fetching successors for segment: {}", sealedSegment, t);
                     // Remove all writers and fail all pending writes
-                    Exception e = (t instanceof RetriesExhaustedException) ? new ControllerFailureException(t) : new NoSuchSegmentException(sealedSegment.toString());
+                    Exception e = (t instanceof RetriesExhaustedException) ? new ControllerFailureException(t) : new NoSuchSegmentException(sealedSegment.toString(), t);
                     removeAllWriters().forEach(event -> event.getAckFuture().completeExceptionally(e));
                     return null;
                 });
 
+        // If Successors is null that means Stream doesn't exist
         if (successors == null) {
+            return Collections.emptyList();
+        } else if (successors.getSegmentToPredecessor().isEmpty()) {
+            log.warn("Stream {} is sealed since no successor segments found for segment {} ", sealedSegment.getStream(), sealedSegment);
+            Exception e = new IllegalStateException("Writes cannot proceed since the stream is sealed");
+            // Remove all writers and fail all pending writes since Stream is sealed and no successor segment found
+            removeAllWriters().forEach(pendingEvent -> pendingEvent.getAckFuture()
+                                                                   .completeExceptionally(e));
+            sealed.set(true);
             return Collections.emptyList();
         } else {
             return updateSegmentsUponSealed(successors, sealedSegment, segmentSealedCallback);
@@ -129,10 +151,14 @@ public class SegmentSelector {
     }
 
     @Synchronized
-    private List<PendingEvent> updateSegments(StreamSegments newSteamSegments, Consumer<Segment>
+    private List<PendingEvent> updateSegments(StreamSegments newStreamSegments, Consumer<Segment>
             segmentSealedCallBack) {
-        currentSegments = newSteamSegments;
-        createMissingWriters(segmentSealedCallBack, newSteamSegments.getDelegationToken());
+        Preconditions.checkState(newStreamSegments.getNumberOfSegments() > 0,
+                "Writers cannot proceed writing since the stream %s is sealed", stream);
+        Preconditions.checkState(!isStreamSealed(), "Writers cannot proceed writing since the stream %s is sealed", stream);
+        currentSegments = newStreamSegments;
+        createMissingWriters(segmentSealedCallBack);
+
         List<PendingEvent> toResend = new ArrayList<>();
         Iterator<Entry<Segment, SegmentOutputStream>> iter = writers.entrySet().iterator();
         while (iter.hasNext()) {
@@ -156,7 +182,7 @@ public class SegmentSelector {
     private List<PendingEvent> updateSegmentsUponSealed(StreamSegmentsWithPredecessors successors, Segment sealedSegment,
                                                         Consumer<Segment> segmentSealedCallback) {
         currentSegments = currentSegments.withReplacementRange(sealedSegment, successors);
-        createMissingWriters(segmentSealedCallback, currentSegments.getDelegationToken());
+        createMissingWriters(segmentSealedCallback);
         log.debug("Fetch unacked events for segment: {}, and adding new segments {}", sealedSegment, currentSegments);
         return writers.get(sealedSegment).getUnackedEventsOnSeal();
     }
@@ -173,11 +199,12 @@ public class SegmentSelector {
         return pendingEvents;
     }
 
-    private void createMissingWriters(Consumer<Segment> segmentSealedCallBack, String delegationToken) {
+    private void createMissingWriters(Consumer<Segment> segmentSealedCallBack) {
         for (Segment segment : currentSegments.getSegments()) {
             if (!writers.containsKey(segment)) {
                 log.debug("Creating writer for segment {}", segment);
-                SegmentOutputStream out = outputStreamFactory.createOutputStreamForSegment(segment, segmentSealedCallBack, config, delegationToken);
+                SegmentOutputStream out = outputStreamFactory.createOutputStreamForSegment(segment,
+                        segmentSealedCallBack, config, tokenProvider);
                 writers.put(segment, out);
             }
         }
@@ -192,8 +219,18 @@ public class SegmentSelector {
     }
 
     @Synchronized
-    public List<SegmentOutputStream> getWriters() {
-        return new ArrayList<>(writers.values());
+    public Map<Segment, SegmentOutputStream> getWriters() {
+        return new HashMap<>(writers);
+    }
+
+    /**
+     * A flag that is used to determine if the stream has been sealed. Note: This flag only returns true if
+     * the seal has been detected as a result of calling {@link #refreshSegmentEventWritersUponSealed}.
+     *
+     * @return Whether the stream seal has been detected for this stream.
+     */
+    public boolean isStreamSealed() {
+        return sealed.get();
     }
 
 }

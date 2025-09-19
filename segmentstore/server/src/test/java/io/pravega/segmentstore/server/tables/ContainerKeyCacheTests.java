@@ -1,45 +1,71 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.segmentstore.server.tables;
 
 import com.google.common.collect.Maps;
 import io.pravega.common.util.ByteArraySegment;
 import io.pravega.segmentstore.contracts.tables.TableKey;
-import io.pravega.segmentstore.storage.mocks.InMemoryCacheFactory;
+import io.pravega.segmentstore.storage.cache.CacheFullException;
+import io.pravega.segmentstore.storage.cache.CacheStorage;
+import io.pravega.segmentstore.storage.cache.DirectMemoryCache;
 import io.pravega.test.common.AssertExtensions;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
 import lombok.Cleanup;
 import lombok.RequiredArgsConstructor;
 import lombok.val;
+import org.junit.After;
 import org.junit.Assert;
+import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.Timeout;
+import org.mockito.Mockito;
 
 /**
  * Unit tests for the {@link ContainerKeyCache} class.
  */
 public class ContainerKeyCacheTests {
-    private static final int CONTAINER_ID = 1;
     private static final int SEGMENT_COUNT = 3;
     private static final int KEYS_PER_SEGMENT = 1000;
     private static final KeyHasher KEY_HASHER = KeyHashers.DEFAULT_HASHER;
     @Rule
     public Timeout globalTimeout = new Timeout(30, TimeUnit.SECONDS);
+    private CacheStorage cacheStorage;
+
+    @Before
+    public void setup() {
+        this.cacheStorage = new DirectMemoryCache(Integer.MAX_VALUE);
+    }
+
+    @After
+    public void tearDown() {
+        val s = this.cacheStorage.getState();
+        Assert.assertEquals("MEMORY LEAK: Expected CacheStorage to be empty upon closing: " + s, 0, s.getStoredBytes());
+        this.cacheStorage.close();
+    }
 
     /**
      * Tests the {@link ContainerKeyCache#includeExistingKey} method.
@@ -47,9 +73,7 @@ public class ContainerKeyCacheTests {
     @Test
     public void testIncludeExistingKey() {
         @Cleanup
-        val cacheFactory = new InMemoryCacheFactory();
-        @Cleanup
-        val keyCache = new ContainerKeyCache(CONTAINER_ID, cacheFactory);
+        val keyCache = new ContainerKeyCache(this.cacheStorage);
         val expectedResult = new HashMap<TestKey, CacheBucketOffset>();
 
         // Insert.
@@ -106,14 +130,61 @@ public class ContainerKeyCacheTests {
     }
 
     /**
+     * Tests the {@link ContainerKeyCache#includeTailCache} method.
+     */
+    @Test
+    public void testIncludeTailCache() {
+        final long segmentId = 0L;
+        final long baseOffset = 1000;
+        @Cleanup
+        val keyCache = new ContainerKeyCache(this.cacheStorage);
+        val expectedResult = new HashMap<TestKey, CacheBucketOffset>();
+
+        // Insert some pre-existing values.
+        for (int i = 0; i < KEYS_PER_SEGMENT; i++) {
+            long offset = baseOffset + i;
+            val keyHash = newSimpleHash();
+            keyCache.updateSegmentIndexOffset(segmentId, offset);
+            long updateResult = keyCache.includeExistingKey(segmentId, keyHash, offset);
+            Assert.assertEquals("Unexpected result from includeExistingKey() for new insertion.", offset, updateResult);
+            expectedResult.put(new TestKey(segmentId, keyHash), new CacheBucketOffset(offset, false));
+        }
+        // Perform updates.
+        val rnd = new Random(0);
+        boolean successfulUpdate = false;
+        val updateBatch = new HashMap<UUID, CacheBucketOffset>();
+        for (val e : expectedResult.entrySet()) {
+            // Every other update will try to set an obsolete offset. We need to verify that such a case will not be accepted.
+            successfulUpdate = !successfulUpdate;
+            val existingOffset = e.getValue().getSegmentOffset();
+            val segmentIndexOffset = keyCache.getSegmentIndexOffset(e.getKey().segmentId);
+
+            long newOffset;
+            boolean isRemoved;
+            if (successfulUpdate) {
+                newOffset = existingOffset + 1;
+                isRemoved = existingOffset % 3 == 0; // Need to pick odd number since only odd offsets are successful.
+                e.setValue(new CacheBucketOffset(newOffset, isRemoved));
+            } else {
+                newOffset = existingOffset - 1;
+                isRemoved = existingOffset % 4 == 0; // Need to pick even number since only even offsets are unsuccessful.
+            }
+
+            updateBatch.put(e.getKey().keyHash, new CacheBucketOffset(newOffset, isRemoved));
+        }
+
+        // Update the cache, then check it.
+        keyCache.includeTailCache(segmentId, updateBatch);
+        checkCache(expectedResult, keyCache);
+    }
+
+    /**
      * Tests the {@link ContainerKeyCache#includeUpdateBatch} method for inserts.
      */
     @Test
     public void testBatchInsert() {
         @Cleanup
-        val cacheFactory = new InMemoryCacheFactory();
-        @Cleanup
-        val keyCache = new ContainerKeyCache(CONTAINER_ID, cacheFactory);
+        val keyCache = new ContainerKeyCache(this.cacheStorage);
         val rnd = new Random(0);
         val expectedResult = new HashMap<TestKey, CacheBucketOffset>();
 
@@ -133,9 +204,7 @@ public class ContainerKeyCacheTests {
     @Test
     public void testBatchUpdate() {
         @Cleanup
-        val cacheFactory = new InMemoryCacheFactory();
-        @Cleanup
-        val keyCache = new ContainerKeyCache(CONTAINER_ID, cacheFactory);
+        val keyCache = new ContainerKeyCache(this.cacheStorage);
         val rnd = new Random(0);
         val expectedResult = new HashMap<TestKey, CacheBucketOffset>();
 
@@ -174,9 +243,7 @@ public class ContainerKeyCacheTests {
     @Test
     public void testBatchRemove() {
         @Cleanup
-        val cacheFactory = new InMemoryCacheFactory();
-        @Cleanup
-        val keyCache = new ContainerKeyCache(CONTAINER_ID, cacheFactory);
+        val keyCache = new ContainerKeyCache(this.cacheStorage);
         val rnd = new Random(0);
         val expectedResult = new HashMap<TestKey, CacheBucketOffset>();
 
@@ -244,16 +311,60 @@ public class ContainerKeyCacheTests {
         val keyHash = newSimpleHash();
 
         @Cleanup
-        val cacheFactory = new InMemoryCacheFactory();
-        @Cleanup
-        val cache1 = new ContainerKeyCache(CONTAINER_ID, cacheFactory);
+        val cache1 = new ContainerKeyCache(this.cacheStorage);
         cache1.includeExistingKey(segmentId, keyHash, 0L);
         cache1.close();
 
         @Cleanup
-        val cache2 = new ContainerKeyCache(CONTAINER_ID, cacheFactory);
+        val cache2 = new ContainerKeyCache(this.cacheStorage);
         val result2 = cache2.get(segmentId, keyHash);
         Assert.assertNull("Not expecting the cache to have contents after close & reinitialize.", result2);
+    }
+
+    /**
+     * Test a case when the cache storage throws errors while attempting to update.
+     */
+    @Test
+    public void testCacheUpdateFailure() {
+        val segmentId = 0;
+        val offset1 = 0L;
+        val offset2 = 1L;
+
+        val spiedStorage = Mockito.spy(this.cacheStorage);
+        @Cleanup
+        val keyCache = new ContainerKeyCache(spiedStorage);
+        val expectedResult = new HashMap<TestKey, CacheBucketOffset>();
+        val keyHash = newSimpleHash();
+
+        // Perform an initial insert and verify it.
+        keyCache.updateSegmentIndexOffset(segmentId, offset1);
+        val updateResult1 = keyCache.includeExistingKey(segmentId, keyHash, offset1);
+        Assert.assertEquals("Unexpected result from includeExistingKey() for new insertion.", offset1, updateResult1);
+        expectedResult.put(new TestKey(segmentId, keyHash), new CacheBucketOffset(offset1, false));
+        checkCache(expectedResult, keyCache);
+
+        // For the second insert, fail the cache update and verify that the whole entry has been evicted.
+        val replaceAddress = new AtomicInteger(-1);
+        Mockito.doAnswer(arg1 -> {
+            replaceAddress.set(arg1.getArgument(0));
+            throw new CacheFullException("cache full");
+        }).when(spiedStorage).replace(Mockito.anyInt(), Mockito.any());
+
+        val deleteAddress = new AtomicInteger(-1);
+        Mockito.doAnswer(arg1 -> {
+            deleteAddress.set(arg1.getArgument(0));
+            return arg1.callRealMethod();
+        }).when(spiedStorage).delete(Mockito.anyInt());
+
+        val updateResult2 = keyCache.includeExistingKey(segmentId, keyHash, offset2);
+        Assert.assertEquals("Unexpected result from includeExistingKey() for new insertion.", offset2, updateResult2);
+
+        // Set the expected value to null - that indicates it shouldn't be in the cache.
+        expectedResult.put(new TestKey(segmentId, keyHash), null);
+        checkCache(expectedResult, keyCache);
+
+        Assert.assertNotEquals("Replacement was not attempted.", -1, replaceAddress.get());
+        Assert.assertEquals("Deletion was for wrong entry.", replaceAddress.get(), deleteAddress.get());
     }
 
     /**
@@ -261,14 +372,14 @@ public class ContainerKeyCacheTests {
      * - For a segment with no SegmentIndexOffset - there is no cache eviction.
      * - For a segment with SegmentIndexOffset == MAX - eviction is 100% driven by generations.
      * - For a segment with SegmentIndexOffset controlled - eviction is driven by generations and SegmentIndexOffset.
-     *
+     * <p>
      * The only reason this test should work is because we use a KeyHasher which doesn't produce collisions (for our test);
      * this allows us to stash every Cache Value in its own Cache Entry.
      */
     @Test
     public void testCacheEviction() {
         // We need one segment for each type of rules we are verifying (refer to this test's Javadoc for details).
-        final int keyCount = 100;
+        final int keyCount = 25;
         final int segmentCount = 3;
         final long segmentIdNoEviction = 0L; // We do not set the Last Index Offset on this one.
         final long segmentIdByGenerations = 1L; // We set the Last Index Offset to Long.MAX_VALUE on this one.
@@ -278,9 +389,7 @@ public class ContainerKeyCacheTests {
         // 2. With SegmentIndexOffset set to MAX - driven by generations.
         // 3. With SegmentIndexOffset controlled - driven by itself.
         @Cleanup
-        val cacheFactory = new InMemoryCacheFactory();
-        @Cleanup
-        val keyCache = new ContainerKeyCache(CONTAINER_ID, cacheFactory);
+        val keyCache = new ContainerKeyCache(this.cacheStorage);
         val rnd = new Random(0);
         val expectedResult = new HashMap<TestKey, CacheBucketOffset>();
 
@@ -288,10 +397,10 @@ public class ContainerKeyCacheTests {
         for (int i = 0; i < keyCount; i++) {
             // We reuse the same key hash across multiple "segments", to make sure that segmentId does indeed partition
             // the cache.
-            keyCache.updateGenerations(i, 0);
+            keyCache.updateGenerations(i, 0, false);
             val keyHash = KEY_HASHER.hash(newTableKey(rnd).getKey());
             for (long segmentId = 0; segmentId < segmentCount; segmentId++) {
-                keyCache.includeExistingKey(segmentId, keyHash, (long) i);
+                keyCache.includeExistingKey(segmentId, keyHash, i);
                 expectedResult.put(new TestKey(segmentId, keyHash), new CacheBucketOffset(i, false));
             }
         }
@@ -304,13 +413,12 @@ public class ContainerKeyCacheTests {
         val initialStatus = keyCache.getCacheStatus();
         Assert.assertEquals("Unexpected initial oldest generation.", 0, initialStatus.getOldestGeneration());
         Assert.assertEquals("Unexpected initial newest generation.", keyCount - 1, initialStatus.getNewestGeneration());
-        AssertExtensions.assertGreaterThan("Expecting a non-zero cache size.", 0, initialStatus.getSize());
 
         // Increase the generations to the newest one, while verifying that at each step we get some removal.
         int ng = initialStatus.getNewestGeneration() + 1;
         for (int og = 1; og <= ng; og++) {
-            long sizeRemoved = keyCache.updateGenerations(ng, og);
-            AssertExtensions.assertGreaterThan("Expecting something to have been removed (gen).", 0, sizeRemoved);
+            boolean anythingRemoved = keyCache.updateGenerations(ng, og, false);
+            Assert.assertTrue("Expecting something to have been removed (gen).", anythingRemoved);
         }
 
         // We expect all of these entries to be removed.
@@ -321,8 +429,8 @@ public class ContainerKeyCacheTests {
         // Now update the Last Indexed Offset for a segment and verify that its entries are removed.
         for (long offset = 1; offset <= keyCount; offset++) {
             keyCache.updateSegmentIndexOffset(segmentIdByOffset, offset);
-            long sizeRemoved = keyCache.updateGenerations(ng, ng);
-            AssertExtensions.assertGreaterThan("Expecting something to have been removed (offset).", 0, sizeRemoved);
+            boolean anythingRemoved = keyCache.updateGenerations(ng, ng, false);
+            Assert.assertTrue("Expecting something to have been removed (offset).", anythingRemoved);
         }
 
         toRemove = expectedResult.keySet().stream().filter(k -> k.segmentId == segmentIdByOffset).collect(Collectors.toList());
@@ -334,15 +442,103 @@ public class ContainerKeyCacheTests {
     }
 
     /**
+     * Tests the {@link SegmentKeyCache} behavior when {@link ContainerKeyCache#updateGenerations} is called with "essentialOnly==false".
+     */
+    @Test
+    public void testNonEssentialCache() {
+        // We need one segment for each type of rules we are verifying (refer to this test's Javadoc for details).
+        final int keyCount = 25;
+        final long segmentId = 0L;
+
+        // Spy on our cache storage and record all insertions.
+        val spiedCacheStorage = Mockito.spy(this.cacheStorage);
+        val insertCount = new AtomicInteger(0);
+        Mockito.doAnswer(arg1 -> {
+            insertCount.incrementAndGet();
+            return arg1.callRealMethod();
+        }).when(spiedCacheStorage).replace(Mockito.anyInt(), Mockito.any());
+        Mockito.doAnswer(arg1 -> {
+            insertCount.incrementAndGet();
+            return arg1.callRealMethod();
+        }).when(spiedCacheStorage).insert(Mockito.any());
+
+        @Cleanup
+        val keyCache = new ContainerKeyCache(spiedCacheStorage);
+        val rnd = new Random(0);
+        val expectedResult = new HashMap<TestKey, CacheBucketOffset>();
+        val keys = new ArrayList<TableKey>();
+
+        // Initial cache population. Each Key in each segment gets its own generation.
+        val currentGeneration = new AtomicInteger(0);
+        val segmentOffset = new AtomicLong(0);
+        for (int i = 0; i < keyCount; i++) {
+            keyCache.updateGenerations(currentGeneration.getAndIncrement(), 0, false);
+            val key = newTableKey(rnd);
+            keys.add(key);
+            val keyHash = KEY_HASHER.hash(key.getKey());
+            val offset = segmentOffset.getAndIncrement();
+            keyCache.includeExistingKey(segmentId, keyHash, offset);
+            expectedResult.put(new TestKey(segmentId, keyHash), new CacheBucketOffset(offset, false));
+        }
+
+        checkCache(expectedResult, keyCache);
+        Assert.assertEquals("Unexpected number of initial insertions.", expectedResult.size(), insertCount.get());
+
+        // Now mark the cache as non-essential. These updates should effectively evict everything.
+        insertCount.set(0);
+        for (val k : keys) {
+            keyCache.updateGenerations(currentGeneration.getAndIncrement(), 0, true);
+            val keyHash = KEY_HASHER.hash(k.getKey());
+            keyCache.includeExistingKey(segmentId, keyHash, segmentOffset.getAndIncrement());
+        }
+
+        checkNotInCache(expectedResult.keySet(), keyCache);
+        Assert.assertEquals("Not expected any cache insertions with cache disabled.", 0, insertCount.get());
+
+        // Re-insert them, with "essential" == false.
+        for (val k : keys) {
+            keyCache.updateGenerations(currentGeneration.getAndIncrement(), 0, false);
+            val keyHash = KEY_HASHER.hash(k.getKey());
+            val offset = segmentOffset.getAndIncrement();
+            keyCache.includeExistingKey(segmentId, keyHash, offset);
+            expectedResult.put(new TestKey(segmentId, keyHash), new CacheBucketOffset(offset, false));
+        }
+
+        checkCache(expectedResult, keyCache);
+        Assert.assertEquals("Unexpected number of reinsertions.", expectedResult.size(), insertCount.get());
+        insertCount.set(0);
+
+        // Evict everything and set the "essential" state.
+        keyCache.updateSegmentIndexOffset(segmentId, segmentOffset.get());
+        boolean anyEvicted = keyCache.updateGenerations(currentGeneration.getAndIncrement(), currentGeneration.get(), true);
+        Assert.assertTrue(anyEvicted);
+        checkNotInCache(expectedResult.keySet(), keyCache);
+        expectedResult.clear();
+        keys.clear();
+
+        // Verify tail migration with the essential offset set (from the previous step).
+        val tailKey = newTableKey(rnd);
+        val tailKeyHash = KEY_HASHER.hash(tailKey.getKey());
+        val tailBatch = TableKeyBatch.update();
+        tailBatch.add(tailKey, tailKeyHash, tailKey.getKey().getLength());
+        keyCache.includeUpdateBatch(segmentId, tailBatch, segmentOffset.get());
+        expectedResult.put(new TestKey(segmentId, tailKeyHash), new CacheBucketOffset(segmentOffset.get(), tailBatch.isRemoval()));
+        checkCache(expectedResult, keyCache);
+
+        // The migration should not store this value anywhere in the cache since it's disabled.
+        keyCache.updateSegmentIndexOffset(segmentId, segmentOffset.get() + 1);
+        checkNotInCache(expectedResult.keySet(), keyCache);
+        Assert.assertEquals("Not expected any cache insertions with cache disabled (migration).", 0, insertCount.get());
+    }
+
+    /**
      * Tests the ability to record and purge backpointers.
      */
     @Test
     public void testTailCacheMigration() {
         final long segmentId = 1L;
         @Cleanup
-        val cacheFactory = new InMemoryCacheFactory();
-        @Cleanup
-        val keyCache = new ContainerKeyCache(CONTAINER_ID, cacheFactory);
+        val keyCache = new ContainerKeyCache(this.cacheStorage);
         val rnd = new Random(0);
         val expectedResult = new HashMap<TestKey, CacheBucketOffset>();
 
@@ -382,6 +578,79 @@ public class ContainerKeyCacheTests {
         checkNoTailHashes(keyCache);
     }
 
+    /**
+     * Test the {@link SegmentKeyCache.MigrationCandidate} class.
+     */
+    @Test
+    public void testMigrationCandidate() {
+        val keyCache = new SegmentKeyCache(1L, this.cacheStorage);
+        val rnd = new Random(0);
+
+        val batch = TableKeyBatch.update();
+        val key = newTableKey(rnd);
+        val keyHash = KEY_HASHER.hash(key.getKey());
+        batch.add(key, keyHash, key.getKey().getLength());
+        keyCache.includeUpdateBatch(batch, 0, 0);
+
+        List<SegmentKeyCache.CacheEntry> evictedEntries = null;
+        try {
+            // Migrate the tail index to a Cache Entry.
+            keyCache.setLastIndexedOffset(batch.getLength() + 1, 1);
+
+            // Evict all entries.
+            evictedEntries = keyCache.evictAll();
+            Assert.assertEquals(1, evictedEntries.size());
+            val entry = evictedEntries.get(0);
+            entry.evict(); // Force-evict it from the cache.
+
+            // Check MigrationCandidate.persist().
+            val mc = new SegmentKeyCache.MigrationCandidate(keyHash, entry, new CacheBucketOffset(0, false));
+            boolean committed = mc.commit(2);
+            Assert.assertFalse("Not expected commit() to go through.", committed);
+        } finally {
+            // Clean up the cache in case of an error. We do not want to leave data hanging around in the Cache.
+            if (evictedEntries != null) {
+                evictedEntries.forEach(SegmentKeyCache.CacheEntry::evict);
+            }
+        }
+    }
+
+    /**
+     * Test the {@link SegmentKeyCache.MigrationCandidate} class when cache is full.
+     */
+    @Test
+    public void testMigrationCandidateFailedCacheFull() {
+        @Cleanup
+        val fullCache = new DirectMemoryCache(10);
+        fullCache.insert(new ByteArraySegment(new byte[(int) (fullCache.getState().getMaxBytes() - fullCache.getBlockAlignment())]));
+
+        val keyCache = new SegmentKeyCache(1L, fullCache);
+        val rnd = new Random(0);
+
+        val batch = TableKeyBatch.update();
+        val key = newTableKey(rnd);
+        val keyHash = KEY_HASHER.hash(key.getKey());
+        batch.add(key, keyHash, key.getKey().getLength());
+        keyCache.includeUpdateBatch(batch, 0, 0);
+
+        List<SegmentKeyCache.CacheEntry> evictedEntries = null;
+        try {
+            // Migrate the tail index to a Cache Entry.
+            keyCache.setLastIndexedOffset(batch.getLength() + 1, 1);
+
+            // Try to evict all entries.
+            evictedEntries = keyCache.evictAll();
+
+            // We expect no evictions because we shouldn't have inserted anything.
+            Assert.assertEquals(0, evictedEntries.size());
+        } finally {
+            // Clean up the cache in case of an error. We do not want to leave data hanging around in the Cache.
+            if (evictedEntries != null) {
+                evictedEntries.forEach(SegmentKeyCache.CacheEntry::evict);
+            }
+        }
+    }
+
     private long batchInsert(long insertOffset, ContainerKeyCache keyCache, HashMap<TestKey, CacheBucketOffset> expectedResult, Random rnd) {
         val insertBatches = new HashMap<Long, TableKeyBatch>();
         long highestOffset = 0L;
@@ -415,7 +684,8 @@ public class ContainerKeyCacheTests {
                                    .collect(Collectors.toList());
 
             // Fetch initial tail hashes now, before we apply the updates
-            val expectedTailHashes = new HashMap<UUID, CacheBucketOffset>(keyCache.getTailHashes(segmentId));
+            val expectedTailHashes = new HashMap<>(keyCache.getTailHashes(segmentId));
+            Assert.assertEquals(getExpectedTailUpdateDelta(expectedTailHashes.values()), keyCache.getTailUpdateDelta(segmentId));
 
             // Update the Cache.
             val batchUpdateResult = keyCache.includeUpdateBatch(segmentId, e.getValue(), batchOffset);
@@ -445,7 +715,20 @@ public class ContainerKeyCacheTests {
                 val actual = tailHashes.get(expected.getKey());
                 Assert.assertEquals("Unexpected tail hash.", expected.getValue(), actual);
             }
+            Assert.assertEquals(getExpectedTailUpdateDelta(expectedTailHashes.values()), keyCache.getTailUpdateDelta(segmentId));
         }
+    }
+
+    private int getExpectedTailUpdateDelta(Collection<CacheBucketOffset> tailOffsets) {
+        int r = 0;
+        for (val c : tailOffsets) {
+            if (c.isRemoval()) {
+                r--;
+            } else {
+                r++;
+            }
+        }
+        return r;
     }
 
     private void updateSegmentIndexOffsets(ContainerKeyCache keyCache, long offset) {
@@ -475,7 +758,7 @@ public class ContainerKeyCacheTests {
         }
     }
 
-    private void checkNotInCache(List<TestKey> keys, ContainerKeyCache keyCache) {
+    private void checkNotInCache(Collection<TestKey> keys, ContainerKeyCache keyCache) {
         for (val e : keys) {
             val result = keyCache.get(e.segmentId, e.keyHash);
             Assert.assertNull("Found key that is not supposed to be in the cache.", result);

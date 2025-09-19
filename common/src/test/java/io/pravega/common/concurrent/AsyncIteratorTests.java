@@ -1,11 +1,17 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.common.concurrent;
 
@@ -45,6 +51,15 @@ public class AsyncIteratorTests extends ThreadPooledTestSuite {
         return 1;
     }
 
+    @Test
+    public void testSingleton() {
+        val item = 1;
+        val iterator = AsyncIterator.singleton(item);
+        val retrievedItem = iterator.getNext().join();
+        Assert.assertEquals(item, (int) retrievedItem);
+        Assert.assertNull(iterator.getNext().join());
+    }
+
     /**
      * Tests the {@link AsyncIterator#forEachRemaining(Consumer, Executor)} method.
      */
@@ -56,7 +71,6 @@ public class AsyncIteratorTests extends ThreadPooledTestSuite {
         iterator.forEachRemaining(result::add, executorService()).join();
         AssertExtensions.assertListEquals("Unexpected result.", expected, result, Integer::equals);
     }
-
 
     /**
      * Tests the {@link AsyncIterator#collectRemaining(Predicate)} method.
@@ -126,6 +140,34 @@ public class AsyncIteratorTests extends ThreadPooledTestSuite {
         // Last case; we purposefully made an extra invocation of #getNext() to observe its behavior.
         val last = iteratorItems.get(iteratorItems.size() - 1).get(TIMEOUT_MILLIS, TimeUnit.MILLISECONDS);
         Assert.assertNull("Expected last value to be null", last);
+    }
+
+    /**
+     * Tests the {@link AsyncIterator#thenApply} method.
+     */
+    @Test
+    public void testThenApply() {
+        val expected = IntStream.range(0, 10).boxed().collect(Collectors.toList());
+        val baseIterator = new TestIterator<Integer>(expected.stream().map(CompletableFuture::completedFuture).collect(Collectors.toList()));
+        val newIterator = baseIterator.thenApply(Object::toString);
+        val result = new ArrayList<String>();
+        newIterator.forEachRemaining(result::add, executorService()).join();
+        val expectedResult = expected.stream().map(Object::toString).collect(Collectors.toList());
+        AssertExtensions.assertListEquals("Unexpected result.", expectedResult, result, String::equals);
+    }
+
+    /**
+     * Tests the {@link AsyncIterator#thenCompose} method.
+     */
+    @Test
+    public void testThenCompose() {
+        val expected = IntStream.range(0, 10).boxed().collect(Collectors.toList());
+        val baseIterator = new TestIterator<Integer>(expected.stream().map(CompletableFuture::completedFuture).collect(Collectors.toList()));
+        AsyncIterator<String> newIterator = baseIterator.thenCompose(i -> CompletableFuture.completedFuture(i.toString()));
+        val result = new ArrayList<String>();
+        newIterator.forEachRemaining(result::add, executorService()).join();
+        val expectedResult = expected.stream().map(Object::toString).collect(Collectors.toList());
+        AssertExtensions.assertListEquals("Unexpected result.", expectedResult, result, String::equals);
     }
 
     private static class TestIterator<T> implements AsyncIterator<T> {

@@ -1,15 +1,22 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.common.io.serialization;
 
-import io.pravega.common.util.ByteArraySegment;
+import io.pravega.common.io.DirectDataOutput;
+import io.pravega.common.util.BufferView;
 import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
@@ -26,9 +33,9 @@ import java.util.function.ToIntFunction;
  *
  * This interface is designed to serialize data that can be consumed using {@link RevisionDataInput}.
  */
-public interface RevisionDataOutput extends DataOutput {
+public interface RevisionDataOutput extends DataOutput, DirectDataOutput {
     /**
-     * Maximum value that can be encoded using {@link #writeCompactLong).
+     * Maximum value that can be encoded using {@link #writeCompactLong}.
      */
     long COMPACT_LONG_MAX = 0x3FFF_FFFF_FFFF_FFFFL - 1;
 
@@ -63,8 +70,8 @@ public interface RevisionDataOutput extends DataOutput {
     int UUID_BYTES = 2 * Long.BYTES;
 
     /**
-     * Gets a value indicating whether this instance of a RevisionDataOutput requires {@link #length) to be called prior to writing
-     * anything to it.
+     * Gets a value indicating whether this instance of a RevisionDataOutput requires {@link #length} to be called
+     * prior to writing anything to it.
      *
      * @return True if Length must be declared beforehand (by invoking length()) or not.
      */
@@ -249,21 +256,6 @@ public interface RevisionDataOutput extends DataOutput {
     }
 
     /**
-     * Serializes the given byte array segment. Equivalent to calling {@link #writeArray}(segment, segment.arrayOffset(), segment.getLength()).
-     *
-     * @param segment The byte array segment to serialize. Can be null (in which case an Empty array will be deserialized
-     *                by {@link RevisionDataInput#readArray})).
-     * @throws IOException If an IO Exception occurred.
-     */
-    default void writeArray(ByteArraySegment segment) throws IOException {
-        if (segment == null) {
-            writeArray(null, 0, 0);
-        } else {
-            writeArray(segment.array(), segment.arrayOffset(), segment.getLength());
-        }
-    }
-    
-    /**
      * Serializes the given byte array. It first writes a Compact Integer representing the length to serialize, followed
      * by the actual array elements being written.
      *
@@ -274,6 +266,20 @@ public interface RevisionDataOutput extends DataOutput {
      * @throws IOException If an IO Exception occurred.
      */
     void writeArray(byte[] array, int offset, int length) throws IOException;
+
+    /**
+     * Serializes the given {@link BufferView}. It first writes a Compact Integer representing {@link BufferView#getLength()},
+     * followed by {@link BufferView#getLength()} bytes representing the data from the {@link BufferView}.
+     *
+     * This can be read back using {@link RevisionDataInput#readArray()} as this method serializes the data in the same
+     * ways as {@link #writeArray}.
+     *
+     * @param buffer The {@link BufferView} to serialize. Can be null (in which case an Empty array will be deserialized
+     *               by {@link RevisionDataInput#readArray})).
+     * @throws IOException If an IO Exception occurred.
+     */
+    @Override
+    void writeBuffer(BufferView buffer) throws IOException;
 
     /**
      * Calculates the number of bytes required to serialize a Map.

@@ -1,16 +1,26 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.segmentstore.server.writer;
 
 import io.pravega.common.Exceptions;
+import io.pravega.common.concurrent.Services;
+import io.pravega.common.util.ByteArraySegment;
+import io.pravega.segmentstore.contracts.AttributeId;
 import io.pravega.segmentstore.contracts.AttributeUpdate;
+import io.pravega.segmentstore.contracts.AttributeUpdateCollection;
 import io.pravega.segmentstore.contracts.AttributeUpdateType;
 import io.pravega.segmentstore.contracts.Attributes;
 import io.pravega.segmentstore.contracts.SegmentProperties;
@@ -37,10 +47,11 @@ import io.pravega.segmentstore.server.logs.operations.StreamSegmentMapOperation;
 import io.pravega.segmentstore.server.logs.operations.StreamSegmentSealOperation;
 import io.pravega.segmentstore.server.logs.operations.StreamSegmentTruncateOperation;
 import io.pravega.segmentstore.server.logs.operations.UpdateAttributesOperation;
+import io.pravega.segmentstore.storage.DataLogWriterNotPrimaryException;
 import io.pravega.segmentstore.storage.SegmentHandle;
 import io.pravega.segmentstore.storage.StorageNotPrimaryException;
 import io.pravega.segmentstore.storage.mocks.InMemoryStorage;
-import io.pravega.shared.segment.StreamSegmentNameUtils;
+import io.pravega.shared.NameUtils;
 import io.pravega.test.common.AssertExtensions;
 import io.pravega.test.common.ErrorInjector;
 import io.pravega.test.common.IntentionalException;
@@ -86,8 +97,8 @@ public class StorageWriterTests extends ThreadPooledTestSuite {
     private static final int UPDATE_ATTRIBUTES_PER_SEGMENT = 50;
     private static final int APPENDS_PER_SEGMENT_RECOVERY = 500; // We use depth-first, which has slower performance.
     private static final int METADATA_CHECKPOINT_FREQUENCY = 50;
-    private static final UUID CORE_ATTRIBUTE_ID = Attributes.EVENT_COUNT;
-    private static final UUID EXTENDED_ATTRIBUTE_ID = UUID.randomUUID();
+    private static final AttributeId CORE_ATTRIBUTE_ID = Attributes.EVENT_COUNT;
+    private static final List<AttributeId> EXTENDED_ATTRIBUTE_IDS = Arrays.asList(AttributeId.randomUUID(), AttributeId.randomUUID(), AttributeId.randomUUID());
     private static final WriterConfig DEFAULT_CONFIG = WriterConfig
             .builder()
             .with(WriterConfig.FLUSH_THRESHOLD_BYTES, 1000)
@@ -162,7 +173,7 @@ public class StorageWriterTests extends ThreadPooledTestSuite {
      * the cache lookup for a CachedStreamSegmentAppendOperation returns null.
      */
     @Test
-    public void testWithDataSourceFatalErrors() throws Exception {
+    public void testWithDataSourceFatalErrors() {
         @Cleanup
         TestContext context = new TestContext(DEFAULT_CONFIG);
 
@@ -226,6 +237,44 @@ public class StorageWriterTests extends ThreadPooledTestSuite {
         context.storage.setConcatAsyncErrorInjector(new ErrorInjector<>(count -> count % failConcatAsyncEvery == 0, exceptionSupplier));
 
         testWriter(context);
+    }
+
+    /**
+     * Tests the StorageWriter in a scenario where the DurableLog is left throwing DataLogWriterNotPrimaryException. In
+     * this case, we need to restart the StorageWriter and expect the container recovery to resolve the original issue.
+     */
+    @Test
+    public void testWithDataSourceNotPrimaryErrors() throws Exception {
+        final int failWriteSyncEvery = 4;
+        Predicate<Throwable> errorPredicate = ex -> ex instanceof DataLogWriterNotPrimaryException;
+
+        @Cleanup
+        TestContext context = new TestContext(DEFAULT_CONFIG);
+        Supplier<Exception> exceptionSupplier = () -> new DataLogWriterNotPrimaryException("Problem interacting with Zookeeper");
+
+        // Simulate DataLogWriterNotPrimaryException in DurableLog from a failed truncation (e.g., KeeperException.BadVersionException).
+        context.dataSource.setAckAsyncErrorInjector(new ErrorInjector<>(count -> count % failWriteSyncEvery == 0, exceptionSupplier));
+
+        // Start the writer.
+        context.writer.startAsync();
+
+        // Create a bunch of segments and Transactions.
+        ArrayList<Long> segmentIds = createSegments(context);
+        HashMap<Long, ArrayList<Long>> transactionsBySegment = createTransactions(segmentIds, context);
+        ArrayList<Long> transactionIds = new ArrayList<>();
+        transactionsBySegment.values().forEach(transactionIds::addAll);
+
+        // Append data.
+        HashMap<Long, ByteArrayOutputStream> segmentContents = new HashMap<>();
+        appendDataBreadthFirst(segmentIds, segmentContents, context);
+        appendDataBreadthFirst(transactionIds, segmentContents, context);
+
+        // Wait for the Storage Writer to be shutdown.
+        ServiceListeners.awaitShutdown(context.writer, TIMEOUT, false);
+
+        // Ensure that the failure case is DataLogWriterNotPrimaryException.
+        Assert.assertTrue("Unexpected failure cause for DurableLog.",
+                errorPredicate.test(Exceptions.unwrap(context.writer.failureCause())));
     }
 
     /**
@@ -376,6 +425,50 @@ public class StorageWriterTests extends ThreadPooledTestSuite {
     }
 
     /**
+     * Tests the StorageWriter in a Scenario where the Storage component throws arbitrary exceptions when requesting
+     * information about a segment. This simulates the Segment Aggregators failing to initialize and we ensure that the
+     * StorageWriter is resilient enough to handle this situation.
+     */
+    @Test
+    public void testWithSegmentAggregatorInitErrors() throws Exception {
+        final int failGetEvery = 2; // Fail very frequently - we want this tested well.
+
+        @Cleanup
+        TestContext context = new TestContext(DEFAULT_CONFIG);
+        context.writer.startAsync();
+
+        // Create a bunch of segments and Transactions.
+        ArrayList<Long> segmentIds = createSegments(context);
+
+        Supplier<Exception> exceptionSupplier = IntentionalException::new;
+        context.storage.setGetErrorInjector(new ErrorInjector<>(count -> count % failGetEvery == 0, exceptionSupplier));
+
+        // Append data.
+        HashMap<Long, ByteArrayOutputStream> segmentContents = new HashMap<>();
+        appendDataBreadthFirst(segmentIds, segmentContents, context);
+
+        // Truncate half of the remaining segments, then seal all, then truncate all segments.
+        metadataCheckpoint(context);
+
+        // Wait for the writer to complete its job.
+        val writerStopped = new CompletableFuture<Void>();
+        Services.onStop(context.writer, () -> writerStopped.complete(null), writerStopped::completeExceptionally, executorService());
+        val fullyAck = context.dataSource.waitFullyAcked();
+
+        // Stop quickly if the writer fails. If not wait until fully acked.
+        CompletableFuture.anyOf(writerStopped, fullyAck).get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+
+        // If the writer stopped prematurely, it should only be because it failed, so we should never get in here.
+        // However, just for sanity reasons, ensure that we have fully acked to the data source, as that is a prerequisite
+        // for verifying final output.
+        fullyAck.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+
+        // Verify final output (and clear out any error injectors since we are done using the writer at this point).
+        context.storage.setGetErrorInjector(null);
+        verifyFinalOutput(segmentContents, Collections.emptyList(), context);
+    }
+
+    /**
      * Tests the StorageWriter in a Scenario where it needs to gracefully recover from a Container failure, and not all
      * previously written data has been acknowledged to the DataSource.
      * General test flow:
@@ -471,6 +564,7 @@ public class StorageWriterTests extends ThreadPooledTestSuite {
     public void testCleanup() throws Exception {
         final WriterConfig config = WriterConfig.builder()
                                                 .with(WriterConfig.FLUSH_THRESHOLD_BYTES, 1) // This differs from DEFAULT_CONFIG.
+                                                .with(WriterConfig.FLUSH_ATTRIBUTES_THRESHOLD, 1)
                                                 .with(WriterConfig.FLUSH_THRESHOLD_MILLIS, 1000L)
                                                 .with(WriterConfig.MIN_READ_TIMEOUT_MILLIS, 10L)
                                                 .with(WriterConfig.MAX_READ_TIMEOUT_MILLIS, 250L)
@@ -489,7 +583,7 @@ public class StorageWriterTests extends ThreadPooledTestSuite {
         final byte[] data = new byte[1];
 
         Function<UpdateableSegmentMetadata, Operation> createAppend = segment -> {
-            StreamSegmentAppendOperation append = new StreamSegmentAppendOperation(segment.getId(), data, null);
+            StreamSegmentAppendOperation append = new StreamSegmentAppendOperation(segment.getId(), new ByteArraySegment(data), null);
             append.setStreamSegmentOffset(segment.getLength());
             context.dataSource.recordAppend(append);
             segment.setLength(segment.getLength() + data.length);
@@ -613,6 +707,46 @@ public class StorageWriterTests extends ThreadPooledTestSuite {
     }
 
     /**
+     * Tests the {@link StorageWriter#forceFlush} method.
+     */
+    @Test
+    public void testForceFlush() throws Exception {
+        // Special config that increases the flush thresholds and keeps the read timeout to something manageable (for empty reads).
+        val config = WriterConfig
+                .builder()
+                .with(WriterConfig.FLUSH_THRESHOLD_BYTES, 1024 * 1024)
+                .with(WriterConfig.FLUSH_THRESHOLD_MILLIS, 5000L)
+                .with(WriterConfig.MAX_ITEMS_TO_READ_AT_ONCE, 100)
+                .with(WriterConfig.MIN_READ_TIMEOUT_MILLIS, 100L)
+                .with(WriterConfig.MAX_READ_TIMEOUT_MILLIS, 250L)
+                .build();
+        @Cleanup
+        TestContext context = new TestContext(config);
+        context.writer.startAsync();
+
+        ArrayList<Long> segmentIds = createSegments(context);
+        HashMap<Long, ByteArrayOutputStream> segmentContents = new HashMap<>();
+        appendDataBreadthFirst(segmentIds, segmentContents, context);
+
+        // Do not queue up a checkpoint - make it impossible for the Writer to acknowledge anything on its own path.
+        // Instead, force-flush and verify the output when done.
+        val ff1 = context.writer.forceFlush(context.metadata.getOperationSequenceNumber(), TIMEOUT);
+        val result1 = ff1.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        Assert.assertTrue("Expected something to be flushed.", result1);
+
+        // Verify result.
+        verifyFinalOutput(segmentContents, Collections.emptyList(), context);
+
+        // Do a second force-flush. At this point there should be nothing left to flush, so ensure the StorageWriter
+        // cannot write to Storage or update attributes.
+        context.storage.close();
+        context.dataSource.setPersistAttributesErrorInjector(new ErrorInjector<>(i -> true, Exception::new));
+        val ff2 = context.writer.forceFlush(context.metadata.getOperationSequenceNumber(), TIMEOUT);
+        val result2 = ff2.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        Assert.assertFalse("Not expected anything to be flushed the second time.", result2);
+    }
+
+    /**
      * Tests the writer as it is setup in the given context.
      * General test flow:
      * 1. Add Appends (Cached/non-cached) to both Parent and Transaction segments
@@ -712,7 +846,7 @@ public class StorageWriterTests extends ThreadPooledTestSuite {
                     0, persistedAttributes.size());
             AssertExtensions.assertFutureThrows(
                     "Merged transaction attribute index still exists.",
-                    context.dataSource.persistAttributes(metadata.getId(), Collections.singletonMap(UUID.randomUUID(), 0L), TIMEOUT),
+                    context.dataSource.persistAttributes(metadata.getId(), Collections.singletonMap(AttributeId.randomUUID(), 0L), TIMEOUT),
                     ex -> ex instanceof StreamSegmentNotExistsException);
         } else {
             for (val e : metadata.getAttributes().entrySet()) {
@@ -728,7 +862,7 @@ public class StorageWriterTests extends ThreadPooledTestSuite {
             if (metadata.isSealedInStorage()) {
                 AssertExtensions.assertFutureThrows(
                         "Sealed segment attribute index accepted new values.",
-                        context.dataSource.persistAttributes(metadata.getId(), Collections.singletonMap(UUID.randomUUID(), 0L), TIMEOUT),
+                        context.dataSource.persistAttributes(metadata.getId(), Collections.singletonMap(AttributeId.randomUUID(), 0L), TIMEOUT),
                         ex -> ex instanceof StreamSegmentSealedException);
             }
         }
@@ -836,8 +970,8 @@ public class StorageWriterTests extends ThreadPooledTestSuite {
         // Make sure we increase the Length prior to appending; the Writer checks for this.
         long offset = segmentMetadata.getLength();
         segmentMetadata.setLength(offset + data.length);
-        Collection<AttributeUpdate> attributeUpdates = generateAttributeUpdates(segmentMetadata);
-        StreamSegmentAppendOperation op = new StreamSegmentAppendOperation(segmentMetadata.getId(), data, attributeUpdates);
+        AttributeUpdateCollection attributeUpdates = generateAttributeUpdates(segmentMetadata);
+        StreamSegmentAppendOperation op = new StreamSegmentAppendOperation(segmentMetadata.getId(), new ByteArraySegment(data), attributeUpdates);
         op.setStreamSegmentOffset(offset);
         context.dataSource.recordAppend(op);
         context.dataSource.add(new CachedStreamSegmentAppendOperation(op));
@@ -845,16 +979,19 @@ public class StorageWriterTests extends ThreadPooledTestSuite {
     }
 
     private void updateAttributes(UpdateableSegmentMetadata segmentMetadata, TestContext context) {
-        Collection<AttributeUpdate> attributeUpdates = generateAttributeUpdates(segmentMetadata);
+        AttributeUpdateCollection attributeUpdates = generateAttributeUpdates(segmentMetadata);
         context.dataSource.add(new UpdateAttributesOperation(segmentMetadata.getId(), attributeUpdates));
     }
 
-    private Collection<AttributeUpdate> generateAttributeUpdates(UpdateableSegmentMetadata segmentMetadata) {
+    private AttributeUpdateCollection generateAttributeUpdates(UpdateableSegmentMetadata segmentMetadata) {
         long coreAttributeValue = segmentMetadata.getAttributes().getOrDefault(CORE_ATTRIBUTE_ID, 0L) + 1;
-        long extendedAttributeValue = segmentMetadata.getAttributes().getOrDefault(EXTENDED_ATTRIBUTE_ID, 0L) + 13;
-        Collection<AttributeUpdate> attributeUpdates = Arrays.asList(
-                new AttributeUpdate(CORE_ATTRIBUTE_ID, AttributeUpdateType.Accumulate, coreAttributeValue),
-                new AttributeUpdate(EXTENDED_ATTRIBUTE_ID, AttributeUpdateType.Replace, extendedAttributeValue));
+        val attributeUpdates = new AttributeUpdateCollection();
+        attributeUpdates.add(new AttributeUpdate(CORE_ATTRIBUTE_ID, AttributeUpdateType.Accumulate, coreAttributeValue));
+        for (int i = 0; i < EXTENDED_ATTRIBUTE_IDS.size(); i++) {
+            AttributeId id = EXTENDED_ATTRIBUTE_IDS.get(i);
+            long extendedAttributeValue = segmentMetadata.getAttributes().getOrDefault(id, 0L) + 13 + i;
+            attributeUpdates.add(new AttributeUpdate(id, AttributeUpdateType.Replace, extendedAttributeValue));
+        }
         segmentMetadata.updateAttributes(
                 attributeUpdates.stream().collect(Collectors.toMap(AttributeUpdate::getAttributeId, AttributeUpdate::getValue)));
         return attributeUpdates;
@@ -883,7 +1020,7 @@ public class StorageWriterTests extends ThreadPooledTestSuite {
 
             // Add the operation to the log.
             StreamSegmentMapOperation mapOp = new StreamSegmentMapOperation(context.storage.getStreamSegmentInfo(name, TIMEOUT).join());
-            mapOp.setStreamSegmentId((long) i);
+            mapOp.setStreamSegmentId(i);
             context.dataSource.add(mapOp);
         }
 
@@ -899,7 +1036,7 @@ public class StorageWriterTests extends ThreadPooledTestSuite {
             transactions.put(parentId, segmentTransactions);
             SegmentMetadata parentMetadata = context.metadata.getStreamSegmentMetadata(parentId);
             for (int i = 0; i < TRANSACTIONS_PER_SEGMENT; i++) {
-                String transactionName = StreamSegmentNameUtils.getTransactionNameFromId(parentMetadata.getName(), UUID.randomUUID());
+                String transactionName = NameUtils.getTransactionNameFromId(parentMetadata.getName(), UUID.randomUUID());
                 context.transactionIds.put(transactionId, parentId);
                 context.metadata.mapStreamSegmentId(transactionName, transactionId);
                 initializeSegment(transactionId, context);
@@ -986,7 +1123,7 @@ public class StorageWriterTests extends ThreadPooledTestSuite {
         }
 
         @Override
-        public CompletableFuture<WriterFlushResult> flush(Duration timeout) {
+        public CompletableFuture<WriterFlushResult> flush(boolean force, Duration timeout) {
             Exceptions.checkNotClosed(this.closed.get(), this);
             this.firstUnAcked.set(this.operations.size());
             return CompletableFuture.completedFuture(new WriterFlushResult());

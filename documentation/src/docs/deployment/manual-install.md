@@ -1,11 +1,17 @@
 <!--
-Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+Copyright Pravega Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
 -->
 # Manual Installation
 
@@ -13,33 +19,43 @@ This page describes the prerequisites and installation steps to deploy Pravega i
 
 ## Prerequisites
 
-### HDFS
+### Cloud Storage
 
-Setup a HDFS storage cluster running **HDFS version 2.7+**. HDFS is used as Tier 2 Storage and must have
-sufficient capacity to store the contents of all the streams. The storage cluster is recommended to be run
-alongside Pravega on separate nodes.
+Pravega supports Amazon S3, Azure Blob Storage, Google Cloud Storage, HDFS and mounted distributed filesystems for Long Term Storage.
+With the S3 protocol being widely supported by 3rd party storage systems, Pravega can be run either alongside a private storage
+cluster or by targeting public cloud resources.
+
+### Filesystem
+
+If it is easier to mount an NFS share, then `FILESYSTEM` can be used for Long Term Storage. The following configuration options are necessary to configure the `FILESYSTEM` as Long Term Storage.
+```
+pravegaservice.storage.impl.name = FILESYSTEM
+filesystem.root = /mnt/tier2
+```
+where `/mnt/tier2` is replaced with your nfs share and `FILESYSTEM` is a keyword.
+
+Other options for `pravegaservice.storage.impl.name` include `AZURE`, `EXTENDEDS3`, `GCP`, `HDFS`, and `S3`.
 
 ### Java
 
-Install the latest Java 8 from [java.oracle.com](http://java.oracle.com). Packages are available
-for all major operating systems.
+Install Java 11 or later. Packages are available for all major operating systems.
 
 ### Zookeeper
 
-Pravega requires **Zookeeper 3.5.4-beta**. At least 3 Zookeeper nodes are recommended for a quorum. No special configuration is required for Zookeeper but it is recommended to use a dedicated cluster for Pravega.
+Pravega requires **Zookeeper 3.6.3**. At least 3 Zookeeper nodes are recommended for a quorum. No special configuration is required for Zookeeper but it is recommended to use a dedicated cluster for Pravega.
 
-This specific version of Zookeeper can be downloaded from Apache at [zookeeper-3.5.4-beta.tar.gz](https://archive.apache.org/dist/zookeeper/zookeeper-3.5.4-beta/zookeeper-3.5.4-beta.tar.gz).
+This specific version of Zookeeper can be downloaded from Apache at [apache-zookeeper-3.6.3.tar.gz](https://archive.apache.org/dist/zookeeper/zookeeper-3.6.3/apache-zookeeper-3.6.3.tar.gz).
 
-For installing Zookeeper see the [Getting Started Guide](http://zookeeper.apache.org/doc/r3.5.4-beta/zookeeperStarted.html).
+For installing Zookeeper see the [Getting Started Guide](https://zookeeper.apache.org/doc/r3.6.3/zookeeperStarted.html).
 
 ### Bookkeeper
 
-Pravega requires **Bookkeeper 4.7.3**. At least 3 Bookkeeper servers are recommended for a quorum.
+Pravega requires **Bookkeeper 4.14.1**. At least 3 Bookkeeper servers are recommended for a quorum.
 
-This specific version of Bookkeeper can be downloaded from Apache at [bookkeeper-server-4.7.3-bin.tar.gz](https://archive.apache.org/dist/bookkeeper/bookkeeper-4.7.3//bookkeeper-server-4.7.3-bin.tar.gz).
+This specific version of Bookkeeper can be downloaded from Apache at [bookkeeper-server-4.14.1-bin.tar.gz](https://archive.apache.org/dist/bookkeeper/bookkeeper-4.14.1/bookkeeper-server-4.14.1-bin.tar.gz).
 
-For installing Bookkeeper see the [Getting Started Guide](http://bookkeeper.apache.org/docs/4.7.3/getting-started).
-Some specific Pravega instructions are shown below. All sets are assumed to be run from the `bookkeeper-server-4.7.3` directory.
+For installing Bookkeeper see the [Getting Started Guide](https://bookkeeper.apache.org/docs/getting-started/installation/).
+Some specific Pravega instructions are shown below. All sets are assumed to be run from the `bookkeeper-server-4.14.1` directory.
 
 #### Bookkeeper Configuration
 
@@ -56,7 +72,7 @@ indexDirectories=/bk/index
 
 ### Initializing Zookeeper paths
 
-The following paths need to be created in Zookeeper. Open the `zookeeper-3.5.4-beta` directory on the Zookeeper servers and run the following paths:
+The following paths need to be created in Zookeeper. Open the `zookeeper-3.6.3` directory on the Zookeeper servers and run the following paths:
 
 ```
 bin/zkCli.sh -server $ZK_URL create /pravega
@@ -78,7 +94,7 @@ Start the bookie as mentioned below:
 bin/bookkeeper bookie
 ```
 ### Running Bookkeeper with encryption enabled
-Apache BookKeeper can be deployed with TLS enabled. Details can be found [here](https://bookkeeper.apache.org/docs/latest/security/tls/).
+Apache BookKeeper can be deployed with TLS enabled. Details can be found [here](https://bookkeeper.apache.org/docs/security/tls/).
 
 ---
 # Installing Pravega
@@ -139,15 +155,14 @@ bin/pravega-controller
 ## Installation of the Segment Store
 
 In the file `conf/config.properties`, make the following changes as mentioned:
-Replace `<zk-ip>`, `<controller-ip>` and `<hdfs-ip>` with the IPs of the respective services.
+Replace `<zk-ip>` and `<controller-ip>` with the IPs of the respective services.
 
 ```
-pravegaservice.zkURL=<zk-ip>:2181
-bookkeeper.zkAddress=<zk-ip>:2181
-autoScale.controllerUri=tcp://<controller-ip>:9090
+pravegaservice.zk.connect.uri=<zk-ip>:2181
+bookkeeper.zk.connect.uri=<zk-ip>:2181
+autoScale.controller.connect.uri=tcp://<controller-ip>:9090
 
-# Settings required for HDFS
-hdfs.hdfsUrl=<hdfs-ip>:8020
+# Settings required for your Long Term Storage provider
 ```
 
 After making the configuration changes, the segment store can be run using the following command:
@@ -159,6 +174,6 @@ bin/pravega-segmentstore
 
 Steps for securing a distributed mode cluster can be found [here](../security/securing-distributed-mode-cluster.md).
 
-For detailed information about security configuration parameters for [Controller](../security/pravega-security-configurations.md#pravega-controller))
-and [Segment Store](../security/pravega-security-configurations.md#pravega-segment-store),
+For detailed information about security configuration parameters for [Controller](../security/pravega-security-configurations.md#controller-tls-configuration-parameters))
+and [Segment Store](../security/pravega-security-configurations.md#segment-store-tls-configuration-parameters),
 see [this]((../security/pravega-security-configurations.md) document.

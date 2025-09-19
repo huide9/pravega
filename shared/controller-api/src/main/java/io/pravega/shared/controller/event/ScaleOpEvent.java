@@ -1,11 +1,17 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.shared.controller.event;
 
@@ -19,6 +25,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+
 import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Data;
@@ -27,6 +34,7 @@ import lombok.Data;
 @Data
 @AllArgsConstructor
 public class ScaleOpEvent implements ControllerEvent {
+    @SuppressWarnings("unused")
     private static final long serialVersionUID = 1L;
     private final String scope;
     private final String stream;
@@ -43,7 +51,7 @@ public class ScaleOpEvent implements ControllerEvent {
 
     @Override
     public CompletableFuture<Void> process(RequestProcessor processor) {
-        return processor.processScaleOpRequest(this);
+        return ((StreamRequestProcessor) processor).processScaleOpRequest(this);
     }
 
     //region Serialization
@@ -51,7 +59,7 @@ public class ScaleOpEvent implements ControllerEvent {
     private static class ScaleOpEventBuilder implements ObjectBuilder<ScaleOpEvent> {
     }
 
-    static class Serializer extends VersionedSerializer.WithBuilder<ScaleOpEvent, ScaleOpEventBuilder> {
+    public static class Serializer extends VersionedSerializer.WithBuilder<ScaleOpEvent, ScaleOpEventBuilder> {
         @Override
         protected ScaleOpEventBuilder newBuilder() {
             return ScaleOpEvent.builder();

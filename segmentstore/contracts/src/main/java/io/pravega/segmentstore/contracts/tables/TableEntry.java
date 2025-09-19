@@ -1,16 +1,21 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.segmentstore.contracts.tables;
 
-import io.pravega.common.util.ArrayView;
-import io.pravega.common.util.HashedArray;
+import io.pravega.common.util.BufferView;
 import lombok.AccessLevel;
 import lombok.Getter;
 import lombok.NonNull;
@@ -30,7 +35,7 @@ public class TableEntry {
     /**
      * The Value (data) of the entry.
      */
-    private final ArrayView value;
+    private final BufferView value;
     /**
      * Creates a new instance of the TableEntry class with no desired version.
      *
@@ -39,7 +44,7 @@ public class TableEntry {
      *
      * @return the TableEntry that was created
      */
-    public static TableEntry unversioned(@NonNull ArrayView key, @NonNull ArrayView value) {
+    public static TableEntry unversioned(@NonNull BufferView key, @NonNull BufferView value) {
         return new TableEntry(TableKey.unversioned(key), value);
     }
 
@@ -52,7 +57,7 @@ public class TableEntry {
      * @return newly created TableEntry if one for the key does not already exist.
      *
      */
-    public static TableEntry notExists(@NonNull ArrayView key, @NonNull ArrayView value) {
+    public static TableEntry notExists(@NonNull BufferView key, @NonNull BufferView value) {
         return new TableEntry(TableKey.notExists(key), value);
     }
 
@@ -64,7 +69,7 @@ public class TableEntry {
      * @return newly created TableEntry if one for the key does not already exist.
      *
      */
-    public static TableEntry notExists(@NonNull ArrayView key) {
+    public static TableEntry notExists(@NonNull BufferView key) {
         return new TableEntry(TableKey.notExists(key), null);
     }
 
@@ -77,7 +82,7 @@ public class TableEntry {
      *
      * @return new instance of Table Entry with a specified version
      */
-    public static TableEntry versioned(@NonNull ArrayView key, @NonNull ArrayView value, long version) {
+    public static TableEntry versioned(@NonNull BufferView key, @NonNull BufferView value, long version) {
         return new TableEntry(TableKey.versioned(key, version), value);
     }
 
@@ -97,7 +102,7 @@ public class TableEntry {
             TableEntry other = (TableEntry) obj;
             return this.key.equals(other.key)
                     && ((this.value == null && other.value == null)
-                    || (this.value != null && other.value != null && HashedArray.arrayEquals(this.value, other.getValue())));
+                    || (this.value != null && other.value != null && this.value.equals(other.getValue())));
 
         }
 

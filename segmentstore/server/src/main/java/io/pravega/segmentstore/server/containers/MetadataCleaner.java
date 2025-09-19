@@ -1,11 +1,17 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.segmentstore.server.containers;
 
@@ -13,10 +19,12 @@ import io.pravega.common.LoggerHelpers;
 import io.pravega.common.concurrent.AbstractThreadPoolService;
 import io.pravega.common.concurrent.CancellationToken;
 import io.pravega.common.concurrent.Futures;
+import io.pravega.segmentstore.contracts.Attributes;
 import io.pravega.segmentstore.server.EvictableMetadata;
 import io.pravega.segmentstore.server.SegmentMetadata;
 import java.time.Duration;
 import java.util.Collection;
+import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.atomic.AtomicLong;
@@ -24,7 +32,6 @@ import java.util.function.Consumer;
 import java.util.stream.Collectors;
 import javax.annotation.concurrent.GuardedBy;
 import javax.annotation.concurrent.ThreadSafe;
-
 import lombok.NonNull;
 import lombok.extern.slf4j.Slf4j;
 import lombok.val;
@@ -101,6 +108,24 @@ class MetadataCleaner extends AbstractThreadPoolService {
     //endregion
 
     /**
+     * Persists the metadata of all active Segments from the Container's metadata into the {@link MetadataStore}.
+     * This method does not evict or otherwise perform any cleanup tasks on the Container or its Metadata, nor does it
+     * interfere with the regular operation of {@link #runOnce()}.
+     *
+     * @param timeout Timeout for the operation.
+     * @return A CompletableFuture that, when completed, indicates that the operation completed.
+     */
+    CompletableFuture<Void> persistAll(Duration timeout) {
+        val tasks = this.metadata.getAllStreamSegmentIds().stream()
+                .map(this.metadata::getStreamSegmentMetadata)
+                .filter(Objects::nonNull)
+                .filter(sm -> !sm.isDeleted() && !sm.isMerged())
+                .map(sm -> this.metadataStore.updateSegmentInfo(sm, timeout))
+                .collect(Collectors.toList());
+        return Futures.allOf(tasks);
+    }
+
+    /**
      * Executes one iteration of the MetadataCleaner. This ensures that there cannot be more than one concurrent executions of
      * such an iteration (whether it's from this direct call or from the regular MetadataCleaner invocation). If concurrent
      * invocations are made, then subsequent calls will be tied to the execution of the first, and will all complete at
@@ -131,28 +156,47 @@ class MetadataCleaner extends AbstractThreadPoolService {
         return result;
     }
 
-    private CompletableFuture<Void> runOnceInternal() {
-        long lastSeqNo = this.lastIterationSequenceNumber.getAndSet(this.metadata.getOperationSequenceNumber());
+    private CompletableFuture<Void> evictUnusedSegments(long lastSeqNo) {
         long traceId = LoggerHelpers.traceEnterWithContext(log, this.traceObjectId, "metadataCleanup", lastSeqNo);
-
         // Get candidates.
         Collection<SegmentMetadata> cleanupCandidates = this.metadata.getEvictionCandidates(lastSeqNo, this.config.getMaxConcurrentSegmentEvictionCount());
-
         // Serialize only those segments that are still alive (not deleted or merged - those will get removed anyway).
-        val cleanupTasks = cleanupCandidates
+        val serializationTasks = cleanupCandidates
                 .stream()
                 .filter(sm -> !sm.isDeleted() && !sm.isMerged())
                 .map(sm -> this.metadataStore.updateSegmentInfo(sm, this.config.getSegmentMetadataExpiration()))
                 .collect(Collectors.toList());
 
         return Futures
-                .allOf(cleanupTasks)
+                .allOf(serializationTasks)
                 .thenRunAsync(() -> {
                     Collection<SegmentMetadata> evictedSegments = this.metadata.cleanup(cleanupCandidates, lastSeqNo);
                     this.cleanupCallback.accept(evictedSegments);
-                    int evictedAttributes = this.metadata.cleanupExtendedAttributes(0, lastSeqNo);
+                    int evictedAttributes = this.metadata.cleanupExtendedAttributes(this.config.getMaxCachedExtendedAttributeCount(), lastSeqNo);
                     LoggerHelpers.traceLeave(log, this.traceObjectId, "metadataCleanup", traceId, evictedSegments.size(), evictedAttributes);
                 }, this.executor);
+    }
+
+    private CompletableFuture<Void> deleteUnusedTransientSegments(long lastSeqNo) {
+        long traceId = LoggerHelpers.traceEnterWithContext(log, this.traceObjectId, "deleteUnusedTransientSegments", lastSeqNo);
+        // Serialize only those segments that are still alive (not deleted or merged - those will get removed anyway).
+        val deletionTasks = this.metadata.getEvictionCandidates(lastSeqNo, this.config.getMaxConcurrentSegmentEvictionCount())
+                .stream()
+                .filter(sm -> sm.getType().isTransientSegment())
+                .filter(sm -> sm.getAttributes().get(Attributes.CREATION_EPOCH) < metadata.getContainerEpoch())
+                .map(sm -> metadataStore.deleteSegment(sm.getName(), this.config.getTransientSegmentDeleteTimeout()))
+                .collect(Collectors.toList());
+
+        val result = Futures.allOf(deletionTasks);
+        if (log.isTraceEnabled()) {
+            result.thenRun(() -> LoggerHelpers.traceLeave(log, this.traceObjectId, "deleteUnusedTransientSegments", traceId));
+        }
+        return result;
+    }
+
+    private CompletableFuture<Void> runOnceInternal() {
+        long lastSeqNo = this.lastIterationSequenceNumber.getAndSet(this.metadata.getOperationSequenceNumber());
+        return evictUnusedSegments(lastSeqNo).thenCompose(unused -> deleteUnusedTransientSegments(lastSeqNo));
     }
 
     private CompletableFuture<Void> delay() {

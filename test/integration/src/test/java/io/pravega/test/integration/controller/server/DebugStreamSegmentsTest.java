@@ -1,15 +1,23 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
- * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
- * in compliance with the License. You may obtain a copy of the License at
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.test.integration.controller.server;
 
 import io.pravega.client.ClientConfig;
 import io.pravega.client.EventStreamClientFactory;
+import io.pravega.client.security.auth.DelegationTokenProviderFactory;
 import io.pravega.client.segment.impl.Segment;
 import io.pravega.client.segment.impl.SegmentOutputStream;
 import io.pravega.client.segment.impl.SegmentOutputStreamFactory;
@@ -20,26 +28,26 @@ import io.pravega.client.stream.ScalingPolicy;
 import io.pravega.client.stream.Serializer;
 import io.pravega.client.stream.Stream;
 import io.pravega.client.stream.StreamConfiguration;
-import io.pravega.client.stream.impl.Controller;
+import io.pravega.client.control.impl.Controller;
 import io.pravega.client.stream.impl.SegmentSelector;
 import io.pravega.common.concurrent.ExecutorServiceHelpers;
 import io.pravega.common.concurrent.Futures;
 import io.pravega.controller.eventProcessor.EventSerializer;
 import io.pravega.segmentstore.contracts.StreamSegmentStore;
 import io.pravega.segmentstore.contracts.tables.TableStore;
+import io.pravega.segmentstore.server.host.handler.IndexAppendProcessor;
 import io.pravega.segmentstore.server.host.handler.PravegaConnectionListener;
 import io.pravega.segmentstore.server.store.ServiceBuilder;
 import io.pravega.segmentstore.server.store.ServiceBuilderConfig;
+import io.pravega.shared.NameUtils;
 import io.pravega.shared.controller.event.AutoScaleEvent;
-import io.pravega.shared.segment.StreamSegmentNameUtils;
 import io.pravega.test.common.TestUtils;
 import io.pravega.test.common.TestingServerStarter;
-import io.pravega.test.integration.demo.ControllerWrapper;
+import io.pravega.test.integration.utils.ControllerWrapper;
 import java.net.URI;
 import java.util.Collection;
 import java.util.Random;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import lombok.Cleanup;
 import org.apache.curator.test.TestingServer;
@@ -78,7 +86,7 @@ public class DebugStreamSegmentsTest {
 
     @Before
     public void setUp() throws Exception {
-        executor = Executors.newSingleThreadScheduledExecutor();
+        executor = ExecutorServiceHelpers.newScheduledThreadPool(1, "test");
         writerExecutor = ExecutorServiceHelpers.newScheduledThreadPool(NUMBER_OF_WRITERS, "writer-pool");
         readExecutor = ExecutorServiceHelpers.newScheduledThreadPool(1, "reader-pool");
         scaleExecutor = ExecutorServiceHelpers.newScheduledThreadPool(1, "scale-pool");
@@ -89,7 +97,8 @@ public class DebugStreamSegmentsTest {
         StreamSegmentStore store = serviceBuilder.createStreamSegmentService();
         TableStore tableStore = serviceBuilder.createTableStoreService();
 
-        server = new PravegaConnectionListener(false, servicePort, store, tableStore);
+        server = new PravegaConnectionListener(false, servicePort, store, tableStore, serviceBuilder.getLowPriorityExecutor(),
+                new IndexAppendProcessor(serviceBuilder.getLowPriorityExecutor(), store));
         server.startListening();
 
         controllerWrapper = new ControllerWrapper(zkTestServer.getConnectString(), false, controllerPort, serviceHost,
@@ -99,7 +108,7 @@ public class DebugStreamSegmentsTest {
 
     @After
     public void tearDown() throws Exception {
-        executor.shutdown();
+        executor.shutdownNow();
         writerExecutor.shutdownNow();
         readExecutor.shutdownNow();
         scaleExecutor.shutdownNow();
@@ -109,7 +118,7 @@ public class DebugStreamSegmentsTest {
         zkTestServer.close();
     }
 
-    @Test
+    @Test(timeout = 30000)
     public void testOutOfSequence() throws Exception {
         // 1. Prepare
         createScope(SCOPE);
@@ -119,7 +128,8 @@ public class DebugStreamSegmentsTest {
         when(streamFactory.createOutputStreamForSegment(any(), any(), any(),
                                                         any())).thenReturn(mock(SegmentOutputStream.class));
         SegmentSelector selector = new SegmentSelector(Stream.of(SCOPE, STREAM), controllerWrapper.getController(),
-                                                       streamFactory, EventWriterConfig.builder().build());
+                                                       streamFactory, EventWriterConfig.builder().build(),
+                                                       DelegationTokenProviderFactory.createWithEmptyToken());
 
         // 2.Create clientFactory.
         @Cleanup
@@ -136,8 +146,8 @@ public class DebugStreamSegmentsTest {
             for (int key = 0; key < 100; key++) {
                 Segment segment = selector.getSegmentForEvent("key-" + key);
                 if (lastSegments[key] != null) {
-                    int lastEpoch = StreamSegmentNameUtils.getEpoch(lastSegments[key].getSegmentId());
-                    int thisEpoch = StreamSegmentNameUtils.getEpoch(segment.getSegmentId());
+                    int lastEpoch = NameUtils.getEpoch(lastSegments[key].getSegmentId());
+                    int thisEpoch = NameUtils.getEpoch(segment.getSegmentId());
                     assertTrue(thisEpoch >= lastEpoch);
                     if (thisEpoch == lastEpoch) {
                         assertEquals(lastSegments[key], segment);
@@ -177,7 +187,7 @@ public class DebugStreamSegmentsTest {
     }
 
     private void createScope(final String scopeName) throws InterruptedException, ExecutionException {
-        controllerWrapper.getControllerService().createScope(scopeName).get();
+        controllerWrapper.getControllerService().createScope(scopeName, 0L).get();
     }
 
     private void createStream(String streamName) throws Exception {

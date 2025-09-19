@@ -1,11 +1,17 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.segmentstore.server.containers;
 
@@ -14,10 +20,13 @@ import io.pravega.common.Exceptions;
 import io.pravega.common.MathHelpers;
 import io.pravega.common.ObjectClosedException;
 import io.pravega.common.concurrent.Futures;
+import io.pravega.segmentstore.contracts.AttributeId;
 import io.pravega.segmentstore.contracts.AttributeUpdate;
+import io.pravega.segmentstore.contracts.AttributeUpdateCollection;
 import io.pravega.segmentstore.contracts.AttributeUpdateType;
 import io.pravega.segmentstore.contracts.Attributes;
 import io.pravega.segmentstore.contracts.SegmentProperties;
+import io.pravega.segmentstore.contracts.SegmentType;
 import io.pravega.segmentstore.contracts.StreamSegmentExistsException;
 import io.pravega.segmentstore.contracts.StreamSegmentInformation;
 import io.pravega.segmentstore.contracts.StreamSegmentNotExistsException;
@@ -28,9 +37,11 @@ import io.pravega.segmentstore.server.SegmentMetadata;
 import io.pravega.segmentstore.server.SegmentMetadataComparer;
 import io.pravega.segmentstore.server.UpdateableContainerMetadata;
 import io.pravega.segmentstore.server.UpdateableSegmentMetadata;
+import io.pravega.shared.NameUtils;
 import io.pravega.test.common.AssertExtensions;
 import io.pravega.test.common.ErrorInjector;
 import io.pravega.test.common.IntentionalException;
+import io.pravega.test.common.TestUtils;
 import io.pravega.test.common.ThreadPooledTestSuite;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -41,9 +52,13 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
+import java.util.Vector;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Function;
@@ -68,6 +83,7 @@ public abstract class MetadataStoreTestBase extends ThreadPooledTestSuite {
     protected static final Duration TIMEOUT = Duration.ofSeconds(30);
     private static final int CONTAINER_ID = 123;
     private static final int ATTRIBUTE_COUNT = 10;
+    private static final SegmentType SEGMENT_TYPE = SegmentType.builder().internal().build();
 
     @Override
     protected int getThreadPoolSize() {
@@ -80,6 +96,10 @@ public abstract class MetadataStoreTestBase extends ThreadPooledTestSuite {
     @Test
     public void testCreateSegment() {
         final int segmentCount = 50;
+        val segmentTypes = Arrays.asList(
+                SegmentType.STREAM_SEGMENT,
+                SegmentType.builder().system().build(),
+                SegmentType.builder().critical().internal().build());
 
         @Cleanup
         TestContext context = createTestContext();
@@ -87,10 +107,71 @@ public abstract class MetadataStoreTestBase extends ThreadPooledTestSuite {
         // Create some Segments and verify they are properly created and registered.
         for (int i = 0; i < segmentCount; i++) {
             String segmentName = getName(i);
+            val segmentType = segmentTypes.get(i % segmentTypes.size());
             val segmentAttributes = createAttributeUpdates(ATTRIBUTE_COUNT);
-            context.getMetadataStore().createSegment(segmentName, segmentAttributes, TIMEOUT).join();
-            assertSegmentCreated(segmentName, segmentAttributes, context);
+            context.getMetadataStore().createSegment(segmentName, segmentType, segmentAttributes, TIMEOUT).join();
+            assertSegmentCreated(segmentName, segmentType, segmentAttributes, context);
         }
+    }
+
+    /**
+     * Tests the ability of the MetadataStore to create a new Transient Segment.
+     */
+    @Test
+    public void testCreateTransientSegment() {
+        final int transientSegmentCount = 50;
+        @Cleanup
+        TestContext context = createTestContext();
+        // Create some Segments and verify they are properly created and registered.
+        for (int i = 0; i < transientSegmentCount; i++) {
+            String transientSegmentName = getTransientName(i);
+            Collection<AttributeUpdate> segmentAttributes = Set.of(
+                    new AttributeUpdate(Attributes.EVENT_COUNT, AttributeUpdateType.None, 0)
+            );
+            context.getMetadataStore().createSegment(transientSegmentName, SegmentType.TRANSIENT_SEGMENT, segmentAttributes, TIMEOUT);
+            assertTransientSegmentCreated(transientSegmentName, context);
+        }
+    }
+
+    /**
+     * Verifies that {@link MetadataStore#createSegment} validates the {@link Attributes#ATTRIBUTE_ID_LENGTH} value, if
+     * passed as an argument.
+     */
+    @Test
+    public void testCreateSegmentValidateAttributeIdLength() {
+        @Cleanup
+        TestContext context = createTestContext();
+
+        // Try to create a segment with invalid values.
+        val s1 = getName(0);
+        AssertExtensions.assertSuppliedFutureThrows(
+                "ATTRIBUTE_ID_LENGTH was accepted as negative.",
+            () -> context.getMetadataStore()
+                         .createSegment(s1, SegmentType.STREAM_SEGMENT,
+                                        AttributeUpdateCollection.from(new AttributeUpdate(Attributes.ATTRIBUTE_ID_LENGTH, AttributeUpdateType.None, -1L)),
+                                        TIMEOUT),
+                ex -> ex instanceof IllegalArgumentException);
+
+        AssertExtensions.assertSuppliedFutureThrows(
+                "ATTRIBUTE_ID_LENGTH was accepted with too high value.",
+                () -> context.getMetadataStore()
+                             .createSegment(s1, SegmentType.STREAM_SEGMENT, 
+                                            AttributeUpdateCollection.from(new AttributeUpdate(Attributes.ATTRIBUTE_ID_LENGTH, AttributeUpdateType.None, AttributeId.MAX_LENGTH + 1)), 
+                                            TIMEOUT),
+                ex -> ex instanceof IllegalArgumentException);
+
+        // Create a segment with valid values.
+        val validAttributes = AttributeUpdateCollection.from(
+                new AttributeUpdate(Attributes.ATTRIBUTE_ID_LENGTH, AttributeUpdateType.None, AttributeId.MAX_LENGTH / 2));
+        context.getMetadataStore().createSegment(s1, SegmentType.STREAM_SEGMENT, validAttributes, TIMEOUT).join();
+        assertSegmentCreated(s1, SegmentType.STREAM_SEGMENT, validAttributes, context);
+
+        // Now verify that it also works if the attribute is not set.
+        val noAttributes = new AttributeUpdateCollection();
+        val s2 = getName(1);
+        context.getMetadataStore().createSegment(s2, SegmentType.STREAM_SEGMENT, noAttributes, TIMEOUT).join();
+        assertSegmentCreated(s2, SegmentType.STREAM_SEGMENT, noAttributes, context);
+
     }
 
     /**
@@ -99,13 +180,13 @@ public abstract class MetadataStoreTestBase extends ThreadPooledTestSuite {
     @Test
     public void testCreateSegmentAlreadyExists() {
         final String segmentName = "NewSegment";
-        final Map<UUID, Long> originalAttributes = ImmutableMap.of(UUID.randomUUID(), 123L, Attributes.EVENT_COUNT, 1L);
-        final Map<UUID, Long> expectedAttributes = Attributes.getCoreNonNullAttributes(originalAttributes);
+        final Map<AttributeId, Long> originalAttributes = ImmutableMap.of(AttributeId.randomUUID(), 123L, Attributes.EVENT_COUNT, 1L);
+        final Map<AttributeId, Long> expectedAttributes = getExpectedCoreAttributes(originalAttributes, SEGMENT_TYPE);
         final Collection<AttributeUpdate> correctAttributeUpdates =
                 originalAttributes.entrySet().stream()
-                                  .map(e -> new AttributeUpdate(e.getKey(), AttributeUpdateType.Replace, e.getValue()))
-                                  .collect(Collectors.toList());
-        final Map<UUID, Long> badAttributes = Collections.singletonMap(UUID.randomUUID(), 456L);
+                        .map(e -> new AttributeUpdate(e.getKey(), AttributeUpdateType.Replace, e.getValue()))
+                        .collect(Collectors.toList());
+        final Map<AttributeId, Long> badAttributes = Collections.singletonMap(AttributeId.randomUUID(), 456L);
         final Collection<AttributeUpdate> badAttributeUpdates =
                 badAttributes.entrySet().stream()
                              .map(e -> new AttributeUpdate(e.getKey(), AttributeUpdateType.Replace, e.getValue()))
@@ -115,12 +196,12 @@ public abstract class MetadataStoreTestBase extends ThreadPooledTestSuite {
         TestContext context = createTestContext();
 
         // Create a segment.
-        context.getMetadataStore().createSegment(segmentName, correctAttributeUpdates, TIMEOUT).join();
+        context.getMetadataStore().createSegment(segmentName, SEGMENT_TYPE, correctAttributeUpdates, TIMEOUT).join();
 
         // Try to create it again.
         AssertExtensions.assertSuppliedFutureThrows(
                 "createSegment did not fail when Segment already exists.",
-                () -> context.getMetadataStore().createSegment(segmentName, badAttributeUpdates, TIMEOUT),
+                () -> context.getMetadataStore().createSegment(segmentName, SEGMENT_TYPE, badAttributeUpdates, TIMEOUT),
                 ex -> ex instanceof StreamSegmentExistsException);
 
         val si = context.getMetadataStore().getSegmentInfo(segmentName, TIMEOUT).join();
@@ -155,7 +236,7 @@ public abstract class MetadataStoreTestBase extends ThreadPooledTestSuite {
 
         // Create all Segments that are supposed to exist.
         Stream.of(noIdSegment, unmappedSegment, mappedSegment, mappedDeletedSegment)
-              .forEach(name -> context.getMetadataStore().createSegment(name, null, TIMEOUT).join());
+                .forEach(name -> context.getMetadataStore().createSegment(name, SEGMENT_TYPE, null, TIMEOUT).join());
 
         // Assign Ids to all Segments that are supposed to have one.
         Stream.of(unmappedSegment, mappedSegment, mappedDeletedSegment)
@@ -229,15 +310,13 @@ public abstract class MetadataStoreTestBase extends ThreadPooledTestSuite {
 
         // Segment is not active in the in Metadata, but it does exist.
         // Since we do not setup an OperationLog, we guarantee that there is no attempt to map this in the metadata.
-        val segmentInfo = StreamSegmentInformation.builder()
-                                                  .name(segmentName)
-                                                  .length(123)
-                                                  .sealed(true)
-                                                  .attributes(toAttributes(createAttributeUpdates(ATTRIBUTE_COUNT)))
-                                                  .build();
+        context.getMetadataStore().createSegment(segmentName, SEGMENT_TYPE, null, TIMEOUT).join();
 
         // Persist the segment info in the Store.
-        context.getMetadataStore().createSegment(segmentName, null, TIMEOUT).join();
+        val updateAttributes = toAttributes(createAttributeUpdates(ATTRIBUTE_COUNT));
+        SEGMENT_TYPE.intoAttributes(updateAttributes);
+        val segmentInfo = StreamSegmentInformation.builder()
+                .name(segmentName).length(123).sealed(true).attributes(updateAttributes).build();
         context.getMetadataStore().updateSegmentInfo(toMetadata(segmentId, segmentInfo), TIMEOUT).join();
 
         // Get the segment info from the Store.
@@ -246,6 +325,7 @@ public abstract class MetadataStoreTestBase extends ThreadPooledTestSuite {
 
         // We only expect Core Attributes to have been serialized.
         val expectedAttributes = Attributes.getCoreNonNullAttributes(segmentInfo.getAttributes());
+        SEGMENT_TYPE.intoAttributes(expectedAttributes);
         SegmentMetadataComparer.assertSameAttributes("Unexpected attributes when Segment exists in Storage", expectedAttributes, inStorageInfo);
         Assert.assertEquals("Not expecting any segments to be mapped.", 0, context.getNonPinnedMappedSegmentCount());
 
@@ -253,7 +333,7 @@ public abstract class MetadataStoreTestBase extends ThreadPooledTestSuite {
         // the info is fetched from there.
         val sm = context.getMetadata().mapStreamSegmentId(segmentName, segmentId);
         sm.setLength(segmentInfo.getLength() + 1);
-        sm.updateAttributes(Collections.singletonMap(UUID.randomUUID(), 12345L));
+        sm.updateAttributes(Collections.singletonMap(AttributeId.randomUUID(), 12345L));
         val inMetadataInfo = context.getMetadataStore().getSegmentInfo(segmentName, TIMEOUT).join();
         assertEquals("Unexpected SegmentInfo when Segment exists in Metadata.", sm, inMetadataInfo);
         SegmentMetadataComparer.assertSameAttributes("Unexpected attributes when Segment exists in Metadata.",
@@ -288,7 +368,7 @@ public abstract class MetadataStoreTestBase extends ThreadPooledTestSuite {
                 .attributes(toAttributes(createAttributeUpdates(ATTRIBUTE_COUNT)))
                 .build();
         context.getMetadataStore().updateSegmentInfo(toMetadata(segmentId, initialSegmentInfo), TIMEOUT).join();
-        Map<UUID, Long> expectedAttributes = initialSegmentInfo.getAttributes();
+        Map<AttributeId, Long> expectedAttributes = initialSegmentInfo.getAttributes();
 
         CompletableFuture<Void> addInvoked = new CompletableFuture<>();
         context.connector.setMapSegmentId((id, sp, pin, timeout) -> {
@@ -334,7 +414,7 @@ public abstract class MetadataStoreTestBase extends ThreadPooledTestSuite {
         final long baseSegmentId = 1000;
         final long minSegmentLength = 1;
         final int segmentCount = 50;
-        Function<String, Long> getSegmentLength = segmentName -> minSegmentLength + (long) MathHelpers.abs(segmentName.hashCode());
+        Function<String, Long> getSegmentLength = segmentName -> minSegmentLength + MathHelpers.abs(segmentName.hashCode());
         Function<String, Long> getSegmentStartOffset = segmentName -> getSegmentLength.apply(segmentName) / 2;
 
         @Cleanup
@@ -373,7 +453,7 @@ public abstract class MetadataStoreTestBase extends ThreadPooledTestSuite {
             Assert.assertEquals("Metadata does not have the expected value for isSealed for StreamSegment " + name, expectedSeal, sm.isSealed());
 
             val segmentState = context.getMetadataStore().getSegmentInfo(name, TIMEOUT).join();
-            Map<UUID, Long> expectedAttributes = segmentState == null ? null : segmentState.getAttributes();
+            Map<AttributeId, Long> expectedAttributes = segmentState == null ? null : segmentState.getAttributes();
             SegmentMetadataComparer.assertSameAttributes("Unexpected attributes in metadata for StreamSegment " + name, expectedAttributes, sm);
             long expectedStartOffset = segmentState == null ? 0 : segmentState.getStartOffset();
             Assert.assertEquals("Unexpected StartOffset in metadata for " + name, expectedStartOffset, sm.getStartOffset());
@@ -398,7 +478,7 @@ public abstract class MetadataStoreTestBase extends ThreadPooledTestSuite {
 
         // Map all the segments, then delete them, then verify behavior.
         for (String name : storageSegments) {
-            context.getMetadataStore().createSegment(name, null, TIMEOUT).join();
+            context.getMetadataStore().createSegment(name, SEGMENT_TYPE, null, TIMEOUT).join();
             //            context.getMetadataStore().getOrAssignSegmentId(name, TIMEOUT).join();
             context.getMetadataStore().deleteSegment(name, TIMEOUT).join();
             AssertExtensions.assertSuppliedFutureThrows(
@@ -460,7 +540,7 @@ public abstract class MetadataStoreTestBase extends ThreadPooledTestSuite {
 
         try (TestContext context = createTestContext(noOpCleanup)) {
             for (val s : segmentNames) {
-                context.getMetadataStore().createSegment(s, null, TIMEOUT).join();
+                context.getMetadataStore().createSegment(s, SEGMENT_TYPE, null, TIMEOUT).join();
             }
 
             // 1. Verify the behavior when even after the retry we still cannot map.
@@ -500,7 +580,7 @@ public abstract class MetadataStoreTestBase extends ThreadPooledTestSuite {
 
         try (TestContext context = createTestContext(workingCleanup)) {
             for (val s : segmentNames) {
-                context.getMetadataStore().createSegment(s, null, TIMEOUT).join();
+                context.getMetadataStore().createSegment(s, SEGMENT_TYPE, null, TIMEOUT).join();
             }
 
             // 1. Verify the behavior when even after the retry we still cannot map.
@@ -531,7 +611,7 @@ public abstract class MetadataStoreTestBase extends ThreadPooledTestSuite {
 
         @Cleanup
         TestContext context = createTestContext();
-        context.getMetadataStore().createSegment(segmentName, null, TIMEOUT).join();
+        context.getMetadataStore().createSegment(segmentName, SEGMENT_TYPE, null, TIMEOUT).join();
         CompletableFuture<Void> addInvoked = new CompletableFuture<>();
         AtomicBoolean mapSegmentIdInvoked = new AtomicBoolean(false);
         context.connector.setMapSegmentId((id, sp, pin, timeout) -> {
@@ -547,7 +627,7 @@ public abstract class MetadataStoreTestBase extends ThreadPooledTestSuite {
             return CompletableFuture.completedFuture(segmentId);
         });
 
-        List<Integer> invocationOrder = Collections.synchronizedList(new ArrayList<>());
+        List<Integer> invocationOrder = new Vector<>();
 
         // Second call is designed to hit when the first call still tries to assign the id, hence we test normal queueing.
         CompletableFuture<String> firstCall = context.getMetadataStore().getOrAssignSegmentId(segmentName, TIMEOUT,
@@ -584,6 +664,37 @@ public abstract class MetadataStoreTestBase extends ThreadPooledTestSuite {
     }
 
     /**
+     * Tests the following scenario, which is typical of how the Controller bootstraps its metadata in the Segment Store:
+     * 0. Metadata segment does not currently exist.
+     * 1. Metadata segment is queried (StreamSegmentNotExists is returned).
+     * 2. Metadata segment is immediately created.
+     * 3. Metadata segment is queried again (in which case it should be returned normally).
+     */
+    @Test
+    public void testCreateSegmentAfterFailedAssignment() {
+        final String segmentName = "Segment";
+
+        @Cleanup
+        TestContext context = createTestContext();
+
+        // 1. Query for an inexistent segment, and pass a completion callback that is not yet completed.
+        val f1 = new CompletableFuture<Void>();
+        AssertExtensions.assertSuppliedFutureThrows(
+                "Expecting assignment to be rejected.",
+                () -> context.getMetadataStore().getOrAssignSegmentId(segmentName, TIMEOUT, id -> f1),
+                ex -> ex instanceof StreamSegmentNotExistsException);
+
+        // 2. Create the segment.
+        context.getMetadataStore().createSegment(segmentName, SEGMENT_TYPE, null, TIMEOUT).join();
+
+        // 3. Issue the second assignment. This should not fail.
+        context.getMetadataStore().getOrAssignSegmentId(segmentName, TIMEOUT).join();
+
+        // Finally, complete the first callback - this should have no effect on anything above.
+        f1.complete(null);
+    }
+
+    /**
      * Tests the ability of the MetadataStore to cancel pending assignment requests when {@link MetadataStore#close} is
      * invoked.
      */
@@ -592,7 +703,7 @@ public abstract class MetadataStoreTestBase extends ThreadPooledTestSuite {
         final String segmentName = "Segment";
         @Cleanup
         TestContext context = createTestContext();
-        context.getMetadataStore().createSegment(segmentName, null, TIMEOUT).join();
+        context.getMetadataStore().createSegment(segmentName, SEGMENT_TYPE, null, TIMEOUT).join();
         CompletableFuture<Long> mapResult = new CompletableFuture<>();
         CompletableFuture<Void> mapIdInvoked = new CompletableFuture<>();
         context.connector.setMapSegmentId(
@@ -624,15 +735,63 @@ public abstract class MetadataStoreTestBase extends ThreadPooledTestSuite {
         mapResult.completeExceptionally(new AssertionError("This should not happen"));
     }
 
+    /**
+     * Checks that we can create and register a pinned Segment via {@link MetadataStore}.
+     */
+    @Test
+    public void testPinSegmentToMemory() {
+        final String segmentName = "PinnedSegment";
+        @Cleanup
+        TestContext context = createTestContext();
+        SegmentProperties segmentProperties = StreamSegmentInformation.builder().name(segmentName).build();
+        context.connector.getMapSegmentId().apply(123, segmentProperties, false, TIMEOUT).join();
+        Assert.assertFalse(context.connector.getContainerMetadata().getStreamSegmentMetadata(123).isPinned());
+        Assert.assertEquals((long) context.getMetadataStore().pinSegmentToMemory(segmentName, TIMEOUT).join(), 123);
+        Assert.assertTrue(context.connector.getContainerMetadata().getStreamSegmentMetadata(123).isPinned());
+        AssertExtensions.assertThrows(StreamSegmentNotExistsException.class, () -> context.getMetadataStore().pinSegmentToMemory("nonExistent", TIMEOUT).join());
+    }
+
+    /**
+     * Verifies that a {@link SegmentType} marked as {@link SegmentType#isTransientSegment()} is rejected if it has an improperly
+     * formatted name.
+     *
+     * @throws ExecutionException ExecutionException if any occurs.
+     * @throws InterruptedException InterruptedException if any occurs.
+     * @throws TimeoutException TimeoutException if any occurs.
+     */
+    @Test
+    public void testTransientSegmentFormat() throws ExecutionException, InterruptedException, TimeoutException {
+        final String validTransientSegment = "scope/stream/transient#transient.00000000000000000000000000000000";
+        final String invalidTransientSegment = "scope/stream/transient";
+        @Cleanup
+        TestContext context = createTestContext();
+        // Should complete successfully.
+        context.getMetadataStore().createSegment(validTransientSegment, SegmentType.TRANSIENT_SEGMENT, new ArrayList<>(), TIMEOUT).get();
+        // Make sure our Transient Segment name maps to a valid Segment ID.
+        TestUtils.await(() -> {
+            return context.getMetadata().getStreamSegmentId(validTransientSegment, false) != ContainerMetadata.NO_STREAM_SEGMENT_ID;
+        }, 1000, TIMEOUT.toMillis());
+        // Attempt to create a Transient Segment with an ill-formatted name.
+        AssertExtensions.assertThrows(
+            "createSegment did not throw an exception given an invalid Transient Segment name.",
+                () -> context.getMetadataStore().createSegment(invalidTransientSegment, SegmentType.TRANSIENT_SEGMENT, null, TIMEOUT).get(),
+                ex -> ex instanceof IllegalArgumentException
+        );
+    }
+
     private String getName(long segmentId) {
         return String.format("Segment_%d", segmentId);
+    }
+
+    private String getTransientName(long writerId) {
+        return NameUtils.getTransientNameFromId("segment", new UUID(0, writerId));
     }
 
     private Collection<AttributeUpdate> createAttributeUpdates(int count) {
         Collection<AttributeUpdate> result = new ArrayList<>(count);
         for (int i = 0; i < count; i++) {
             boolean isCore = i % 2 == 0;
-            UUID id = isCore ? new UUID(Long.MIN_VALUE, i) : UUID.randomUUID();
+            AttributeId id = isCore ? AttributeId.uuid(Attributes.CORE_ATTRIBUTE_ID_PREFIX, i + 10000) : AttributeId.randomUUID();
             AttributeUpdateType ut = AttributeUpdateType.values()[i % AttributeUpdateType.values().length];
             result.add(new AttributeUpdate(id, ut, i, i));
         }
@@ -640,7 +799,7 @@ public abstract class MetadataStoreTestBase extends ThreadPooledTestSuite {
         return result;
     }
 
-    private Map<UUID, Long> toAttributes(Collection<AttributeUpdate> updates) {
+    private Map<AttributeId, Long> toAttributes(Collection<AttributeUpdate> updates) {
         return updates.stream().collect(Collectors.toMap(AttributeUpdate::getAttributeId, AttributeUpdate::getValue));
     }
 
@@ -656,11 +815,12 @@ public abstract class MetadataStoreTestBase extends ThreadPooledTestSuite {
             sm.markDeleted();
         }
 
+        sm.refreshDerivedProperties();
         return sm;
     }
 
     @SneakyThrows
-    private void assertSegmentCreated(String segmentName, Collection<AttributeUpdate> attributeUpdates, TestContext context) {
+    private void assertSegmentCreated(String segmentName, SegmentType segmentType, Collection<AttributeUpdate> attributeUpdates, TestContext context) {
         SegmentProperties sp;
         try {
             sp = context.getMetadataStore().getSegmentInfo(segmentName, TIMEOUT).get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
@@ -676,8 +836,15 @@ public abstract class MetadataStoreTestBase extends ThreadPooledTestSuite {
         long segmentId = context.getMetadata().getStreamSegmentId(segmentName, false);
         Assert.assertEquals("Segment '" + segmentName + "' has been registered in the metadata.", ContainerMetadata.NO_STREAM_SEGMENT_ID, segmentId);
 
-        val attributes = Attributes.getCoreNonNullAttributes(toAttributes(attributeUpdates));
+        val attributes = getExpectedCoreAttributes(toAttributes(attributeUpdates), segmentType);
         AssertExtensions.assertMapEquals("Wrong attributes.", attributes, sp.getAttributes());
+    }
+
+    // Transient Segments are written directly to in-memory metadata without being persisted in Tier 1.
+    // Therefore we expect the container metadata to not report an id of NO_STREAM_SEGMENT_ID.
+    private void assertTransientSegmentCreated(String segmentName, TestContext context) {
+        long segmentId = context.getMetadata().getStreamSegmentId(segmentName, false);
+        Assert.assertNotEquals("Transient Segment '" + segmentName + "' has not been registered in the metadata.", ContainerMetadata.NO_STREAM_SEGMENT_ID, segmentId);
     }
 
     protected void assertEquals(String message, SegmentProperties expected, SegmentProperties actual) {
@@ -686,6 +853,12 @@ public abstract class MetadataStoreTestBase extends ThreadPooledTestSuite {
         Assert.assertEquals(message + " getLength() mismatch.", expected.getLength(), actual.getLength());
         Assert.assertEquals(message + " isSealed() mismatch.", expected.isSealed(), actual.isSealed());
         Assert.assertEquals(message + " getStartOffset() mismatch.", expected.getStartOffset(), actual.getStartOffset());
+    }
+
+    private Map<AttributeId, Long> getExpectedCoreAttributes(Map<AttributeId, Long> attributes, SegmentType segmentType) {
+        attributes = Attributes.getCoreNonNullAttributes(attributes);
+        segmentType.intoAttributes(attributes);
+        return attributes;
     }
 
     //region TestContext
@@ -716,6 +889,7 @@ public abstract class MetadataStoreTestBase extends ThreadPooledTestSuite {
                         sm.markPinned();
                     }
                     sm.updateAttributes(sp.getAttributes());
+                    sm.refreshDerivedProperties();
                     return CompletableFuture.completedFuture(id);
                 },
                 (id, timeout) -> {
@@ -726,7 +900,15 @@ public abstract class MetadataStoreTestBase extends ThreadPooledTestSuite {
                     }
                     return CompletableFuture.completedFuture(null);
                 },
-                runCleanup);
+                runCleanup,
+                (id, sp, pin, timeout) -> {
+                    Assert.assertNotEquals("PinSegmentOperation with no segment id.", ContainerMetadata.NO_STREAM_SEGMENT_ID, id);
+                    UpdateableSegmentMetadata sm = metadata.getStreamSegmentMetadata(id);
+                    if (pin) {
+                        sm.markPinned();
+                    }
+                    return CompletableFuture.completedFuture(pin);
+                });
 
         return createTestContext(connector);
     }
@@ -784,8 +966,9 @@ public abstract class MetadataStoreTestBase extends ThreadPooledTestSuite {
         @Setter
         private LazyDeleteSegment lazyDeleteSegment;
 
-        TestConnector(UpdateableContainerMetadata metadata, MapSegmentId mapSegmentId, LazyDeleteSegment lazyDeleteSegment, Supplier<CompletableFuture<Void>> runCleanup) {
-            super(metadata, mapSegmentId, (name, timeout) -> CompletableFuture.completedFuture(null), lazyDeleteSegment, runCleanup);
+        TestConnector(UpdateableContainerMetadata metadata, MapSegmentId mapSegmentId, LazyDeleteSegment lazyDeleteSegment,
+                      Supplier<CompletableFuture<Void>> runCleanup, PinSegment pinSegment) {
+            super(metadata, mapSegmentId, (name, timeout) -> CompletableFuture.completedFuture(null), lazyDeleteSegment, runCleanup, pinSegment);
             reset();
         }
 

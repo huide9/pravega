@@ -1,11 +1,17 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.test.integration;
 
@@ -21,11 +27,11 @@ import io.pravega.client.stream.ScalingPolicy;
 import io.pravega.client.stream.Stream;
 import io.pravega.client.stream.StreamConfiguration;
 import io.pravega.client.stream.StreamCut;
-import io.pravega.common.concurrent.ExecutorServiceHelpers;
 import io.pravega.common.concurrent.Futures;
 import io.pravega.common.hash.RandomFactory;
 import io.pravega.segmentstore.contracts.StreamSegmentStore;
 import io.pravega.segmentstore.contracts.tables.TableStore;
+import io.pravega.segmentstore.server.host.handler.IndexAppendProcessor;
 import io.pravega.segmentstore.server.host.handler.PravegaConnectionListener;
 import io.pravega.segmentstore.server.store.ServiceBuilder;
 import io.pravega.segmentstore.server.store.ServiceBuilderConfig;
@@ -34,13 +40,13 @@ import io.pravega.shared.metrics.MetricsConfig;
 import io.pravega.shared.metrics.MetricsProvider;
 import io.pravega.shared.metrics.StatsProvider;
 import io.pravega.test.common.AssertExtensions;
+import io.pravega.test.common.SerializedClassRunner;
 import io.pravega.test.common.TestUtils;
 import io.pravega.test.common.TestingServerStarter;
-import io.pravega.test.integration.demo.ControllerWrapper;
+import io.pravega.test.common.ThreadPooledTestSuite;
+import io.pravega.test.integration.utils.ControllerWrapper;
 import java.net.URI;
 import java.time.Duration;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
 import lombok.Cleanup;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.curator.test.TestingServer;
@@ -48,6 +54,7 @@ import org.junit.After;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
+import org.junit.runner.RunWith;
 
 import static io.pravega.shared.MetricsNames.CONTROLLER_ZK_SESSION_EXPIRATION;
 import static io.pravega.shared.MetricsNames.CREATE_STREAM;
@@ -69,7 +76,8 @@ import static io.pravega.test.integration.ReadWriteUtils.writeEvents;
  * Check the end to end correctness of metrics published by the Controller.
  */
 @Slf4j
-public class ControllerMetricsTest {
+@RunWith(SerializedClassRunner.class)
+public class ControllerMetricsTest extends ThreadPooledTestSuite {
 
     private final int controllerPort = TestUtils.getAvailableListenPort();
     private final String serviceHost = "localhost";
@@ -80,14 +88,19 @@ public class ControllerMetricsTest {
     private PravegaConnectionListener server;
     private ControllerWrapper controllerWrapper;
     private ServiceBuilder serviceBuilder;
-    private ScheduledExecutorService executor;
     private StatsProvider statsProvider = null;
+
+    @Override
+    protected int getThreadPoolSize() {
+        return 1;
+    }
 
     @Before
     public void setUp() throws Exception {
         MetricsConfig metricsConfig = MetricsConfig.builder()
-                                                   .with(MetricsConfig.ENABLE_STATSD_REPORTER, false)
-                                                   .build();
+                .with(MetricsConfig.ENABLE_STATISTICS, true)
+                .with(MetricsConfig.ENABLE_STATSD_REPORTER, false)
+                .build();
         metricsConfig.setDynamicCacheEvictionDuration(Duration.ofMinutes(5));
 
         MetricsProvider.initialize(metricsConfig);
@@ -95,7 +108,6 @@ public class ControllerMetricsTest {
         statsProvider.startWithoutExporting();
         log.info("Metrics Stats provider is started");
 
-        executor = Executors.newSingleThreadScheduledExecutor();
         zkTestServer = new TestingServerStarter().start();
 
         serviceBuilder = ServiceBuilder.newInMemoryBuilder(ServiceBuilderConfig.getDefaultConfig());
@@ -103,17 +115,18 @@ public class ControllerMetricsTest {
         StreamSegmentStore store = serviceBuilder.createStreamSegmentService();
         TableStore tableStore = serviceBuilder.createTableStoreService();
 
-        server = new PravegaConnectionListener(false, servicePort, store, tableStore);
+        server = new PravegaConnectionListener(false, servicePort, store, tableStore, serviceBuilder.getLowPriorityExecutor(),
+                new IndexAppendProcessor(serviceBuilder.getLowPriorityExecutor(), store));
         server.startListening();
 
         controllerWrapper = new ControllerWrapper(zkTestServer.getConnectString(),
-                false,
-                false,
-                controllerPort,
-                serviceHost,
-                servicePort,
-                containerCount,
-                9091);
+                                                  false,
+                                                  false,
+                                                  controllerPort,
+                                                  serviceHost,
+                                                  servicePort,
+                                                  containerCount,
+                                                  -1);
         controllerWrapper.awaitRunning();
     }
 
@@ -125,13 +138,20 @@ public class ControllerMetricsTest {
             log.info("Metrics statsProvider is now closed.");
         }
 
-        ExecutorServiceHelpers.shutdown(executor);
         controllerWrapper.close();
         server.close();
         serviceBuilder.close();
         zkTestServer.close();
     }
 
+    @Test(timeout = 3000)
+    public void testSetup() throws Exception {
+        //This is to verify the setUp / tearDown methods
+        //That needs to be independently validated because previous versions of this test
+        //had errors in the setup which were dependent on the state of the metrics
+        //So streamMetricsTest would pass or fail depending on what ran before it. 
+    }
+    
     /**
      * This test verifies that the appropriate metrics for Stream operations are updated correctly (counters, latency
      * histograms). Note that this test performs "at least" assertions on metrics as in an environment with concurrent
@@ -150,6 +170,7 @@ public class ControllerMetricsTest {
         // At this point, we have at least 6 internal streams.
         StreamConfiguration streamConfiguration = StreamConfiguration.builder()
                 .scalingPolicy(ScalingPolicy.fixed(parallelism)).build();
+        @Cleanup
         StreamManager streamManager = StreamManager.create(controllerURI);
         streamManager.createScope(scope);
         @Cleanup
@@ -185,7 +206,7 @@ public class ControllerMetricsTest {
                 Futures.allOf(readEvents(clientFactory, iterationReaderGroupName, parallelism));
 
                 // Get a StreamCut for truncating the Stream.
-                StreamCut streamCut = readerGroup.generateStreamCuts(executor).join().get(Stream.of(scope, iterationStreamName));
+                StreamCut streamCut = readerGroup.generateStreamCuts(executorService()).join().get(Stream.of(scope, iterationStreamName));
 
                 // Truncate the Stream and check that the number of truncated Streams and per-Stream truncations is incremented.
                 streamManager.truncateStream(scope, iterationStreamName, streamCut);
@@ -236,12 +257,11 @@ public class ControllerMetricsTest {
     @Test(timeout = 25000)
     public void zookeeperMetricsTest() throws Exception {
         Counter zkSessionExpirationCounter = MetricRegistryUtils.getCounter(CONTROLLER_ZK_SESSION_EXPIRATION);
-        Assert.assertNull(zkSessionExpirationCounter);
+        double previousCount = zkSessionExpirationCounter == null ? 0.0 : zkSessionExpirationCounter.count();
         controllerWrapper.forceClientSessionExpiry();
-        while (zkSessionExpirationCounter == null) {
-            Thread.sleep(100);
-            zkSessionExpirationCounter = MetricRegistryUtils.getCounter(CONTROLLER_ZK_SESSION_EXPIRATION);
-        }
-        Assert.assertEquals(zkSessionExpirationCounter.count(), 1, 0.1);
+        AssertExtensions.assertEventuallyEquals(previousCount + 1.0, () -> {
+            Counter counter = MetricRegistryUtils.getCounter(CONTROLLER_ZK_SESSION_EXPIRATION);
+            return counter == null ? 0 : counter.count();
+        }, 25000L);
     }
 }

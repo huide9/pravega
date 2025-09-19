@@ -1,11 +1,17 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.segmentstore.server.host.stat;
 
@@ -112,6 +118,8 @@ abstract class SegmentAggregates {
 
     protected abstract long getUpdateCountDelta(long dataLength, int numOfEvents);
 
+    protected abstract double getRate(double rate);
+
     boolean isScalingEnabled() {
         return true;
     }
@@ -125,7 +133,15 @@ abstract class SegmentAggregates {
                 lastTick = newTick;
                 final long count = currentCount;
                 currentCount = 0;
-                computeDecay(count, (double) Duration.ofMillis(age).toMillis() / 1000.0);
+                long iterations = age / TICK_INTERVAL;
+                // If the age is greater than tick interval, then account for silent periods between last 
+                // reported update and current update by calling the decay function for all silent tick intervals
+                // with event count as 0 for them.
+                for (long i = 0; i < iterations - 1; i++) {
+                    computeDecay(0, TICK_INTERVAL / 1000.0);
+                }
+                double duration = (age - ((iterations - 1) * TICK_INTERVAL)) / 1000.0;
+                computeDecay(count, duration);
             }
 
             return true;
@@ -173,19 +189,19 @@ abstract class SegmentAggregates {
     }
 
     synchronized double getTwoMinuteRate() {
-        return twoMinuteRate;
+        return getRate(twoMinuteRate);
     }
 
     synchronized double getFiveMinuteRate() {
-        return fiveMinuteRate;
+        return getRate(fiveMinuteRate);
     }
 
     synchronized double getTenMinuteRate() {
-        return tenMinuteRate;
+        return getRate(tenMinuteRate);
     }
 
     synchronized double getTwentyMinuteRate() {
-        return twentyMinuteRate;
+        return getRate(twentyMinuteRate);
     }
 
     boolean reportIfNeeded(Duration reportingDuration) {
@@ -215,7 +231,12 @@ abstract class SegmentAggregates {
 
         @Override
         protected long getUpdateCountDelta(long dataLength, int numOfEvents) {
-            return dataLength / 1024;
+            return dataLength;
+        }
+
+        @Override
+        protected double getRate(double rate) {
+            return rate / 1024;
         }
     }
 
@@ -232,6 +253,11 @@ abstract class SegmentAggregates {
         @Override
         protected long getUpdateCountDelta(long dataLength, int numOfEvents) {
             return numOfEvents;
+        }
+
+        @Override
+        protected double getRate(double rate) {
+            return rate;
         }
     }
 
@@ -253,6 +279,11 @@ abstract class SegmentAggregates {
         @Override
         protected long getUpdateCountDelta(long dataLength, int numOfEvents) {
             return 0;
+        }
+
+        @Override
+        protected double getRate(double rate) {
+            return rate;
         }
     }
 

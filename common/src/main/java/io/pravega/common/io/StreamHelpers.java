@@ -1,19 +1,27 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.common.io;
 
 import com.google.common.base.Preconditions;
 import io.pravega.common.Exceptions;
+import java.io.Closeable;
 import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
+import org.slf4j.Logger;
 
 /**
  * Miscellaneous operations on Streams.
@@ -21,6 +29,10 @@ import java.io.InputStream;
 public final class StreamHelpers {
     /**
      * Reads at most 'maxLength' bytes from the given input stream, as long as the stream still has data to serve.
+     * A note about performance:
+     * - This uses the default implementation of {@link InputStream#read(byte[], int, int)}, which means in most cases
+     * it will copy byte-by-byte into the target array, which is rather inefficient.
+     * - See https://github.com/pravega/pravega/issues/2924 for more details.
      *
      * @param stream      The InputStream to read from.
      * @param target      The target array to write data to.
@@ -31,9 +43,9 @@ public final class StreamHelpers {
      */
     public static int readAll(InputStream stream, byte[] target, int startOffset, int maxLength) throws IOException {
         Preconditions.checkNotNull(stream, "stream");
-        Preconditions.checkNotNull(stream, "target");
+        Preconditions.checkNotNull(target, "target");
         Preconditions.checkElementIndex(startOffset, target.length, "startOffset");
-        Exceptions.checkArgument(maxLength >= 0, "maxLength", "maxLength must be a non-negative number.");
+        Exceptions.checkArgument(maxLength >= 0, "maxLength", "must be a non-negative number.");
 
         int totalBytesRead = 0;
         while (totalBytesRead < maxLength) {
@@ -68,4 +80,21 @@ public final class StreamHelpers {
 
         return ret;
     }
+    
+    /**
+     * Closes a stream, logging a warning if it fails.
+     * 
+     * @param toClose the stream/socket etc to close
+     * @param log the logger to log a warning with.
+     * @param message the message to log in the event of an exception
+     * @param args template args for the message.
+     */
+    public static void closeQuietly(Closeable toClose, Logger log, String message, Object... args) {
+        try {
+            toClose.close();
+        } catch (IOException e) {
+            log.warn(message, args);
+        }
+    }
+    
 }

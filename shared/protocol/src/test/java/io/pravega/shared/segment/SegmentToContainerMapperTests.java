@@ -1,14 +1,21 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.shared.segment;
 
+import io.pravega.shared.NameUtils;
 import io.pravega.test.common.AssertExtensions;
 import java.nio.CharBuffer;
 import java.util.HashMap;
@@ -32,8 +39,11 @@ public class SegmentToContainerMapperTests {
     public void testConstructor() {
         AssertExtensions.assertThrows(
                 "SegmentToContainerManager could be created with no containers.",
-                () -> new SegmentToContainerMapper(0),
+                () -> new SegmentToContainerMapper(0, true),
                 ex -> ex instanceof IllegalArgumentException);
+        // Check that the admin mode takes effect in the container assignment of metadata segments.
+        Assert.assertEquals(1, new SegmentToContainerMapper(16, true).getContainerId("_system/containers/metadata_1"));
+        Assert.assertNotEquals(1, new SegmentToContainerMapper(16, false).getContainerId("_system/containers/metadata_1"));
     }
 
     /**
@@ -53,7 +63,7 @@ public class SegmentToContainerMapperTests {
 
     private void testUniformMapping(int containerCount, int streamSegmentCount, double maxDeviation,
             Function<Integer, String> nameGen) {
-        SegmentToContainerMapper m = new SegmentToContainerMapper(containerCount);
+        SegmentToContainerMapper m = new SegmentToContainerMapper(containerCount, true);
         assertEquals("Unexpected value for getTotalContainerCount().",
                             containerCount,
                             m.getTotalContainerCount());
@@ -90,16 +100,39 @@ public class SegmentToContainerMapperTests {
         int streamSegmentCount = 256;
         int transactionPerParentCount = 10;
 
-        SegmentToContainerMapper m = new SegmentToContainerMapper(containerCount);
+        SegmentToContainerMapper m = new SegmentToContainerMapper(containerCount, true);
 
         // Generate all possible names with the given length and assign them to a container.
         for (int segmentId = 0; segmentId < streamSegmentCount; segmentId++) {
             String segmentName = getSegmentName(segmentId);
             int containerId = m.getContainerId(segmentName);
             for (int i = 0; i < transactionPerParentCount; i++) {
-                String transcationName = StreamSegmentNameUtils.getTransactionNameFromId(segmentName, UUID.randomUUID());
-                int transactionContainerId = m.getContainerId(transcationName);
+                String transactionName = NameUtils.getTransactionNameFromId(segmentName, UUID.randomUUID());
+                int transactionContainerId = m.getContainerId(transactionName);
                 Assert.assertEquals("Parent and Transaction were not assigned to the same container.", containerId, transactionContainerId);
+            }
+        }
+    }
+
+    /**
+     * Tests that Transient Segments are mapped to the same container as their parents.
+     */
+    @Test
+    public void testTransientMapping() {
+        int containerCount = 16;
+        int streamSegmentCount = 256;
+        int transientPerParentCount = 10;
+
+        SegmentToContainerMapper m = new SegmentToContainerMapper(containerCount, true);
+
+        // Generate all possible names with the given length and assign them to a container.
+        for (int segmentId = 0; segmentId < streamSegmentCount; segmentId++) {
+            String segmentName = getSegmentName(segmentId);
+            int containerId = m.getContainerId(segmentName);
+            for (int i = 0; i < transientPerParentCount; i++) {
+                String transientSegmentName = NameUtils.getTransientNameFromId(segmentName, UUID.randomUUID());
+                int transientContainerId = m.getContainerId(transientSegmentName);
+                Assert.assertEquals("Parent and Transient Segment were not assigned to the same container.", containerId, transientContainerId);
             }
         }
     }
@@ -109,20 +142,32 @@ public class SegmentToContainerMapperTests {
         int containerCount = 16;
         int streamSegmentCount = 256;
         int epochCount = 10;
-        SegmentToContainerMapper m = new SegmentToContainerMapper(containerCount);
+        SegmentToContainerMapper m = new SegmentToContainerMapper(containerCount, true);
 
         // Generate all possible names with the given length and assign them to a container.
         for (int segmentId = 0; segmentId < streamSegmentCount; segmentId++) {
-            String segmentName = StreamSegmentNameUtils.getQualifiedStreamSegmentName("scope", "stream",
-                    StreamSegmentNameUtils.computeSegmentId(segmentId, 0));
+            String segmentName = NameUtils.getQualifiedStreamSegmentName("scope", "stream",
+                    NameUtils.computeSegmentId(segmentId, 0));
             int containerId = m.getContainerId(segmentName);
             for (int i = 0; i < epochCount; i++) {
-                String duplicate = StreamSegmentNameUtils.getQualifiedStreamSegmentName("scope", "stream",
-                        StreamSegmentNameUtils.computeSegmentId(segmentId, i));
+                String duplicate = NameUtils.getQualifiedStreamSegmentName("scope", "stream",
+                        NameUtils.computeSegmentId(segmentId, i));
                 int duplicateContainerId = m.getContainerId(duplicate);
                 Assert.assertEquals("Parent and Transaction were not assigned to the same container.", containerId, duplicateContainerId);
             }
         }
+    }
+
+    @Test
+    public void testInternalSegmentMapping() {
+        int containerCount = 16;
+        SegmentToContainerMapper m = new SegmentToContainerMapper(containerCount, true);
+        for (int i = 0; i < containerCount; i++) {
+            Assert.assertEquals(i, m.getContainerId(NameUtils.getMetadataSegmentName(i)));
+            Assert.assertEquals(i, m.getContainerId(NameUtils.getStorageMetadataSegmentName(i)));
+        }
+        // Other Segment naming formats should fall back to regular hashing as usual.
+        Assert.assertNotEquals(0, m.getContainerId(NameUtils.getAttributeSegmentName(NameUtils.getStorageMetadataSegmentName(0))));
     }
 
     private String getSegmentName(int segmentId) {

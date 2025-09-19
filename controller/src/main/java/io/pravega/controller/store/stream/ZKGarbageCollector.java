@@ -1,11 +1,17 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.controller.store.stream;
 
@@ -13,13 +19,15 @@ import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import com.google.common.util.concurrent.AbstractService;
 import io.pravega.common.Exceptions;
+import io.pravega.common.concurrent.ExecutorServiceHelpers;
 import io.pravega.common.concurrent.Futures;
+import io.pravega.controller.store.Version;
+import io.pravega.controller.store.ZKStoreHelper;
 import io.pravega.controller.util.RetryHelper;
 import java.io.IOException;
 import java.time.Duration;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -42,8 +50,9 @@ import org.apache.curator.framework.recipes.cache.NodeCacheListener;
  * The current batch is identified by a znode. All controller instances register a watch on this znode. And whenever batch
  * is updated, all watchers receive the latest update.
  */
+@SuppressWarnings("deprecation")
 @Slf4j
-class ZKGarbageCollector extends AbstractService implements AutoCloseable {
+class ZKGarbageCollector extends AbstractService {
     private static final String GC_ROOT = "/garbagecollection/%s";
     private static final String GUARD_PATH = GC_ROOT + "/guard";
 
@@ -71,7 +80,7 @@ class ZKGarbageCollector extends AbstractService implements AutoCloseable {
         this.zkStoreHelper = zkStoreHelper;
         this.gcProcessingSupplier = gcProcessingSupplier;
         this.periodInMillis = gcPeriod.toMillis();
-        this.gcExecutor = Executors.newSingleThreadScheduledExecutor();
+        this.gcExecutor = ExecutorServiceHelpers.newScheduledThreadPool(1, "gc");
         this.gcLoop = new AtomicReference<>();
         this.currentBatch = new AtomicInteger(0);
         this.latestVersion = new AtomicInteger(0);
@@ -104,7 +113,7 @@ class ZKGarbageCollector extends AbstractService implements AutoCloseable {
                     x.cancel(true);
                     x.whenComplete((r, e) -> {
                         if (e != null && !(Exceptions.unwrap(e) instanceof CancellationException)) {
-                            log.error("Exception while trying to stop GC {}", gcName, e);
+                            log.warn("Exception while trying to stop GC {}", gcName, e);
                             notifyFailed(e);
                         } else {
                             notifyStopped();
@@ -118,6 +127,19 @@ class ZKGarbageCollector extends AbstractService implements AutoCloseable {
                 notifyStopped();
             }
         });
+        
+        watch.getAndUpdate(x -> {
+            if (x != null) {
+                try {
+                    x.close();
+                } catch (IOException e) {
+                    throw Exceptions.sneakyThrow(e);
+                }
+            }
+            return x;
+        });
+
+        gcExecutor.shutdownNow();
     }
 
     int getLatestBatch() {
@@ -146,11 +168,16 @@ class ZKGarbageCollector extends AbstractService implements AutoCloseable {
                 }, gcExecutor)
                 // fetch the version and update it.
                 .exceptionally(e -> {
-                    if (Exceptions.unwrap(e) instanceof StoreException.WriteConflictException) {
+                    Throwable unwrap = Exceptions.unwrap(e);
+                    if (unwrap instanceof StoreException.WriteConflictException) {
                         log.debug("Unable to acquire guard. Will try in next cycle.");
                     } else {
                         // if GC failed, it will be tried again in the next cycle. So log and ignore.
-                        log.error("Exception thrown during Garbage Collection iteration for {}. Log and ignore.", gcName, e);
+                        if (unwrap instanceof StoreException.StoreConnectionException) {
+                            log.warn("StoreConnectionException thrown during Garbage Collection iteration for {}.", gcName);
+                        } else {
+                            log.warn("Exception thrown during Garbage Collection iteration for {}. Log and ignore.", gcName, unwrap);
+                        }
                     }
                     return null;
                 }).thenCompose(v -> fetchVersion());
@@ -187,19 +214,4 @@ class ZKGarbageCollector extends AbstractService implements AutoCloseable {
         return nodeCache;
     }
 
-    @Override
-    public void close() {
-        watch.getAndUpdate(x -> {
-            if (x != null) {
-                try {
-                    x.close();
-                } catch (IOException e) {
-                    throw Exceptions.sneakyThrow(e);
-                }
-            }
-            return x;
-        });
-
-        gcExecutor.shutdown();
-    }
 }

@@ -1,18 +1,26 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
- * <p>
+ * Copyright Pravega Authors.
+ *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
- * <p>
- * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.controller.server.eventProcessor.requesthandlers;
 
 import com.google.common.base.Preconditions;
 import io.pravega.common.Exceptions;
+import io.pravega.common.Timer;
 import io.pravega.common.concurrent.Futures;
 import io.pravega.common.tracing.TagLogger;
+import io.pravega.controller.metrics.StreamMetrics;
 import io.pravega.controller.store.stream.OperationContext;
 import io.pravega.controller.store.stream.StoreException;
 import io.pravega.controller.store.stream.StreamMetadataStore;
@@ -22,7 +30,11 @@ import io.pravega.controller.store.stream.records.StreamSegmentRecord;
 import io.pravega.controller.task.Stream.StreamMetadataTasks;
 import io.pravega.controller.task.Stream.StreamTransactionMetadataTasks;
 import io.pravega.shared.controller.event.SealStreamEvent;
+
+import java.util.AbstractMap;
 import java.util.List;
+import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ScheduledExecutorService;
@@ -55,22 +67,22 @@ public class SealStreamTask implements StreamTask<SealStreamEvent> {
         this.executor = executor;
     }
 
-
     @Override
     public CompletableFuture<Void> execute(final SealStreamEvent request) {
+        Timer timer = new Timer();
         String scope = request.getScope();
         String stream = request.getStream();
         long requestId = request.getRequestId();
-        final OperationContext context = streamMetadataStore.createContext(scope, stream);
+        final OperationContext context = streamMetadataStore.createStreamContext(scope, stream, requestId);
 
         // when seal stream task is picked, if the state is sealing/sealed, process sealing, else postpone.
         return streamMetadataStore.getState(scope, stream, true, context, executor)
                 .thenAccept(state -> {
                     if (!state.equals(State.SEALING) && !state.equals(State.SEALED)) {
-                        throw new TaskExceptions.StartException("Seal stream task not started yet.");
+                        throw new IllegalStateException("Seal stream not started.");
                     }
                 })
-                .thenCompose(x -> abortTransaction(context, scope, stream, requestId)
+                .thenCompose(x -> abortTransaction(context, scope, stream)
                         .thenAccept(noTransactions -> {
                             if (!noTransactions) {
                                 // If transactions exist on the stream, we will throw OperationNotAllowed so that this task
@@ -92,7 +104,7 @@ public class SealStreamTask implements StreamTask<SealStreamEvent> {
                     } else {
                         return notifySealed(scope, stream, context, activeSegments, requestId);
                     }
-                });
+                }).thenAccept(v -> StreamMetrics.getInstance().controllerEventProcessorSealStreamEvent(timer.getElapsed()));
     }
 
     /**
@@ -101,20 +113,25 @@ public class SealStreamTask implements StreamTask<SealStreamEvent> {
      * @param context operation context
      * @param scope scope
      * @param stream stream
-     * @param requestId requestId
      * @return CompletableFuture which when complete will contain a boolean indicating if there are transactions of the
      * stream or not.
      */
-    private CompletableFuture<Boolean> abortTransaction(OperationContext context, String scope, String stream, long requestId) {
+    private CompletableFuture<Boolean> abortTransaction(OperationContext context, String scope, String stream) {
         return streamMetadataStore.getActiveTxns(scope, stream, context, executor)
                 .thenCompose(activeTxns -> {
                     if (activeTxns == null || activeTxns.isEmpty()) {
                         return CompletableFuture.completedFuture(true);
                     } else {
-                        // abort transactions
+                        Map<UUID, TxnStatus> pendingTxns = activeTxns.entrySet().stream().map(txn -> new AbstractMap.SimpleEntry<>(txn.getKey(), txn.getValue().getTxnStatus()))
+                                .collect(Collectors.toMap(e -> e.getKey(), e -> e.getValue()));
+                        // log list of pending txns on the Stream
+                        log.info(context.getRequestId(), "Found pending transactions {} on Stream {}/{}.", pendingTxns, scope, stream);
                         return Futures.allOf(activeTxns.entrySet().stream().map(txIdPair -> {
                             CompletableFuture<Void> voidCompletableFuture;
-                            if (txIdPair.getValue().getTxnStatus().equals(TxnStatus.OPEN)) {
+                            TxnStatus txnStatus = txIdPair.getValue().getTxnStatus();
+                            if (txnStatus.equals(TxnStatus.OPEN) || txnStatus.equals(TxnStatus.ABORTING)) {
+                                // abort open transactions
+                                log.trace(context.getRequestId(), "Aborting txn {} in state {}.", txIdPair.getKey(), txnStatus);
                                 voidCompletableFuture = Futures.toVoid(streamTransactionMetadataTasks
                                         .abortTxn(scope, stream, txIdPair.getKey(), null, context)
                                         .exceptionally(e -> {
@@ -129,7 +146,7 @@ public class SealStreamTask implements StreamTask<SealStreamEvent> {
                                                 // already being aborted.
                                                 // DataNotFoundException: If transaction metadata is cleaned up after reading list
                                                 // of active segments
-                                                log.debug(requestId, "A known exception thrown during seal stream " +
+                                                log.warn(context.getRequestId(), "A known exception thrown during seal stream " +
                                                         "while trying to abort transaction on stream {}/{}", scope, stream, cause);
                                             } else {
                                                 // throw the original exception
@@ -138,7 +155,7 @@ public class SealStreamTask implements StreamTask<SealStreamEvent> {
                                                 // So in subsequent iteration it will reattempt to abort all active transactions.
                                                 // This is a valid course of action because it is important to understand that
                                                 // all transactions are completable (either via abort of commit).
-                                                log.warn(requestId, "Exception thrown during seal stream while trying " +
+                                                log.warn(context.getRequestId(), "Exception thrown during seal stream while trying " +
                                                         "to abort transaction on stream {}/{}", scope, stream, cause);
                                             }
                                             return null;
@@ -146,7 +163,6 @@ public class SealStreamTask implements StreamTask<SealStreamEvent> {
                             } else {
                                 voidCompletableFuture = CompletableFuture.completedFuture(null);
                             }
-
                             return voidCompletableFuture;
                         }).collect(Collectors.toList())).thenApply(v -> false);
                     }

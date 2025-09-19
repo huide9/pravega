@@ -1,11 +1,17 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.segmentstore.server.store;
 
@@ -13,17 +19,25 @@ import com.google.common.util.concurrent.AbstractService;
 import com.google.common.util.concurrent.Service;
 import io.pravega.common.concurrent.Futures;
 import io.pravega.common.concurrent.Services;
+import io.pravega.common.util.BufferView;
 import io.pravega.common.util.ReusableLatch;
+import io.pravega.segmentstore.contracts.AttributeId;
 import io.pravega.segmentstore.contracts.AttributeUpdate;
+import io.pravega.segmentstore.contracts.AttributeUpdateCollection;
 import io.pravega.segmentstore.contracts.ContainerNotFoundException;
-import io.pravega.segmentstore.server.DirectSegmentAccess;
+import io.pravega.segmentstore.contracts.ExtendedChunkInfo;
+import io.pravega.segmentstore.contracts.MergeStreamSegmentResult;
 import io.pravega.segmentstore.contracts.ReadResult;
 import io.pravega.segmentstore.contracts.SegmentProperties;
+import io.pravega.segmentstore.contracts.SegmentType;
+import io.pravega.segmentstore.server.DebugSegmentContainer;
+import io.pravega.segmentstore.server.DirectSegmentAccess;
 import io.pravega.segmentstore.server.ContainerHandle;
 import io.pravega.segmentstore.server.SegmentContainer;
 import io.pravega.segmentstore.server.SegmentContainerFactory;
 import io.pravega.segmentstore.server.SegmentContainerExtension;
 import io.pravega.segmentstore.server.ServiceListeners;
+import io.pravega.segmentstore.server.logs.operations.OperationPriority;
 import io.pravega.test.common.AssertExtensions;
 import io.pravega.test.common.IntentionalException;
 import io.pravega.test.common.ThreadPooledTestSuite;
@@ -33,7 +47,6 @@ import java.util.Collection;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -82,6 +95,37 @@ public class StreamSegmentContainerRegistryTests extends ThreadPooledTestSuite {
             Assert.assertTrue("Wrong container Java type.", container instanceof TestContainer);
             Assert.assertEquals("Unexpected container Id.", handle.getContainerId(), container.getId());
             container.close();
+        }
+
+        AssertExtensions.assertContainsSameElements("Unexpected container ids registered.", expectedContainerIds, actualHandleIds);
+
+        AssertExtensions.assertThrows(
+                "getContainer did not throw when passed an invalid container id.",
+                () -> registry.getContainer(containerCount + 1),
+                ex -> ex instanceof ContainerNotFoundException);
+    }
+
+    /**
+     * Tests the getContainers method for registered and unregistered containers.
+     */
+    @Test
+    public void testGetContainers() throws Exception {
+        final int containerCount = 1000;
+        TestContainerFactory factory = new TestContainerFactory();
+        @Cleanup
+        StreamSegmentContainerRegistry registry = new StreamSegmentContainerRegistry(factory, executorService());
+
+        HashSet<Integer> expectedContainerIds = new HashSet<>();
+        for (int containerId = 0; containerId < containerCount; containerId++) {
+            registry.startContainer(containerId, TIMEOUT);
+            expectedContainerIds.add(containerId);
+        }
+
+        HashSet<Integer> actualHandleIds = new HashSet<>();
+        for (SegmentContainer segmentContainer : registry.getContainers()) {
+            actualHandleIds.add(segmentContainer.getId());
+            Assert.assertTrue("Wrong container Java type.", segmentContainer instanceof TestContainer);
+            segmentContainer.close();
         }
 
         AssertExtensions.assertContainsSameElements("Unexpected container ids registered.", expectedContainerIds, actualHandleIds);
@@ -248,6 +292,11 @@ public class StreamSegmentContainerRegistryTests extends ThreadPooledTestSuite {
         }
 
         @Override
+        public DebugSegmentContainer createDebugStreamSegmentContainer(int containerId) {
+            throw new UnsupportedOperationException("DebugSegmentContainer not supported in container Registry Tests.");
+        }
+
+        @Override
         public SegmentContainer createStreamSegmentContainer(int containerId) {
             return new TestContainer(containerId, this.startException, this.startReleaseSignal);
         }
@@ -334,22 +383,22 @@ public class StreamSegmentContainerRegistryTests extends ThreadPooledTestSuite {
         //region Unimplemented methods
 
         @Override
-        public CompletableFuture<Void> append(String streamSegmentName, byte[] data, Collection<AttributeUpdate> attributeUpdates, Duration timeout) {
+        public CompletableFuture<Long> append(String streamSegmentName, BufferView data, AttributeUpdateCollection attributeUpdates, Duration timeout) {
             return null;
         }
 
         @Override
-        public CompletableFuture<Void> append(String streamSegmentName, long offset, byte[] data, Collection<AttributeUpdate> attributeUpdates, Duration timeout) {
+        public CompletableFuture<Long> append(String streamSegmentName, long offset, BufferView data, AttributeUpdateCollection attributeUpdates, Duration timeout) {
             return null;
         }
 
         @Override
-        public CompletableFuture<Void> updateAttributes(String streamSegmentName, Collection<AttributeUpdate> attributeUpdates, Duration timeout) {
+        public CompletableFuture<Void> updateAttributes(String streamSegmentName, AttributeUpdateCollection attributeUpdates, Duration timeout) {
             return null;
         }
 
         @Override
-        public CompletableFuture<Map<UUID, Long>> getAttributes(String streamSegmentName, Collection<UUID> attributeIds, boolean cache, Duration timeout) {
+        public CompletableFuture<Map<AttributeId, Long>> getAttributes(String streamSegmentName, Collection<AttributeId> attributeIds, boolean cache, Duration timeout) {
             return null;
         }
 
@@ -364,12 +413,18 @@ public class StreamSegmentContainerRegistryTests extends ThreadPooledTestSuite {
         }
 
         @Override
-        public CompletableFuture<Void> createStreamSegment(String streamSegmentName, Collection<AttributeUpdate> attributes, Duration timeout) {
+        public CompletableFuture<Void> createStreamSegment(String streamSegmentName, SegmentType segmentType, Collection<AttributeUpdate> attributes, Duration timeout) {
             return null;
         }
 
         @Override
-        public CompletableFuture<SegmentProperties> mergeStreamSegment(String targetStreamSegment, String sourceStreamSegment, Duration timeout) {
+        public CompletableFuture<MergeStreamSegmentResult> mergeStreamSegment(String targetStreamSegment, String sourceStreamSegment, Duration timeout) {
+            return null;
+        }
+
+        @Override
+        public CompletableFuture<MergeStreamSegmentResult> mergeStreamSegment(String targetStreamSegment, String sourceStreamSegment,
+                                                                              AttributeUpdateCollection attributes, Duration timeout) {
             return null;
         }
 
@@ -389,7 +444,7 @@ public class StreamSegmentContainerRegistryTests extends ThreadPooledTestSuite {
         }
 
         @Override
-        public CompletableFuture<DirectSegmentAccess> forSegment(String streamSegmentName, Duration timeout) {
+        public CompletableFuture<DirectSegmentAccess> forSegment(String streamSegmentName, OperationPriority priority, Duration timeout) {
             return null;
         }
 
@@ -400,6 +455,16 @@ public class StreamSegmentContainerRegistryTests extends ThreadPooledTestSuite {
 
         @Override
         public <T extends SegmentContainerExtension> T getExtension(Class<T> extensionClass) {
+            return null;
+        }
+
+        @Override
+        public CompletableFuture<Void> flushToStorage(Duration timeout) {
+            return null;
+        }
+
+        @Override
+        public CompletableFuture<List<ExtendedChunkInfo>> getExtendedChunkInfo(String streamSegmentName, Duration timeout) {
             return null;
         }
 

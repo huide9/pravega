@@ -1,11 +1,17 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.test.integration.selftest;
 
@@ -13,7 +19,7 @@ import com.google.common.base.Preconditions;
 import com.google.common.util.concurrent.AbstractScheduledService;
 import io.pravega.common.AbstractTimer;
 import io.pravega.common.concurrent.ExecutorServiceHelpers;
-import java.util.concurrent.ForkJoinPool;
+
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
@@ -82,7 +88,8 @@ class Reporter extends AbstractScheduledService {
      */
     void outputState() {
         val testPoolSnapshot = ExecutorServiceHelpers.getSnapshot(this.executorService);
-        val joinPoolSnapshot = ExecutorServiceHelpers.getSnapshot(ForkJoinPool.commonPool());
+        @SuppressWarnings("ImportControl")
+        val joinPoolSnapshot = ExecutorServiceHelpers.getSnapshot(java.util.concurrent.ForkJoinPool.commonPool());
         val storePoolSnapshot = this.storePoolSnapshotProvider.get();
         long time = System.nanoTime();
         long producedLength = this.testState.getProducedLength();
@@ -159,7 +166,7 @@ class Reporter extends AbstractScheduledService {
      */
     void outputSummary() {
         TestLogger.log(LOG_ID, "Operation Summary");
-        outputRow("Operation Type", "Count", "LAvg", "L50", "L75", "L90", "L99", "L999");
+        outputRow("Operation Type", "Count", "LSum", "LAvg", "L50", "L75", "L90", "L99", "L999");
         for (OperationType ot : TestState.SUMMARY_OPERATION_TYPES) {
             val durations = this.testState.getDurations(ot);
             if (durations == null || durations.count() == 0) {
@@ -167,16 +174,16 @@ class Reporter extends AbstractScheduledService {
             }
 
             int[] percentiles = durations.percentiles(0.5, 0.75, 0.9, 0.99, 0.999);
-            outputRow(ot, durations.count(), (int) durations.average(), percentiles[0], percentiles[1], percentiles[2], percentiles[3], percentiles[4]);
+            outputRow(ot, durations.count(), (int) durations.sum(), (int) durations.average(), percentiles[0], percentiles[1], percentiles[2], percentiles[3], percentiles[4]);
         }
     }
 
-    private void outputRow(Object opType, Object count, Object lAvg, Object l50, Object l75, Object l90, Object l99, Object l999) {
-        TestLogger.log(LOG_ID, "%18s | %7s | %5s | %5s | %5s | %5s | %5s | %5s", opType, count, lAvg, l50, l75, l90, l99, l999);
+    private void outputRow(Object opType, Object count, Object sum, Object lAvg, Object l50, Object l75, Object l90, Object l99, Object l999) {
+        TestLogger.log(LOG_ID, "%18s | %7s | %9s | %5s | %5s | %5s | %5s | %5s | %5s", opType, count, sum, lAvg, l50, l75, l90, l99, l999);
     }
 
     private double toMB(double bytes) {
-        return bytes / (double) ONE_MB;
+        return bytes / ONE_MB;
     }
 
     private double toSeconds(long nanos) {

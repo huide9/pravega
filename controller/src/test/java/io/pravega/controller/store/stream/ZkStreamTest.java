@@ -1,38 +1,38 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.controller.store.stream;
 
+import com.google.common.collect.Lists;
+import io.pravega.client.stream.ScalingPolicy;
+import io.pravega.client.stream.StreamConfiguration;
 import io.pravega.common.Exceptions;
 import io.pravega.common.concurrent.ExecutorServiceHelpers;
 import io.pravega.common.concurrent.Futures;
 import io.pravega.common.util.BitConverter;
+import io.pravega.controller.store.TestOperationContext;
+import io.pravega.controller.store.VersionedMetadata;
+import io.pravega.controller.store.ZKStoreHelper;
 import io.pravega.controller.store.stream.records.ActiveTxnRecord;
 import io.pravega.controller.store.stream.records.EpochTransitionRecord;
+import io.pravega.controller.store.stream.records.StreamConfigurationRecord;
 import io.pravega.controller.store.stream.records.StreamSegmentRecord;
-import io.pravega.test.common.AssertExtensions;
-import io.pravega.test.common.TestingServerStarter;
 import io.pravega.controller.stream.api.grpc.v1.Controller.CreateScopeStatus;
 import io.pravega.controller.stream.api.grpc.v1.Controller.DeleteScopeStatus;
-import io.pravega.client.stream.ScalingPolicy;
-import io.pravega.client.stream.StreamConfiguration;
-import com.google.common.collect.Lists;
-import org.apache.curator.framework.CuratorFramework;
-import org.apache.curator.framework.CuratorFrameworkFactory;
-import org.apache.curator.retry.RetryOneTime;
-import org.apache.curator.test.TestingServer;
-import org.junit.After;
-import org.junit.Assert;
-import org.junit.Before;
-import org.junit.Test;
-import org.mockito.Mockito;
-
+import io.pravega.test.common.AssertExtensions;
+import io.pravega.test.common.TestingServerStarter;
 import java.util.AbstractMap;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -43,12 +43,21 @@ import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
+import lombok.Cleanup;
+import org.apache.curator.framework.CuratorFramework;
+import org.apache.curator.framework.CuratorFrameworkFactory;
+import org.apache.curator.retry.RetryOneTime;
+import org.apache.curator.test.TestingServer;
+import org.junit.After;
+import org.junit.Assert;
+import org.junit.Before;
+import org.junit.Test;
+import org.mockito.Mockito;
 
-import static io.pravega.shared.segment.StreamSegmentNameUtils.*;
+import static io.pravega.shared.NameUtils.computeSegmentId;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotEquals;
@@ -56,8 +65,8 @@ import static org.junit.Assert.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doReturn;
-import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.reset;
+import static org.mockito.Mockito.spy;
 
 public class ZkStreamTest {
     private static final String SCOPE = "scope";
@@ -65,7 +74,7 @@ public class ZkStreamTest {
     private CuratorFramework cli;
     private StreamMetadataStore storePartialMock;
 
-    private final ScheduledExecutorService executor = Executors.newScheduledThreadPool(10);
+    private final ScheduledExecutorService executor = ExecutorServiceHelpers.newScheduledThreadPool(10, "test");
 
     @Before
     public void startZookeeper() throws Exception {
@@ -84,7 +93,7 @@ public class ZkStreamTest {
         storePartialMock.close();
     }
 
-    @Test
+    @Test(timeout = 30000)
     public void testZkConnectionLoss() throws Exception {
         final ScalingPolicy policy = ScalingPolicy.fixed(5);
 
@@ -102,10 +111,11 @@ public class ZkStreamTest {
         zkTestServer.start();
     }
 
-    @Test
+    @Test(timeout = 30000)
     public void testCreateStreamState() throws Exception {
         final ScalingPolicy policy = ScalingPolicy.fixed(5);
 
+        @Cleanup
         final StreamMetadataStore store = new ZKStreamMetadataStore(cli, executor);
         final String streamName = "testfail";
 
@@ -113,7 +123,7 @@ public class ZkStreamTest {
                 .scalingPolicy(policy)
                 .build();
 
-        store.createScope(SCOPE).get();
+        store.createScope(SCOPE, null, executor).get();
         store.createStream(SCOPE, streamName, streamConfig, System.currentTimeMillis(), null, executor).get();
 
         try {
@@ -121,22 +131,23 @@ public class ZkStreamTest {
         } catch (Exception e) {
             assert e.getCause() != null && e.getCause() instanceof IllegalStateException;
         }
-        store.deleteScope(SCOPE);
+        store.deleteScope(SCOPE, null, executor);
     }
 
-    @Test
+    @Test(timeout = 30000)
     public void testZkCreateScope() throws Exception {
 
         // create new scope test
+        @Cleanup
         final StreamMetadataStore store = new ZKStreamMetadataStore(cli, executor);
         final String scopeName = "Scope1";
-        CompletableFuture<CreateScopeStatus> createScopeStatus = store.createScope(scopeName);
+        CompletableFuture<CreateScopeStatus> createScopeStatus = store.createScope(scopeName, null, executor);
 
         // createScope returns null on success, and exception on failure
         assertEquals("Create new scope :", CreateScopeStatus.Status.SUCCESS, createScopeStatus.get().getStatus());
 
         // create duplicate scope test
-        createScopeStatus = store.createScope(scopeName);
+        createScopeStatus = store.createScope(scopeName, null, executor);
         assertEquals("Create new scope :", CreateScopeStatus.Status.SCOPE_EXISTS, createScopeStatus.get().getStatus());
 
         //listStreams test
@@ -152,85 +163,90 @@ public class ZkStreamTest {
         store.createStream(scopeName, streamName2, streamConfig2, System.currentTimeMillis(), null, executor).get();
         store.setState(scopeName, streamName2, State.ACTIVE, null, executor).get();
 
-        Map<String, StreamConfiguration> listOfStreams = store.listStreamsInScope(scopeName).get();
+        Map<String, StreamConfiguration> listOfStreams = store.listStreamsInScope(scopeName, null, executor).get();
         assertEquals("Size of list", 2, listOfStreams.size());
         assertTrue("Name of stream at index zero", listOfStreams.containsKey("Stream1"));
         assertTrue("Name of stream at index one", listOfStreams.containsKey("Stream2"));
     }
 
-    @Test
+    @Test(timeout = 30000)
     public void testZkDeleteScope() throws Exception {
         // create new scope
+        @Cleanup
         final StreamMetadataStore store = new ZKStreamMetadataStore(cli, executor);
         final String scopeName = "Scope1";
-        store.createScope(scopeName).get();
+        store.createScope(scopeName, null, executor).get();
 
         // Delete empty scope Scope1
-        CompletableFuture<DeleteScopeStatus> deleteScopeStatus = store.deleteScope(scopeName);
+        CompletableFuture<DeleteScopeStatus> deleteScopeStatus = store.deleteScope(scopeName, null, executor);
         assertEquals("Delete Empty Scope", DeleteScopeStatus.Status.SUCCESS, deleteScopeStatus.get().getStatus());
 
         // Delete non-existent scope Scope2
-        CompletableFuture<DeleteScopeStatus> deleteScopeStatus2 = store.deleteScope("Scope2");
+        CompletableFuture<DeleteScopeStatus> deleteScopeStatus2 = store.deleteScope("Scope2", null, executor);
         assertEquals("Delete non-existent Scope", DeleteScopeStatus.Status.SCOPE_NOT_FOUND, deleteScopeStatus2.get().getStatus());
 
         // Delete non-empty scope Scope3
-        store.createScope("Scope3").get();
+        store.createScope("Scope3", null, executor).get();
         final ScalingPolicy policy = ScalingPolicy.fixed(5);
         final StreamConfiguration streamConfig =
                 StreamConfiguration.builder().scalingPolicy(policy).build();
 
-        store.createStream("Scope3", "Stream3", streamConfig, System.currentTimeMillis(), null, executor).get();
+        store.createStream("Scope3", "Stream3", streamConfig, System.currentTimeMillis(), 
+                null, executor).get();
         store.setState("Scope3", "Stream3", State.ACTIVE, null, executor).get();
 
-        CompletableFuture<DeleteScopeStatus> deleteScopeStatus3 = store.deleteScope("Scope3");
+        CompletableFuture<DeleteScopeStatus> deleteScopeStatus3 = store.deleteScope("Scope3", null, executor);
         assertEquals("Delete non-empty Scope", DeleteScopeStatus.Status.SCOPE_NOT_EMPTY,
                 deleteScopeStatus3.get().getStatus());
     }
 
-    @Test
+    @Test(timeout = 30000)
     public void testGetScope() throws Exception {
+        @Cleanup
         final StreamMetadataStore store = new ZKStreamMetadataStore(cli, executor);
         final String scope1 = "Scope1";
         final String scope2 = "Scope2";
         String scopeName;
 
         // get existent scope
-        store.createScope(scope1).get();
-        scopeName = store.getScopeConfiguration(scope1).get();
+        store.createScope(scope1, null, executor).get();
+        scopeName = store.getScopeConfiguration(scope1, null, executor).get();
         assertEquals("Get existent scope", scope1, scopeName);
 
         // get non-existent scope
         try {
-            store.getScopeConfiguration(scope2).get();
+            store.getScopeConfiguration(scope2, null, executor).get();
         } catch (ExecutionException e) {
             assertTrue("Get non existent scope", e.getCause() instanceof StoreException.DataNotFoundException);
         }
     }
 
-    @Test
+    @Test(timeout = 30000)
     public void testZkListScope() throws Exception {
         // list scope test
+        @Cleanup
         final StreamMetadataStore store = new ZKStreamMetadataStore(cli, executor);
-        store.createScope("Scope1").get();
-        store.createScope("Scope2").get();
-        store.createScope("Scope3").get();
+        store.createScope("Scope1", null, executor).get();
+        store.createScope("Scope2", null, executor).get();
+        store.createScope("Scope3", null, executor).get();
 
-        List<String> listScopes = store.listScopes().get();
+        List<String> listScopes = store.listScopes(executor, 0L).get();
         assertEquals("List Scopes ", 3, listScopes.size());
 
-        store.deleteScope("Scope3").get();
-        listScopes = store.listScopes().get();
+        store.deleteScope("Scope3", null, executor).get();
+        listScopes = store.listScopes(executor, 0L).get();
         assertEquals("List Scopes ", 2, listScopes.size());
     }
 
-    @Test
+    @Test(timeout = 30000)
     public void testZkStream() throws Exception {
         double keyChunk = 1.0 / 5;
         final ScalingPolicy policy = ScalingPolicy.fixed(5);
 
+        @Cleanup
         final StreamMetadataStore store = new ZKStreamMetadataStore(cli, executor);
         final String streamName = "test";
-        store.createScope(SCOPE).get();
+        store.createScope(SCOPE, null, executor).get();
 
         StreamConfiguration streamConfig = StreamConfiguration.builder()
                 .scalingPolicy(policy)
@@ -238,7 +254,13 @@ public class ZkStreamTest {
 
         store.createStream(SCOPE, streamName, streamConfig, System.currentTimeMillis(), null, executor).get();
         store.setState(SCOPE, streamName, State.ACTIVE, null, executor).get();
-        OperationContext context = store.createContext(SCOPE, streamName);
+        OperationContext context = store.createStreamContext(SCOPE, streamName, 0L);
+
+        // set minimum number of segments to 1 so that we can also test scale downs
+        streamConfig = StreamConfiguration.builder().scalingPolicy(ScalingPolicy.fixed(1)).build();
+        store.startUpdateConfiguration(SCOPE, streamName, streamConfig, null, executor).join();
+        VersionedMetadata<StreamConfigurationRecord> configRecord = store.getConfigurationRecord(SCOPE, streamName, null, executor).join();
+        store.completeUpdateConfiguration(SCOPE, streamName, configRecord, null, executor).join();
 
         List<StreamSegmentRecord> segments = store.getActiveSegments(SCOPE, streamName, context, executor).get();
         assertEquals(segments.size(), 5);
@@ -439,7 +461,7 @@ public class ZkStreamTest {
 
         final StreamMetadataStore store = new ZKStreamMetadataStore(cli, executor);
         final String streamName = "testTx";
-        store.createScope(SCOPE).get();
+        store.createScope(SCOPE, null, executor).get();
         final Predicate<Throwable> operationNotAllowedPredicate =
                 ex -> Exceptions.unwrap(ex) instanceof StoreException.IllegalStateException;
 
@@ -450,7 +472,10 @@ public class ZkStreamTest {
         store.createStream(SCOPE, streamName, streamConfig, System.currentTimeMillis(), null, executor).get();
         store.setState(SCOPE, streamName, State.ACTIVE, null, executor).get();
 
-        OperationContext context = store.createContext(ZkStreamTest.SCOPE, streamName);
+        OperationContext context = store.createStreamContext(ZkStreamTest.SCOPE, streamName, 0L);
+
+        Map<UUID, TxnStatus> listAborted = store.listCompletedTxns(SCOPE, streamName, context, executor).join();
+        assertEquals(0, listAborted.size());
 
         UUID txnId1 = store.generateTransactionId(SCOPE, streamName, null, executor).join();
         VersionedTransactionData tx = store.createTransaction(SCOPE, streamName, txnId1, 10000, 600000,
@@ -462,14 +487,14 @@ public class ZkStreamTest {
                 context, executor).get();
         Assert.assertEquals(txnId2, tx2.getId());
 
-        store.sealTransaction(SCOPE, streamName, tx.getId(), true, Optional.empty(),
+        store.sealTransaction(SCOPE, streamName, tx.getId(), true, Optional.empty(), "", Long.MIN_VALUE,
                 context, executor).get();
         assert store.transactionStatus(SCOPE, streamName, tx.getId(), context, executor)
                 .get().equals(TxnStatus.COMMITTING);
 
         // Test to ensure that sealTransaction is idempotent.
         Assert.assertEquals(TxnStatus.COMMITTING, store.sealTransaction(SCOPE, streamName, tx.getId(), true,
-                Optional.empty(), context, executor).join().getKey());
+                Optional.empty(), "", Long.MIN_VALUE, context, executor).join().getKey());
 
         // Test to ensure that COMMITTING_TXN transaction cannot be aborted.
         testAbortFailure(store, SCOPE, streamName, tx.getEpoch(), tx.getId(), context, operationNotAllowedPredicate);
@@ -479,13 +504,13 @@ public class ZkStreamTest {
         store.setState(SCOPE, streamName, State.ACTIVE, context, executor).join();
 
         store.sealTransaction(SCOPE, streamName, tx2.getId(), false, Optional.empty(),
-                context, executor).get();
+                "", Long.MIN_VALUE, context, executor).get();
         assert store.transactionStatus(SCOPE, streamName, tx2.getId(), context, executor)
                 .get().equals(TxnStatus.ABORTING);
 
         // Test to ensure that sealTransaction is idempotent.
         Assert.assertEquals(TxnStatus.ABORTING, store.sealTransaction(SCOPE, streamName, tx2.getId(), false,
-                Optional.empty(), context, executor).join().getKey());
+                Optional.empty(), "", Long.MIN_VALUE, context, executor).join().getKey());
 
         // Test to ensure that ABORTING transaction cannot be committed.
         testCommitFailure(store, SCOPE, streamName, tx2.getEpoch(), tx2.getId(), context, operationNotAllowedPredicate);
@@ -501,7 +526,7 @@ public class ZkStreamTest {
 
         // Test to ensure that sealTransaction, to commit it, on committed transaction does not throw an error.
         Assert.assertEquals(TxnStatus.COMMITTED, store.sealTransaction(SCOPE, streamName, tx.getId(), true,
-                Optional.empty(), context, executor).join().getKey());
+                Optional.empty(), "", Long.MIN_VALUE, context, executor).join().getKey());
 
         // Test to ensure that commitTransaction is idempotent.
         store.setState(SCOPE, streamName, State.COMMITTING_TXN, context, executor).join();
@@ -514,11 +539,14 @@ public class ZkStreamTest {
 
         // Test to ensure that sealTransaction, to abort it, on aborted transaction does not throw an error.
         Assert.assertEquals(TxnStatus.ABORTED, store.sealTransaction(SCOPE, streamName, tx2.getId(), false,
-                Optional.empty(), context, executor).join().getKey());
+                Optional.empty(), "", Long.MIN_VALUE, context, executor).join().getKey());
 
         // Test to ensure that abortTransaction is idempotent.
         Assert.assertEquals(TxnStatus.ABORTED,
                 store.abortTransaction(SCOPE, streamName, tx2.getId(), context, executor).join());
+
+        listAborted = store.listCompletedTxns(SCOPE, streamName, context, executor).join();
+        assertEquals(2, listAborted.size());
 
         // Test to ensure that sealTransaction, to abort it, and abortTransaction on committed transaction throws error.
         testCommitFailure(store, SCOPE, streamName, tx2.getEpoch(), tx2.getId(), context, operationNotAllowedPredicate);
@@ -547,7 +575,7 @@ public class ZkStreamTest {
                 .get().equals(TxnStatus.UNKNOWN);
     }
 
-    @Test(timeout = 10000)
+    @Test(timeout = 30000)
     public void testGetActiveTxn() throws Exception {
         ZKStoreHelper storeHelper = spy(new ZKStoreHelper(cli, executor));
         ZkOrderedStore orderer = new ZkOrderedStore("txn", storeHelper, executor);
@@ -556,17 +584,18 @@ public class ZkStreamTest {
         storeHelper.createZNodeIfNotExist("/store/scope").join();
         final ScalingPolicy policy1 = ScalingPolicy.fixed(2);
         final StreamConfiguration configuration1 = StreamConfiguration.builder().scalingPolicy(policy1).build();
-        stream.create(configuration1, System.currentTimeMillis(), startingSegmentNumber).join();
-        stream.updateState(State.ACTIVE).join();
-        UUID txId = stream.generateNewTxnId(0, 0L).join();
-        stream.createTransaction(txId, 1000L, 1000L).join();
+        OperationContext context = new TestOperationContext();
+        stream.create(configuration1, System.currentTimeMillis(), startingSegmentNumber, context).join();
+        stream.updateState(State.ACTIVE, context).join();
+        UUID txId = stream.generateNewTxnId(0, 0L, context).join();
+        stream.createTransaction(txId, 1000L, 1000L, context).join();
 
         String activeTxPath = stream.getActiveTxPath(0, txId.toString());
         // throw DataNotFoundException for txn path
         doReturn(Futures.failedFuture(StoreException.create(StoreException.Type.DATA_NOT_FOUND, "txn data not found")))
                 .when(storeHelper).getData(eq(activeTxPath), any());
 
-        Map<UUID, ActiveTxnRecord> result = stream.getActiveTxns().join();
+        Map<UUID, ActiveTxnRecord> result = stream.getActiveTxns(context).join();
         // verify that call succeeds and no active txns were found
         assertTrue(result.isEmpty());
 
@@ -575,15 +604,16 @@ public class ZkStreamTest {
 
         ZKStream stream2 = new ZKStream("scope", "stream", storeHelper, executor, orderer);
         // verify that the call fails
-        AssertExtensions.assertFutureThrows("", stream2.getActiveTxns(), e -> Exceptions.unwrap(e) instanceof RuntimeException);
+        AssertExtensions.assertFutureThrows("", stream2.getActiveTxns(context), 
+                e -> Exceptions.unwrap(e) instanceof RuntimeException);
 
         reset(storeHelper);
         ZKStream stream3 = new ZKStream("scope", "stream", storeHelper, executor, orderer);
-        result = stream3.getActiveTxns().join();
+        result = stream3.getActiveTxns(context).join();
         assertEquals(1, result.size());
     }
 
-    @Test(timeout = 10000)
+    @Test(timeout = 30000)
     public void testStreamRecreation() {
         // We will first create stream. Verify that its metadata is present in the cache.  
         ZKStoreHelper storeHelper = new ZKStoreHelper(cli, executor);
@@ -596,48 +626,51 @@ public class ZkStreamTest {
         storeHelper.createZNodeIfNotExist("/store/scope").join();
         final ScalingPolicy policy1 = ScalingPolicy.fixed(2);
         final StreamConfiguration configuration1 = StreamConfiguration.builder().scalingPolicy(policy1).build();
-        stream.create(configuration1, System.currentTimeMillis(), startingSegmentNumber).join();
+        OperationContext context = new TestOperationContext();
+        stream.create(configuration1, System.currentTimeMillis(), startingSegmentNumber, context).join();
         stream.createStreamPositionNodeIfAbsent(0).join();
-        stream.updateState(State.ACTIVE).join();
-        Long creationTime = stream.getCreationTime().join();
+        stream.updateState(State.ACTIVE, context).join();
+        Long creationTime = stream.getCreationTime(context).join();
         Integer position = stream.getStreamPosition().join();
         assertEquals(0, position.intValue());
-        ZKStoreHelper.ZkCacheKey<Integer> key = new ZKStoreHelper.ZkCacheKey<>(stream.getCreationPath(), position.toString(), x -> BitConverter.readInt(x, 0));
-        VersionedMetadata<?> cachedCreationTime = storeHelper.getCache().getCachedData(key).join();
+        ZKStoreHelper.ZkCacheKey<Integer> key = new ZKStoreHelper.ZkCacheKey<>(stream.getCreationPath(),
+                position.toString(), x -> BitConverter.readInt(x, 0));
+        VersionedMetadata<?> cachedCreationTime = storeHelper.getCache().getCachedData(key);
         // verify that both timestamps are same
         assertEquals(creationTime, cachedCreationTime.getObject());
         // delete stream.
-        stream.updateState(State.SEALING).join();
-        stream.updateState(State.SEALED).join();
-        stream.deleteStream().join();
+        stream.updateState(State.SEALING, context).join();
+        stream.updateState(State.SEALED, context).join();
+        stream.deleteStream(context).join();
 
         // refresh the stream object to indicate new request context
         stream.refresh();
-
-        AssertExtensions.assertFutureThrows("should throw data not found for stream", stream.getEpochRecord(0), 
+        AssertExtensions.assertFutureThrows("should throw data not found for stream", stream.getEpochRecord(0, context), 
             e -> Exceptions.unwrap(e) instanceof StoreException.DataNotFoundException);
         
         // refresh the stream object to indicate new request context
         stream.refresh();
 
         // verify that metadata doesn't exist in the store.
-        AssertExtensions.assertFutureThrows("Stream deleted", stream.getCreationTime(), e -> Exceptions.unwrap(e) instanceof StoreException.DataNotFoundException);
+        AssertExtensions.assertFutureThrows("Stream deleted", stream.getCreationTime(context), 
+                e -> Exceptions.unwrap(e) instanceof StoreException.DataNotFoundException);
         
         // verify that cached entries still exist. 
-        VersionedMetadata<?> cachedCreationTimeExists = storeHelper.getCache().getCachedData(key).join();
+        VersionedMetadata<?> cachedCreationTimeExists = storeHelper.getCache().getCachedData(key);
         assertEquals(cachedCreationTime.getObject(), cachedCreationTimeExists.getObject());
         
         // create stream again.
-        stream.create(configuration1, System.currentTimeMillis(), startingSegmentNumber).join();
+        stream.create(configuration1, System.currentTimeMillis(), startingSegmentNumber, context).join();
         stream.createStreamPositionNodeIfAbsent(1).join();
-        stream.updateState(State.ACTIVE).join();
+        stream.updateState(State.ACTIVE, context).join();
 
-        Long creationTimeNew = stream.getCreationTime().join();
+        Long creationTimeNew = stream.getCreationTime(context).join();
         Integer positionNew = stream.getStreamPosition().join();
         assertEquals(1, positionNew.intValue());
 
-        ZKStoreHelper.ZkCacheKey<Integer> keyNew = new ZKStoreHelper.ZkCacheKey<>(stream.getCreationPath(), positionNew.toString(), x -> BitConverter.readInt(x, 0));
-        VersionedMetadata<?> cachedCreationTimeNew = storeHelper.getCache().getCachedData(keyNew).join();
+        ZKStoreHelper.ZkCacheKey<Integer> keyNew = new ZKStoreHelper.ZkCacheKey<>(stream.getCreationPath(), 
+                positionNew.toString(), x -> BitConverter.readInt(x, 0));
+        VersionedMetadata<?> cachedCreationTimeNew = storeHelper.getCache().getCachedData(keyNew);
         // verify that both times are different
         assertNotEquals(creationTime, creationTimeNew);
         assertNotEquals(cachedCreationTime.getObject(), cachedCreationTimeNew.getObject());
@@ -647,7 +680,7 @@ public class ZkStreamTest {
                                    OperationContext context,
                                    Predicate<Throwable> checker) {
         AssertExtensions.assertSuppliedFutureThrows("Seal txn to commit it failure",
-                () -> store.sealTransaction(scope, stream, txnId, true, Optional.empty(), context, executor),
+                () -> store.sealTransaction(scope, stream, txnId, true, Optional.empty(), "", Long.MIN_VALUE, context, executor),
                 checker);
 
         AssertExtensions.assertSuppliedFutureThrows("Commit txn failure",
@@ -659,7 +692,7 @@ public class ZkStreamTest {
                                   OperationContext context,
                                   Predicate<Throwable> checker) {
         AssertExtensions.assertSuppliedFutureThrows("Seal txn to abort it failure",
-                () -> store.sealTransaction(scope, stream, txnId, false, Optional.empty(), context, executor),
+                () -> store.sealTransaction(scope, stream, txnId, false, Optional.empty(), "", Long.MIN_VALUE, context, executor),
                 checker);
 
         AssertExtensions.assertSuppliedFutureThrows("Abort txn failure",

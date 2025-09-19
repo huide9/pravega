@@ -1,11 +1,17 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.test.integration;
 
@@ -14,8 +20,11 @@ import io.pravega.client.admin.ReaderGroupManager;
 import io.pravega.client.admin.StreamManager;
 import io.pravega.client.admin.impl.ReaderGroupManagerImpl;
 import io.pravega.client.admin.impl.StreamManagerImpl;
-import io.pravega.client.netty.impl.ConnectionFactory;
-import io.pravega.client.netty.impl.ConnectionFactoryImpl;
+import io.pravega.client.connection.impl.ConnectionFactory;
+import io.pravega.client.connection.impl.ConnectionPool;
+import io.pravega.client.connection.impl.ConnectionPoolImpl;
+import io.pravega.client.connection.impl.SocketConnectionFactoryImpl;
+import io.pravega.client.control.impl.Controller;
 import io.pravega.client.stream.EventStreamReader;
 import io.pravega.client.stream.EventStreamWriter;
 import io.pravega.client.stream.EventWriterConfig;
@@ -26,12 +35,12 @@ import io.pravega.client.stream.ScalingPolicy;
 import io.pravega.client.stream.Stream;
 import io.pravega.client.stream.StreamConfiguration;
 import io.pravega.client.stream.impl.ClientFactoryImpl;
-import io.pravega.client.stream.impl.Controller;
 import io.pravega.client.stream.impl.StreamImpl;
 import io.pravega.client.stream.impl.UTF8StringSerializer;
 import io.pravega.segmentstore.contracts.StreamSegmentStore;
 import io.pravega.segmentstore.contracts.tables.TableStore;
 import io.pravega.segmentstore.server.host.delegationtoken.PassingTokenVerifier;
+import io.pravega.segmentstore.server.host.handler.IndexAppendProcessor;
 import io.pravega.segmentstore.server.host.handler.PravegaConnectionListener;
 import io.pravega.segmentstore.server.host.stat.AutoScaleMonitor;
 import io.pravega.segmentstore.server.host.stat.AutoScalerConfig;
@@ -41,22 +50,26 @@ import io.pravega.shared.metrics.MetricRegistryUtils;
 import io.pravega.shared.metrics.MetricsConfig;
 import io.pravega.shared.metrics.MetricsProvider;
 import io.pravega.shared.metrics.StatsProvider;
+import io.pravega.test.common.SecurityConfigDefaults;
+import io.pravega.test.common.SerializedClassRunner;
 import io.pravega.test.common.TestUtils;
-import io.pravega.test.common.TestingServerStarter;
 import io.pravega.test.common.ThreadPooledTestSuite;
-import io.pravega.test.integration.demo.ControllerWrapper;
+import io.pravega.test.common.TestingServerStarter;
+import io.pravega.test.integration.utils.ControllerWrapper;
 import java.time.Duration;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Random;
 import java.util.concurrent.CompletableFuture;
+import lombok.Cleanup;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.curator.test.TestingServer;
 import org.junit.After;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
+import org.junit.runner.RunWith;
 
 import static io.pravega.shared.MetricsNames.SEGMENT_READ_BYTES;
 import static io.pravega.shared.MetricsTags.segmentTags;
@@ -65,6 +78,7 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
 @Slf4j
+@RunWith(SerializedClassRunner.class)
 public class MetricsTest extends ThreadPooledTestSuite {
 
     private static final String STREAM_NAME = "testMetricsStream" + new Random().nextInt(Integer.MAX_VALUE);
@@ -98,6 +112,7 @@ public class MetricsTest extends ThreadPooledTestSuite {
         log.info("Initializing metrics provider ...");
 
         MetricsConfig metricsConfig = MetricsConfig.builder()
+                .with(MetricsConfig.ENABLE_STATISTICS, true)
                 .with(MetricsConfig.ENABLE_STATSD_REPORTER, false)
                 .build();
         metricsConfig.setDynamicCacheEvictionDuration(Duration.ofSeconds(2));
@@ -117,9 +132,10 @@ public class MetricsTest extends ThreadPooledTestSuite {
         monitor = new AutoScaleMonitor(store, AutoScalerConfig.builder().build());
         TableStore tableStore = serviceBuilder.createTableStoreService();
 
-        this.server = new PravegaConnectionListener(false, "localhost", servicePort, store, tableStore,
+        this.server = new PravegaConnectionListener(false, false, "localhost", servicePort, store, tableStore,
                 monitor.getStatsRecorder(), monitor.getTableSegmentStatsRecorder(), new PassingTokenVerifier(),
-                null, null, true);
+                null, null, true, this.serviceBuilder.getLowPriorityExecutor(), SecurityConfigDefaults.TLS_PROTOCOL_VERSION,
+                new IndexAppendProcessor(serviceBuilder.getLowPriorityExecutor(), store));
         this.server.startListening();
 
         // 4. Start Pravega Controller service
@@ -165,8 +181,9 @@ public class MetricsTest extends ThreadPooledTestSuite {
 
     @Test(timeout = 120000)
     public void metricsTimeBasedCacheEvictionTest() throws Exception {
-        try (ConnectionFactory cf = new ConnectionFactoryImpl(ClientConfig.builder().build());
-             StreamManager streamManager = new StreamManagerImpl(controller, cf)) {
+        ClientConfig clientConfig = ClientConfig.builder().build();
+        try (ConnectionPool cp = new ConnectionPoolImpl(clientConfig, new SocketConnectionFactoryImpl(clientConfig));
+             StreamManager streamManager = new StreamManagerImpl(controller, cp)) {
             boolean createScopeStatus = streamManager.createScope(scope);
             log.info("Create scope status {}", createScopeStatus);
 
@@ -174,9 +191,10 @@ public class MetricsTest extends ThreadPooledTestSuite {
             log.info("Create stream status {}", createStreamStatus);
         }
 
-        try (ConnectionFactory connectionFactory = new ConnectionFactoryImpl(ClientConfig.builder().build());
+        try (ConnectionFactory connectionFactory = new SocketConnectionFactoryImpl(ClientConfig.builder().build());
              ClientFactoryImpl clientFactory = new ClientFactoryImpl(scope, controller, connectionFactory);
-             ReaderGroupManager readerGroupManager = new ReaderGroupManagerImpl(scope, controller, clientFactory, connectionFactory)) {
+             ReaderGroupManager readerGroupManager = new ReaderGroupManagerImpl(scope, controller, clientFactory)) {
+            @Cleanup
             EventStreamWriter<String> writer1 = clientFactory.createEventWriter(STREAM_NAME,
                     new UTF8StringSerializer(),
                     EventWriterConfig.builder().build());
@@ -238,6 +256,7 @@ public class MetricsTest extends ThreadPooledTestSuite {
                     executorService()).getFuture();
             Assert.assertTrue(scaleStatus.get());
 
+            @Cleanup
             EventStreamWriter<String> writer2 = clientFactory.createEventWriter(STREAM_NAME,
                     new UTF8StringSerializer(),
                     EventWriterConfig.builder().build());

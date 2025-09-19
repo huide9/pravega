@@ -1,11 +1,17 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.client.batch;
 
@@ -21,6 +27,11 @@ import java.util.Iterator;
  *
  * While buffering is used to avoid it, it is possible for {@link #next()} to block on fetching the
  * data.
+ *
+ * While iterating over SegmentIterator using {@link #next()} it can throw {@link io.pravega.client.stream.TruncatedDataException}
+ * if SegmentIterator is pointing to an offset which is already truncated.
+ * If this exception occurs, SegmentIterator will automatically update headOffset to next available offset.
+ * Next call to {@link #next()} will point correctly to valid offset and reader will continue.
  * 
  * At any time {@link #getOffset()} can be called to get the byte offset in the segment the iterator
  * is currently pointing to.

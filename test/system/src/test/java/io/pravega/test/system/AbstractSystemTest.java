@@ -1,11 +1,17 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.test.system;
 
@@ -27,6 +33,8 @@ import static io.pravega.test.system.framework.Utils.EXECUTOR_TYPE;
  */
 @Slf4j
 abstract class AbstractSystemTest {
+    final static String TCP = "tcp://";
+    final static String TLS = "tls://";
     static final Predicate<URI> ISGRPC = uri -> {
         switch (EXECUTOR_TYPE) {
             case REMOTE_SEQUENTIAL:
@@ -62,6 +70,11 @@ abstract class AbstractSystemTest {
 
     static URI ensureControllerRunning(final URI zkUri) {
         Service conService = Utils.createPravegaControllerService(zkUri);
+        return startControllerService(conService);
+    }
+
+    static URI ensureSecureControllerRunning(final URI zkUri) {
+        Service conService = Utils.createPravegaControllerService(zkUri, "controller");
         return startControllerService(conService);
     }
 
@@ -102,7 +115,7 @@ abstract class AbstractSystemTest {
         // Fetch all the RPC endpoints and construct the client URIs.
         final List<String> uris = conUris.stream().filter(ISGRPC).map(URI::getAuthority).collect(Collectors.toList());
 
-        URI controllerURI = URI.create("tcp://" + String.join(",", uris));
+        URI controllerURI = Utils.getControllerURI(uris);
         log.info("Controller Service direct URI: {}", controllerURI);
         return controllerURI;
     }

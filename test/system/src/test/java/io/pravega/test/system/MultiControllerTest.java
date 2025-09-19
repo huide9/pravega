@@ -1,17 +1,23 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.test.system;
 
 import io.pravega.client.ClientConfig;
-import io.pravega.client.stream.impl.ControllerImpl;
-import io.pravega.client.stream.impl.ControllerImplConfig;
+import io.pravega.client.control.impl.ControllerImpl;
+import io.pravega.client.control.impl.ControllerImplConfig;
 import io.pravega.common.concurrent.ExecutorServiceHelpers;
 import io.pravega.common.concurrent.Futures;
 import io.pravega.common.util.RetriesExhaustedException;
@@ -25,7 +31,6 @@ import java.net.URI;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
@@ -38,6 +43,7 @@ import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
+
 import static io.pravega.test.system.framework.Utils.DOCKER_BASED;
 import static org.junit.Assert.assertEquals;
 
@@ -45,8 +51,9 @@ import static org.junit.Assert.assertEquals;
 @RunWith(SystemTestRunner.class)
 public class MultiControllerTest extends AbstractSystemTest {
 
-    private final ScheduledExecutorService executorService = Executors.newSingleThreadScheduledExecutor();
+    private final ScheduledExecutorService executorService = ExecutorServiceHelpers.newScheduledThreadPool(1, "test");
     private Service controllerService = null;
+    private Service segmentStoreService = null;
     private AtomicReference<URI> controllerURIDirect = new AtomicReference<>();
     private AtomicReference<URI> controllerURIDiscover = new AtomicReference<>();
 
@@ -83,16 +90,25 @@ public class MultiControllerTest extends AbstractSystemTest {
         final List<String> uris = conUris.stream().filter(ISGRPC).map(URI::getAuthority).collect(Collectors.toList());
         assertEquals("2 controller instances should be running", 2, uris.size());
 
-        // use the last two uris
-        controllerURIDirect.set(URI.create("tcp://" + String.join(",", uris)));
-        log.info("Controller Service direct URI: {}", controllerURIDirect);
-        controllerURIDiscover.set(URI.create("pravega://" + String.join(",", uris)));
-        log.info("Controller Service discovery URI: {}", controllerURIDiscover);
+        if (Utils.TLS_AND_AUTH_ENABLED) {
+            controllerURIDirect.set(URI.create(TLS + Utils.getTlsCommonName() + ":" + Utils.CONTROLLER_GRPC_PORT));
+            controllerURIDiscover.set(URI.create(TLS + Utils.getTlsCommonName() + ":" + Utils.CONTROLLER_GRPC_PORT));
+        } else {
+            // use the last two uris
+            controllerURIDirect.set(URI.create((TCP) + String.join(",", uris)));
+            log.info("Controller Service direct URI: {}", controllerURIDirect);
+            controllerURIDiscover.set(URI.create("pravega://" + String.join(",", uris)));
+        }
+        log.info("Controller Service discovery URI: {} direct URI :{}", controllerURIDiscover, controllerURIDirect);
+        segmentStoreService = Utils.createPravegaSegmentStoreService(zkUris.get(0), controllerService.getServiceDetails().get(0));
     }
 
     @After
     public void tearDown() {
         ExecutorServiceHelpers.shutdown(executorService);
+        // The test scales down the controller instances to 0.
+        // Scale down the segment store instances to 0 to ensure the next tests start with a clean slate.
+        segmentStoreService.scaleService(0);
     }
 
     /**
@@ -102,8 +118,7 @@ public class MultiControllerTest extends AbstractSystemTest {
      * @throws InterruptedException If test is interrupted.
      */
     @Test(timeout = 300000)
-    public void multiControllerTest() throws ExecutionException, InterruptedException {
-
+    public void multiControllerTest() throws Exception {
         log.info("Start execution of multiControllerTest");
 
         log.info("Test tcp:// with 2 controller instances running");
@@ -121,13 +136,16 @@ public class MultiControllerTest extends AbstractSystemTest {
         // All APIs should throw exception and fail.
         Futures.getAndHandleExceptions(controllerService.scaleService(0), ExecutionException::new);
 
-        if (!controllerService.getServiceDetails().isEmpty()) {
-            controllerURIDirect.set(controllerService.getServiceDetails().get(0));
-            controllerURIDiscover.set(controllerService.getServiceDetails().get(0));
+        AssertExtensions.assertEventuallyEquals("Problem scaling down the Controller service.", true,
+                () -> controllerService.getServiceDetails().isEmpty(), 1000, 30000);
+        if (Utils.TLS_AND_AUTH_ENABLED) {
+            controllerURIDirect.set(URI.create("tls://0.0.0.0:9090"));
+            controllerURIDiscover.set(URI.create("tls://0.0.0.0:9090"));
         } else {
             controllerURIDirect.set(URI.create("tcp://0.0.0.0:9090"));
             controllerURIDiscover.set(URI.create("pravega://0.0.0.0:9090"));
         }
+        log.info("ControllerURIDiscover ::{}", controllerURIDiscover.get());
 
         final ClientConfig clientConfig = Utils.buildClientConfig(controllerURIDirect.get());
         log.info("Test tcp:// with no controller instances running");

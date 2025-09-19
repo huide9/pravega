@@ -1,20 +1,27 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.test.system;
 
+import io.pravega.client.control.impl.Controller;
+import io.pravega.client.control.impl.ControllerImpl;
 import io.pravega.client.stream.EventWriterConfig;
 import io.pravega.client.stream.ScalingPolicy;
+import io.pravega.client.stream.Stream;
 import io.pravega.client.stream.StreamConfiguration;
 import io.pravega.client.stream.impl.ClientFactoryImpl;
-import io.pravega.client.stream.impl.Controller;
-import io.pravega.client.stream.impl.ControllerImpl;
 import io.pravega.client.stream.impl.JavaSerializer;
 import io.pravega.client.stream.impl.StreamImpl;
 import io.pravega.common.concurrent.ExecutorServiceHelpers;
@@ -30,7 +37,6 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.atomic.AtomicBoolean;
 import lombok.extern.slf4j.Slf4j;
@@ -62,7 +68,7 @@ public class AutoScaleTest extends AbstractScaleTests {
     @Rule
     public Timeout globalTimeout = Timeout.seconds(10 * 60);
 
-    private final ScheduledExecutorService scaleExecutorService = Executors.newScheduledThreadPool(5);
+    private final ScheduledExecutorService scaleExecutorService = ExecutorServiceHelpers.newScheduledThreadPool(5, "autoscaletest");
 
     @Environment
     public static void initialize() {
@@ -201,7 +207,7 @@ public class AutoScaleTest extends AbstractScaleTests {
         ControllerImpl controller = getController();
         final AtomicBoolean exit = new AtomicBoolean(false);
         ClientFactoryImpl clientFactory = getClientFactory();
-        startWritingIntoTxn(clientFactory.createTransactionalEventWriter(SCALE_UP_TXN_STREAM_NAME, new JavaSerializer<>(),
+        startWritingIntoTxn(clientFactory.createTransactionalEventWriter("writer", SCALE_UP_TXN_STREAM_NAME, new JavaSerializer<>(),
                 EventWriterConfig.builder().build()), exit);
 
         // overall wait for test to complete in 260 seconds (4.2 minutes) or scale up, whichever happens first.
@@ -216,6 +222,8 @@ public class AutoScaleTest extends AbstractScaleTests {
                                 log.info("txn test scale up done successfully");
                                 exit.set(true);
                             }
-                        }), scaleExecutorService);
+                        }).thenRun(() -> controller.listCompletedTransactions(Stream.of(SCOPE, SCALE_UP_TXN_STREAM_NAME))
+                                        .thenAccept(txnList -> log.info("No of completed txn {}", txnList.size()))),
+                        scaleExecutorService);
     }
 }

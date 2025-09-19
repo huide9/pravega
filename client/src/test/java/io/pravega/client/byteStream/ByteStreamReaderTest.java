@@ -1,11 +1,17 @@
 /**
- * Copyright (c) 2018 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.client.byteStream;
 
@@ -16,8 +22,8 @@ import io.pravega.client.stream.StreamConfiguration;
 import io.pravega.client.stream.mock.MockConnectionFactoryImpl;
 import io.pravega.client.stream.mock.MockController;
 import io.pravega.client.stream.mock.MockSegmentStreamFactory;
-import io.pravega.shared.protocol.netty.ConnectionFailedException;
 import io.pravega.shared.protocol.netty.PravegaNodeUri;
+import io.pravega.test.common.AssertExtensions;
 import lombok.Cleanup;
 import org.junit.After;
 import org.junit.Before;
@@ -35,7 +41,7 @@ public class ByteStreamReaderTest {
     private ByteStreamClientFactory clientFactory;
 
     @Before
-    public void setup() throws ConnectionFailedException {
+    public void setup() {
         PravegaNodeUri endpoint = new PravegaNodeUri("localhost", 0);
         connectionFactory = new MockConnectionFactoryImpl();
         controller = new MockController(endpoint.getEndpoint(), endpoint.getPort(), connectionFactory, false);
@@ -50,8 +56,8 @@ public class ByteStreamReaderTest {
 
     @After
     public void teardown() {
-        clientFactory.close();
         controller.close();
+        clientFactory.close();
         connectionFactory.close();
     }
     
@@ -60,6 +66,7 @@ public class ByteStreamReaderTest {
         @Cleanup
         ByteStreamWriter writer = clientFactory.createByteStreamWriter(STREAM);
         byte[] value = new byte[] { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 };
+        int headOffset = 0;
         writer.write(value);
         writer.flush();
         @Cleanup
@@ -67,8 +74,14 @@ public class ByteStreamReaderTest {
         for (int i = 0; i < 10; i++) {
             assertEquals(i, reader.read());
         }
+        assertEquals(headOffset, reader.fetchHeadOffset());
+        assertEquals(value.length, reader.fetchTailOffset());
+        headOffset = 3;
+        writer.truncateDataBefore(headOffset);
         writer.write(value);
         writer.flush();
+        assertEquals(headOffset, reader.fetchHeadOffset());
+        assertEquals(value.length * 2, reader.fetchTailOffset());
         byte[] read = new byte[5];
         assertEquals(5, reader.read(read));
         assertArrayEquals(new byte[] { 0, 1, 2, 3, 4 }, read);
@@ -116,4 +129,20 @@ public class ByteStreamReaderTest {
         assertEquals(5, reader.available());
     }
 
+    @Test
+    public void testInvalidStream() {
+        String stream1 = "invalidstream1";
+        controller.createStream(SCOPE, stream1, StreamConfiguration.builder()
+                                                                  .scalingPolicy(ScalingPolicy.fixed(2))
+                                                                  .build());
+        AssertExtensions.assertThrows(IllegalStateException.class, () -> clientFactory.createByteStreamReader(stream1));
+        AssertExtensions.assertThrows(IllegalStateException.class, () -> clientFactory.createByteStreamWriter(stream1));
+        String stream2 = "invalidstream2";
+        controller.createStream(SCOPE, stream2, StreamConfiguration.builder()
+                                                                  .scalingPolicy(ScalingPolicy.fixed(1))
+                                                                  .build());
+        controller.sealStream(SCOPE, stream2);
+        clientFactory.createByteStreamReader(stream2);
+        AssertExtensions.assertThrows(IllegalStateException.class, () -> clientFactory.createByteStreamWriter(stream2));
+    }
 }

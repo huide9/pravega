@@ -1,11 +1,17 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.client.segment.impl;
 
@@ -28,7 +34,16 @@ public interface SegmentInputStream extends AutoCloseable {
      *
      * @param offset The offset to set.
      */
-    public abstract void setOffset(long offset);
+    default void setOffset( long offset) {
+        setOffset(offset, false);
+    }
+
+    /**
+     * Sets the offset for reading from the segment.
+     * @param offset The offset to set.
+     * @param resendRequest Resend the read request in-case there is an already pending read request for the offset.
+     */
+    public abstract void setOffset(long offset, boolean resendRequest);
 
     /**
      * Gets the current offset. (Passing this to setOffset in the future will reset reads to the
@@ -62,7 +77,7 @@ public interface SegmentInputStream extends AutoCloseable {
      * 
      * @return A future that will be completed when there is data available to read.
      */
-    public abstract CompletableFuture<Void> fillBuffer();
+    public abstract CompletableFuture<?> fillBuffer();
     
     /**
      * Closes this InputStream. No further methods may be called after close.

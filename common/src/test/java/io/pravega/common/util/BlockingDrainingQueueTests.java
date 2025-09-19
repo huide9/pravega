@@ -1,21 +1,34 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.common.util;
 
+import com.google.common.annotations.VisibleForTesting;
 import io.pravega.common.concurrent.Futures;
 import io.pravega.test.common.AssertExtensions;
+import io.pravega.test.common.ThreadPooledTestSuite;
+import java.time.Duration;
 import java.util.Collection;
 import java.util.Queue;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import lombok.Cleanup;
 import lombok.val;
 import org.junit.Assert;
@@ -24,24 +37,32 @@ import org.junit.Test;
 /**
  * Unit tests for BlockingDrainingQueue class.
  */
-public class BlockingDrainingQueueTests {
+public class BlockingDrainingQueueTests extends ThreadPooledTestSuite {
     private static final int ITEM_COUNT = 100;
     private static final int MAX_READ_COUNT = ITEM_COUNT / 10;
     private static final int TIMEOUT_MILLIS = 10 * 1000;
+
+    @Override
+    protected int getThreadPoolSize() {
+        return 1;
+    }
 
     /**
      * Tests the basic ability dequeue items using poll() as they are added.
      */
     @Test
-    public void testAddSinglePoll() throws Exception {
+    public void testAddSinglePoll() {
         @Cleanup
         BlockingDrainingQueue<Integer> queue = new BlockingDrainingQueue<>();
 
         for (int i = 0; i < ITEM_COUNT; i++) {
             queue.add(i);
+            Assert.assertEquals("Unexpected first element.", i, (int) queue.peek());
             Queue<Integer> entries = queue.poll(MAX_READ_COUNT);
             Assert.assertEquals("Unexpected number of items polled.", 1, entries.size());
+            Assert.assertFalse(entries.isEmpty());
             Assert.assertEquals("Unexpected value polled from queue.", i, (int) entries.peek());
+            Assert.assertNull("Unexpected first element after removal", queue.peek());
         }
 
         val remainingItems = queue.poll(1);
@@ -52,7 +73,7 @@ public class BlockingDrainingQueueTests {
      * Tests the basic ability to dequeue items using take() as they are added.
      */
     @Test
-    public void testAddSingleTake() throws Exception {
+    public void testAddSingleTake() {
         @Cleanup
         BlockingDrainingQueue<Integer> queue = new BlockingDrainingQueue<>();
 
@@ -62,6 +83,7 @@ public class BlockingDrainingQueueTests {
             Assert.assertTrue("take() returned an incomplete Future when data is available.", Futures.isSuccessful(takeResult));
             val entries = takeResult.join();
             Assert.assertEquals("Unexpected number of items polled.", 1, entries.size());
+            Assert.assertFalse(entries.isEmpty());
             Assert.assertEquals("Unexpected value polled from queue.", i, (int) entries.peek());
         }
 
@@ -73,7 +95,7 @@ public class BlockingDrainingQueueTests {
      * Tests the basic ability to dequeue items as a batch using poll().
      */
     @Test
-    public void testAddMultiPoll() throws Exception {
+    public void testAddMultiPoll() {
         @Cleanup
         BlockingDrainingQueue<Integer> queue = new BlockingDrainingQueue<>();
         populate(queue);
@@ -94,7 +116,7 @@ public class BlockingDrainingQueueTests {
      * Tests the basic ability to dequeue items as a batch using take().
      */
     @Test
-    public void testAddMultiTake() throws Exception {
+    public void testAddMultiTake() {
         @Cleanup
         BlockingDrainingQueue<Integer> queue = new BlockingDrainingQueue<>();
         populate(queue);
@@ -149,10 +171,90 @@ public class BlockingDrainingQueueTests {
         Assert.assertTrue("Queue did not unblock after adding a value.", Futures.isSuccessful(takeResult));
         Queue<Integer> result = takeResult.join();
         Assert.assertEquals("Unexpected number of items polled.", 1, result.size());
+        Assert.assertFalse(result.isEmpty());
         Assert.assertEquals("Unexpected value polled from queue.", valueToQueue, (int) result.peek());
 
         val remainingItems = queue.poll(MAX_READ_COUNT);
         Assert.assertEquals("Queue was not emptied out after take() completed successfully.", 0, remainingItems.size());
+    }
+
+    /**
+     * Tests {@link AbstractDrainingQueue#take(int, Duration, ScheduledExecutorService)}.
+     */
+    @Test
+    public void testTakeTimeout() throws Exception {
+        final int valueToQueue = 1234;
+        final Duration shortTimeout = Duration.ofMillis(10);
+
+        @Cleanup
+        BlockingDrainingQueue<Integer> queue = new BlockingDrainingQueue<>();
+        val timedoutTake = queue.take(MAX_READ_COUNT, shortTimeout, executorService());
+        AssertExtensions.assertSuppliedFutureThrows(
+                "take did not time out",
+                () -> timedoutTake,
+                ex -> ex instanceof TimeoutException);
+
+        val finalTake = queue.take(MAX_READ_COUNT, Duration.ofMillis(TIMEOUT_MILLIS), executorService());
+        AssertExtensions.assertThrows(
+                "take() succeeded even though there was another incomplete take() request.",
+                () -> queue.take(MAX_READ_COUNT),
+                ex -> ex instanceof IllegalStateException);
+
+        AssertExtensions.assertThrows(
+                "poll() succeeded even though there was another incomplete take() request.",
+                () -> queue.poll(MAX_READ_COUNT),
+                ex -> ex instanceof IllegalStateException);
+
+        queue.add(valueToQueue);
+
+        val result = finalTake.get(TIMEOUT_MILLIS, TimeUnit.MILLISECONDS);
+
+        Assert.assertEquals("Unexpected number of items polled.", 1, result.size());
+        Assert.assertFalse(result.isEmpty());
+        Assert.assertEquals("Unexpected value polled from queue.", valueToQueue, (int) result.peek());
+
+        val remainingItems = queue.poll(MAX_READ_COUNT);
+        Assert.assertEquals("Queue was not emptied out after take() completed successfully.", 0, remainingItems.size());
+    }
+
+    /**
+     * Tests a case where the result from {@link AbstractDrainingQueue#take(int, Duration, ScheduledExecutorService)}
+     * is completed concurrently with it timing out.
+     */
+    @Test
+    public void testTakeCompleteTimeoutConcurrently() throws Exception {
+        final int valueToQueue = 1234;
+        final Duration shortTimeout = Duration.ofMillis(TIMEOUT_MILLIS);
+
+        // We create an InterceptableQueue, which allows us to customize the CompletableFuture returned by take().
+        @Cleanup
+        InterceptableQueue queue = new InterceptableQueue();
+
+        // We use a special Executor that allows us to intercept calls to schedule().
+        @Cleanup("shutdownNow")
+        val e = new MockExecutor(1);
+
+        // Register a take() with a timeout (the timeout value is irrelevant for this test).
+        InterceptableFuture<Queue<Integer>> takeFuture = (InterceptableFuture<Queue<Integer>>) queue.take(1, shortTimeout, e);
+
+        // Fetch the intercepted calls.
+        val timeoutRunnable = e.lastScheduledRunnable;
+        Assert.assertNotNull("Unable to intercept the schedule() runnable.", timeoutRunnable);
+        Assert.assertNotNull("Unable to intercept take() future creation.", takeFuture);
+
+        // When CompletableFuture.complete() is invoked (from the BlockingDrainingQueue.add() method), we want to
+        // immediately invoke the timeout runnable, before we actually complete the CompletableFuture. We want to verify
+        // that the timeout won't preempt the normal completion of the future, which would have caused us to lose data.
+        takeFuture.completeInterceptor = timeoutRunnable;
+
+        // Add a value, which should trigger the take() future to complete.
+        queue.add(valueToQueue);
+
+        // Verify result is as expected.
+        val takeResult = takeFuture.get(TIMEOUT_MILLIS, TimeUnit.MILLISECONDS);
+        Assert.assertEquals(1, takeResult.size());
+        Assert.assertFalse(takeResult.isEmpty());
+        Assert.assertEquals(valueToQueue, (long) takeResult.peek());
     }
 
     /**
@@ -172,15 +274,17 @@ public class BlockingDrainingQueueTests {
 
         val takeResult2 = queue.take(MAX_READ_COUNT);
         queue.add(valueToQueue);
+        val takeResult2Value = takeResult2.get(TIMEOUT_MILLIS, TimeUnit.MILLISECONDS);
+        Assert.assertFalse(takeResult2Value.isEmpty());
         Assert.assertEquals("take() did not work again after being cancelled.", valueToQueue,
-                (int) takeResult2.get(TIMEOUT_MILLIS, TimeUnit.MILLISECONDS).poll());
+                (int) takeResult2Value.poll());
     }
 
     /**
      * Tests the ability of the queue to cancel a take() request if it is closed.
      */
     @Test
-    public void testCloseCancel() throws Exception {
+    public void testCloseCancel() {
         @Cleanup
         BlockingDrainingQueue<Integer> queue = new BlockingDrainingQueue<>();
         CompletableFuture<Queue<Integer>> result = queue.take(MAX_READ_COUNT);
@@ -198,7 +302,7 @@ public class BlockingDrainingQueueTests {
      * Tests the ability of the queue to return its contents when it is closed.
      */
     @Test
-    public void testCloseResult() throws Exception {
+    public void testCloseResult() {
         @Cleanup
         BlockingDrainingQueue<Integer> queue = new BlockingDrainingQueue<>();
         populate(queue);
@@ -218,4 +322,54 @@ public class BlockingDrainingQueueTests {
             queue.add(i);
         }
     }
+
+    //region Helper classes
+
+    /**
+     * {@link ScheduledThreadPoolExecutor} that intercepts any calls to {@link #schedule(Runnable, long, TimeUnit)},
+     * captures the {@link Runnable} passed to it and returns a null result.
+     */
+    private static class MockExecutor extends ScheduledThreadPoolExecutor {
+        volatile Runnable lastScheduledRunnable;
+
+        public MockExecutor(int corePoolSize) {
+            super(corePoolSize);
+        }
+
+        @Override
+        public ScheduledFuture<?> schedule(Runnable command, long delay, TimeUnit unit) {
+            this.lastScheduledRunnable = command;
+            return null;
+        }
+    }
+
+    /**
+     * {@link BlockingDrainingQueue} that intercepts the creation of the {@link CompletableFuture} returned by
+     * {@link #take} and returns an instance of {@link InterceptableFuture}.
+     */
+    private static class InterceptableQueue extends BlockingDrainingQueue<Integer> {
+        @Override
+        @VisibleForTesting
+        protected CompletableFuture<Queue<Integer>> newTakeResult() {
+            return new InterceptableFuture<>();
+        }
+    }
+
+    /**
+     * {@link CompletableFuture} that allows the interception of the {@link #complete} method.
+     */
+    private static class InterceptableFuture<T> extends CompletableFuture<T> {
+        volatile Runnable completeInterceptor;
+
+        @Override
+        public boolean complete(T value) {
+            Runnable i = this.completeInterceptor;
+            if (i != null) {
+                i.run();
+            }
+            return super.complete(value);
+        }
+    }
+
+    //endregion
 }

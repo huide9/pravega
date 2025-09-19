@@ -1,22 +1,29 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.test.system;
 
+import io.pravega.client.ClientConfig;
 import io.pravega.client.admin.ReaderGroupManager;
 import io.pravega.client.admin.StreamManager;
 import io.pravega.client.admin.impl.StreamManagerImpl;
 import io.pravega.client.stream.ScalingPolicy;
 import io.pravega.client.stream.StreamConfiguration;
 import io.pravega.client.stream.impl.ClientFactoryImpl;
-import io.pravega.client.stream.impl.ControllerImpl;
-import io.pravega.client.stream.impl.ControllerImplConfig;
+import io.pravega.client.control.impl.ControllerImpl;
+import io.pravega.client.control.impl.ControllerImplConfig;
 import io.pravega.common.Exceptions;
 import io.pravega.common.concurrent.ExecutorServiceHelpers;
 import io.pravega.common.concurrent.Futures;
@@ -87,7 +94,7 @@ public class ReadWriteAndAutoScaleWithFailoverTest extends AbstractFailoverTests
         // Fetch all the RPC endpoints and construct the client URIs.
         final List<String> uris = conURIs.stream().filter(ISGRPC).map(URI::getAuthority).collect(Collectors.toList());
 
-        controllerURIDirect = URI.create("tcp://" + String.join(",", uris));
+        controllerURIDirect = Utils.getControllerURI(uris);
         log.info("Controller Service direct URI: {}", controllerURIDirect);
 
         // Verify segment store is running.
@@ -102,17 +109,18 @@ public class ReadWriteAndAutoScaleWithFailoverTest extends AbstractFailoverTests
                                                                                   "ReadWriteAndAutoScaleWithFailoverTest-controller");
 
         //get Controller Uri
+        ClientConfig clientConfig = Utils.buildClientConfig(controllerURIDirect);
         controller = new ControllerImpl(ControllerImplConfig.builder()
-                                                            .clientConfig(Utils.buildClientConfig(controllerURIDirect))
+                                                            .clientConfig(clientConfig)
                                                             .maxBackoffMillis(5000).build(),
                                         controllerExecutorService);
         testState = new TestState(false);
-        streamManager = new StreamManagerImpl(Utils.buildClientConfig(controllerURIDirect));
+        streamManager = new StreamManagerImpl(clientConfig);
         createScopeAndStream(scope, AUTO_SCALE_STREAM, config, streamManager);
         log.info("Scope passed to client factory {}", scope);
 
-        clientFactory = new ClientFactoryImpl(scope, controller);
-        readerGroupManager = ReaderGroupManager.withScope(scope, Utils.buildClientConfig(controllerURIDirect));
+        clientFactory = new ClientFactoryImpl(scope, controller, clientConfig);
+        readerGroupManager = ReaderGroupManager.withScope(scope, clientConfig);
     }
 
     @After

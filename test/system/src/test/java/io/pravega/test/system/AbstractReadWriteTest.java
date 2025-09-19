@@ -1,16 +1,21 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.test.system;
 
 import com.google.common.base.Preconditions;
-import io.netty.util.internal.ConcurrentSet;
 import io.pravega.client.EventStreamClientFactory;
 import io.pravega.client.admin.ReaderGroupManager;
 import io.pravega.client.stream.EventRead;
@@ -34,6 +39,7 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentSkipListSet;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
@@ -56,13 +62,14 @@ abstract class AbstractReadWriteTest extends AbstractSystemTest {
 
     static final String RK_VALUE_SEPARATOR = ":";
     static final int WRITER_MAX_BACKOFF_MILLIS = 5 * 1000;
-    static final int WRITER_MAX_RETRY_ATTEMPTS = 20;
+    static final int WRITER_MAX_RETRY_ATTEMPTS = 30;
     static final int NUM_EVENTS_PER_TRANSACTION = 50;
     static final int RK_RENEWAL_RATE_TRANSACTION = NUM_EVENTS_PER_TRANSACTION / 2;
-    static final int TRANSACTION_TIMEOUT = 59 * 1000;
+    static final int TRANSACTION_TIMEOUT = 119 * 1000;
     static final int RK_RENEWAL_RATE_WRITER = 500;
     static final int SCALE_WAIT_ITERATIONS = 12;
-    private static final int READ_TIMEOUT = 1000;
+    private static final int READ_TIMEOUT = 10000;
+    private static final int WRITE_THROTTLING_TIME = 100;
 
     final String readerName = "reader";
     ScheduledExecutorService executorService;
@@ -91,8 +98,8 @@ abstract class AbstractReadWriteTest extends AbstractSystemTest {
         final CompletableFuture<Void> newWritersComplete = new CompletableFuture<>();
         final CompletableFuture<Void> readersComplete = new CompletableFuture<>();
         final List<CompletableFuture<Void>> txnStatusFutureList = synchronizedList(new ArrayList<>());
-        final ConcurrentSet<UUID> committingTxn = new ConcurrentSet<>();
-        final ConcurrentSet<UUID> abortedTxn = new ConcurrentSet<>();
+        final ConcurrentSkipListSet<UUID> committingTxn = new ConcurrentSkipListSet<>();
+        final ConcurrentSkipListSet<UUID> abortedTxn = new ConcurrentSkipListSet<>();
         final boolean txnWrite;
 
         final AtomicLong writtenEvents = new AtomicLong();
@@ -179,7 +186,7 @@ abstract class AbstractReadWriteTest extends AbstractSystemTest {
             long seqNumber = 0;
             while (!stopFlag.get()) {
                 try {
-                    Exceptions.handleInterrupted(() -> Thread.sleep(100));
+                    Exceptions.handleInterrupted(() -> Thread.sleep(WRITE_THROTTLING_TIME));
 
                     // The content of events is generated following the pattern routingKey:seq_number, where
                     // seq_number is monotonically increasing for every routing key, being the expected delta between
@@ -225,6 +232,7 @@ abstract class AbstractReadWriteTest extends AbstractSystemTest {
                     String uniqueRoutingKey = transaction.getTxnId().toString();
                     long seqNumber = 0;
                     for (int j = 1; j <= NUM_EVENTS_PER_TRANSACTION; j++) {
+                        Exceptions.handleInterrupted(() -> Thread.sleep(WRITE_THROTTLING_TIME));
                         // The content of events is generated following the pattern routingKey:seq_number. In this case,
                         // the context of the routing key is the transaction.
                         transaction.writeEvent(uniqueRoutingKey, uniqueRoutingKey + RK_VALUE_SEPARATOR + seqNumber);
@@ -280,7 +288,7 @@ abstract class AbstractReadWriteTest extends AbstractSystemTest {
                         // seq_number + 1. This ensures that readers receive events in the same order that writers
                         // produced them and that there are no duplicate or missing events.
                         final String[] keyAndSeqNum = event.split(RK_VALUE_SEPARATOR);
-                        final long seqNumber = Long.valueOf(keyAndSeqNum[1]);
+                        final long seqNumber = Long.parseLong(keyAndSeqNum[1]);
                         testState.routingKeySeqNumber.compute(keyAndSeqNum[0], (rk, currentSeqNum) -> {
                             if (currentSeqNum != null && currentSeqNum + 1 != seqNumber) {
                                 throw new AssertionError("Event order violated at " + currentSeqNum + " by " + seqNumber);
@@ -406,15 +414,15 @@ abstract class AbstractReadWriteTest extends AbstractSystemTest {
                 EventWriterConfig.builder().build());
         for (int i = initialPoint; i < totalEvents + initialPoint; i++) {
             writer.writeEvent(String.format("%03d", i)).join(); // this ensures the event size is constant.
-            log.debug("Writing event: {} to stream {}.", streamName + String.valueOf(i), streamName);
+            log.debug("Writing event: {} to stream {}.", streamName + i, streamName);
         }
+        log.info("Writer {} finished writing {} events.", writer, totalEvents - initialPoint);
     }
 
     <T extends Serializable> List<CompletableFuture<Integer>> readEventFutures(EventStreamClientFactory client, String rGroup, int numReaders, int limit) {
         List<EventStreamReader<T>> readers = new ArrayList<>();
         for (int i = 0; i < numReaders; i++) {
-            readers.add(client.createReader(rGroup + "-" + String.valueOf(i), rGroup,
-                    new JavaSerializer<>(), ReaderConfig.builder().build()));
+            readers.add(client.createReader(rGroup + "-" + i, rGroup, new JavaSerializer<>(), ReaderConfig.builder().build()));
         }
 
         return readers.stream().map(r -> CompletableFuture.supplyAsync(() -> readEvents(r, limit / numReaders))).collect(toList());
@@ -437,7 +445,7 @@ abstract class AbstractReadWriteTest extends AbstractSystemTest {
             for (int i = 0; i < writers; i++) {
                 log.info("Starting writer: {} (is transactional? {})", i, isTransactionalWriter);
                 final CompletableFuture<Void> writerFuture = isTransactionalWriter ?
-                        startWritingIntoTxn(instantiateTransactionalWriter(clientFactory, stream)) :
+                        startWritingIntoTxn(instantiateTransactionalWriter("writer-" + i, clientFactory, stream)) :
                         startWriting(instantiateWriter(clientFactory, stream));
                 Futures.exceptionListener(writerFuture, t -> log.error("Error while writing events:", t));
                 writerFutureList.add(writerFuture);
@@ -453,9 +461,10 @@ abstract class AbstractReadWriteTest extends AbstractSystemTest {
         return clientFactory.createEventWriter(stream, new JavaSerializer<>(), buildWriterConfig());
     }
 
-    private <T extends Serializable> TransactionalEventStreamWriter<T> instantiateTransactionalWriter(EventStreamClientFactory clientFactory,
+    private <T extends Serializable> TransactionalEventStreamWriter<T> instantiateTransactionalWriter(String writerId,
+                                                                                                      EventStreamClientFactory clientFactory,
                                                                                                       String stream) {
-        return clientFactory.createTransactionalEventWriter(stream, new JavaSerializer<>(), buildWriterConfig());
+        return clientFactory.createTransactionalEventWriter(writerId, stream, new JavaSerializer<T>(), buildWriterConfig());
     }
 
     private EventWriterConfig buildWriterConfig() {
@@ -545,7 +554,7 @@ abstract class AbstractReadWriteTest extends AbstractSystemTest {
         } finally {
             closeReader(reader);
         }
-
+        log.info("Reader {} finished reading {} events (limit was {}).", reader, validEvents, limit);
         return validEvents;
     }
 

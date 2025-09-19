@@ -1,11 +1,17 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.segmentstore.server.host;
 
@@ -15,6 +21,7 @@ import io.pravega.common.Exceptions;
 import io.pravega.common.LoggerHelpers;
 import io.pravega.common.cluster.Host;
 import io.pravega.common.cluster.HostContainerMap;
+import io.pravega.common.concurrent.AsyncSemaphore;
 import io.pravega.common.concurrent.Futures;
 import io.pravega.common.util.CollectionHelpers;
 import io.pravega.segmentstore.server.ContainerHandle;
@@ -51,6 +58,7 @@ import org.apache.curator.utils.ZKPaths;
  * and starts or stops appropriate segment containers locally. Any start failures are periodically retried until
  * the desired ownership state is achieved.
  */
+@SuppressWarnings("deprecation")
 @Slf4j
 public class ZKSegmentContainerMonitor implements AutoCloseable {
 
@@ -75,8 +83,11 @@ public class ZKSegmentContainerMonitor implements AutoCloseable {
     // we don't initiate conflicting tasks for the same containerId.
     private final Set<Integer> pendingTasks;
     private final ScheduledExecutorService executor;
-    private AtomicReference<ScheduledFuture<?>> assigmentTask;
+    private AtomicReference<ScheduledFuture<?>> assignmentTask;
     private final AtomicLong lastReportTime;
+
+    // Throttle the max number of parallel container starts/recoveries.
+    private final AsyncSemaphore parallelContainerStartsSemaphore;
 
     /**
      * Creates an instance of ZKSegmentContainerMonitor.
@@ -86,8 +97,9 @@ public class ZKSegmentContainerMonitor implements AutoCloseable {
      * @param pravegaServiceEndpoint The pravega endpoint for which we need to fetch the container assignment.
      */
     ZKSegmentContainerMonitor(SegmentContainerRegistry containerRegistry, CuratorFramework zkClient,
-                              Host pravegaServiceEndpoint, ScheduledExecutorService executor) {
+                              Host pravegaServiceEndpoint, int parallelContainerStarts, ScheduledExecutorService executor) {
         Preconditions.checkNotNull(zkClient, "zkClient");
+        Preconditions.checkArgument(parallelContainerStarts > 0, "parallelContainerStarts");
 
         this.registry = Preconditions.checkNotNull(containerRegistry, "containerRegistry");
         this.host = Preconditions.checkNotNull(pravegaServiceEndpoint, "pravegaServiceEndpoint");
@@ -96,8 +108,9 @@ public class ZKSegmentContainerMonitor implements AutoCloseable {
         this.pendingTasks = new ConcurrentSkipListSet<>();
         String clusterPath = ZKPaths.makePath("cluster", "segmentContainerHostMapping");
         this.hostContainerMapNode = new NodeCache(zkClient, clusterPath);
-        this.assigmentTask = new AtomicReference<>();
+        this.assignmentTask = new AtomicReference<>();
         this.lastReportTime = new AtomicLong(CURRENT_TIME_MILLIS.get());
+        this.parallelContainerStartsSemaphore = new AsyncSemaphore(parallelContainerStarts, 0, this.getClass().getName());
     }
 
     /**
@@ -112,14 +125,14 @@ public class ZKSegmentContainerMonitor implements AutoCloseable {
     public void initialize(Duration monitorInterval) {
         Exceptions.checkNotClosed(closed.get(), this);
 
-        // Start loading the segment container to node assigment map from zookeeper.
+        // Start loading the segment container to node assignment map from zookeeper.
         this.hostContainerMapNode.start();
 
         // There are two triggers for the segment container monitor.
         // 1. On any segment container ownership changes notified via zookeeper. We will ensure the local containers
         //      are stopped/started according to the new ownership mapping.
         // 2. At scheduled intervals to perform retries on local segment container start failures.
-        this.assigmentTask.set(this.executor.scheduleWithFixedDelay(
+        this.assignmentTask.set(this.executor.scheduleWithFixedDelay(
                 this::checkAssignment, 0L, monitorInterval.getSeconds(), TimeUnit.SECONDS));
         this.hostContainerMapNode.getListenable().addListener(this::checkAssignment, this.executor);
     }
@@ -134,7 +147,7 @@ public class ZKSegmentContainerMonitor implements AutoCloseable {
             log.warn("Failed to close hostContainerMapNode", e);
         }
 
-        val task = this.assigmentTask.getAndSet(null);
+        val task = this.assignmentTask.getAndSet(null);
         if (task != null) {
             task.cancel(true);
         }
@@ -242,8 +255,7 @@ public class ZKSegmentContainerMonitor implements AutoCloseable {
         log.info("Starting Container {}.", containerId);
         this.pendingTasks.add(containerId);
         try {
-            return this.registry
-                    .startContainer(containerId, INIT_TIMEOUT_PER_CONTAINER)
+            return this.parallelContainerStartsSemaphore.run(() -> this.registry.startContainer(containerId, INIT_TIMEOUT_PER_CONTAINER), 1, false)
                     .whenComplete((handle, ex) -> {
                         try {
                             if (ex == null) {
@@ -262,6 +274,8 @@ public class ZKSegmentContainerMonitor implements AutoCloseable {
                             // should be available immediately after the task is complete.
                             // Also need to ensure this is always called, hence doing this in a finally block.
                             this.pendingTasks.remove(containerId);
+                            this.parallelContainerStartsSemaphore.release(1);
+                            log.info("Current ongoing Segment Container starts {}.", this.parallelContainerStartsSemaphore.getUsedCredits());
                         }
                     });
         } catch (Throwable e) {

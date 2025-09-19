@@ -1,11 +1,17 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.client.stream;
 
@@ -53,6 +59,14 @@ public interface EventRead<T> {
      * @return true if this is a checkpoint.
      */
     boolean isCheckpoint();
+
+    /**
+     * A boolean indicating if all events in the stream read completely.
+     * This is true when the streams are sealed and all events in the streams have already been read.
+     *
+     * @return true if all events in the stream read completely.
+     */
+    boolean isReadCompleted();
     
     /**
      * If a checkpoint has been requested this will return the checkpointName passed to

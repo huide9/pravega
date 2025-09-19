@@ -1,18 +1,24 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.segmentstore.server.logs;
 
 import com.google.common.base.Preconditions;
 import io.pravega.common.Exceptions;
 import io.pravega.common.ObjectClosedException;
-import io.pravega.common.util.SequencedItemList;
+import io.pravega.segmentstore.contracts.SequencedElement;
 import io.pravega.segmentstore.server.logs.operations.CompletableOperation;
 import io.pravega.segmentstore.storage.DurableDataLog;
 import io.pravega.segmentstore.storage.LogAddress;
@@ -37,7 +43,7 @@ import lombok.extern.slf4j.Slf4j;
  */
 @Slf4j
 @NotThreadSafe
-class DataFrameBuilder<T extends SequencedItemList.Element> implements AutoCloseable {
+public class DataFrameBuilder<T extends SequencedElement> implements AutoCloseable {
     //region Members
 
     private final DataFrameOutputStream outputStream;
@@ -62,13 +68,13 @@ class DataFrameBuilder<T extends SequencedItemList.Element> implements AutoClose
      * @param args          Arguments for the Builder.
      * @throws NullPointerException If any of the arguments are null.
      */
-    DataFrameBuilder(DurableDataLog targetLog, Serializer<T> serializer, Args args) {
+    public DataFrameBuilder(DurableDataLog targetLog, Serializer<T> serializer, Args args) {
         this.targetLog = Preconditions.checkNotNull(targetLog, "targetLog");
         this.serializer = Preconditions.checkNotNull(serializer, "serializer");
         this.args = Preconditions.checkNotNull(args, "args");
         Preconditions.checkNotNull(args.commitSuccess, "args.commitSuccess");
         Preconditions.checkNotNull(args.commitFailure, "args.commitFailure");
-        this.outputStream = new DataFrameOutputStream(targetLog.getMaxAppendLength(), this::handleDataFrameComplete);
+        this.outputStream = new DataFrameOutputStream(targetLog.getWriteSettings().getMaxWriteLength(), this::handleDataFrameComplete);
         this.lastSerializedSequenceNumber = -1;
         this.lastStartedSequenceNumber = -1;
         this.failureCause = new AtomicReference<>();
@@ -95,10 +101,9 @@ class DataFrameBuilder<T extends SequencedItemList.Element> implements AutoClose
      * Forces a flush of the current DataFrame. This should be invoked if there are no more items to add to the current
      * DataFrame, but it is desired to have its outstanding contents flushed to the underlying DurableDataLog.
      */
-    void flush() {
+    public void flush() {
         Exceptions.checkNotClosed(this.closed.get(), this);
         this.outputStream.flush();
-        this.outputStream.releaseBuffer();
     }
 
     /**
@@ -106,7 +111,7 @@ class DataFrameBuilder<T extends SequencedItemList.Element> implements AutoClose
      *
      * @return The causing exception, or null if none.
      */
-    Throwable failureCause() {
+    public Throwable failureCause() {
         return this.failureCause.get();
     }
 
@@ -126,7 +131,7 @@ class DataFrameBuilder<T extends SequencedItemList.Element> implements AutoClose
      *                              the LogItem failed to commit to the DataFrameLog.
      * @throws ObjectClosedException If the DataFrameBuilder is closed (or in in a failed state) and cannot be used anymore.
      */
-    void append(T logItem) throws IOException {
+    public void append(T logItem) throws IOException {
         Exceptions.checkNotClosed(this.closed.get(), this);
         long seqNo = logItem.getSequenceNumber();
         Exceptions.checkArgument(this.lastSerializedSequenceNumber < seqNo, "logItem",
@@ -224,7 +229,7 @@ class DataFrameBuilder<T extends SequencedItemList.Element> implements AutoClose
     /**
      * Contains Information about the committal of a DataFrame.
      */
-    static class CommitArgs {
+    public static class CommitArgs {
         /**
          * The Sequence Number of the last LogItem that was fully serialized (and committed).
          * If this value is different than 'getLastStartedSequenceNumber' then we currently have a LogItem that was split
@@ -297,7 +302,7 @@ class DataFrameBuilder<T extends SequencedItemList.Element> implements AutoClose
     //region Args
 
     @RequiredArgsConstructor
-    static class Args {
+    public static class Args {
         /**
          * A Callback that will be invoked synchronously upon a DataFrame's sealing, and right before it is about to be
          * submitted to the DurableDataLog processor. The invocation of this method does not imply that the DataFrame

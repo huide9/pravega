@@ -1,11 +1,17 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.controller.store.stream.records;
 
@@ -21,17 +27,18 @@ import lombok.extern.slf4j.Slf4j;
 
 import java.io.IOException;
 
-/**
+/*
  * This is data class for storing stream cut with time when the cut was computed.
  * And the size of data being cut.
+ */
+
+/**
+ * Data Class representing individual retention set records where recording time and recording sizes are stored.
  */
 @Data
 @Builder
 @AllArgsConstructor
 @Slf4j
-/**
- * Data Class representing individual retention set records where recording time and recording sizes are stored.
- */
 public class StreamCutReferenceRecord {
     public static final StreamCutReferenceRecordSerializer SERIALIZER = new StreamCutReferenceRecordSerializer();
 
@@ -57,7 +64,13 @@ public class StreamCutReferenceRecord {
     public byte[] toBytes() {
         return SERIALIZER.serialize(this).getCopy();
     }
-    
+
+    @Override
+    public String toString() {
+        return String.format("%s = %s", "recordingTime", recordingTime) + "\n" +
+                String.format("%s = %s", "recordingSize", recordingSize);
+    }
+
     static class StreamCutReferenceRecordSerializer
             extends VersionedSerializer.WithBuilder<StreamCutReferenceRecord, StreamCutReferenceRecordBuilder> {
         @Override

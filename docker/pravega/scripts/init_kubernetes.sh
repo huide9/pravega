@@ -1,12 +1,18 @@
 #!/bin/sh
 #
-# Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+# Copyright Pravega Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 #
 
 k8() {
@@ -47,25 +53,46 @@ init_kubernetes() {
         local podname=${POD_NAME}
         export PUBLISHED_ADDRESS=""
         export PUBLISHED_PORT=""
+        local service=$( k8 "${ns}" "services" "${podname}" .kind )
+
+        if [[  "${service}" != "Service" ]];
+        then 
+            echo "Failed to get External Service. Exiting..."
+            exit 1     
+        fi
+
+	export PUBLISHED_ADDRESS=$( k8 "${ns}" "services" "${podname}" ".metadata.annotations[\"external-dns.alpha.kubernetes.io/hostname\"]" )
+
+        if [[ -n ${PUBLISHED_ADDRESS} && "${PUBLISHED_ADDRESS:${#PUBLISHED_ADDRESS}-1}" == "." ]];
+        then
+          export PUBLISHED_ADDRESS=${PUBLISHED_ADDRESS::-1}
+        fi
 
         service_type=$( k8 "${ns}" "services" "${podname}" ".spec.type" )
         if [ "${service_type}" == "LoadBalancer" ]; then
             while [ -z ${PUBLISHED_ADDRESS} ] || [ -z ${PUBLISHED_PORT} ]
             do
-                echo "Trying to obtain LoadBalancer external endpoint..."
-                sleep 10
-                export PUBLISHED_ADDRESS=$( k8 "${ns}" "services" "${podname}" ".status.loadBalancer.ingress[0].ip" )
-                export PUBLISHED_PORT=$( k8 "${ns}" "services" "${podname}" ".spec.ports[].port" )
+                if [ -z ${PUBLISHED_ADDRESS} ]; then
+		        echo "Trying to obtain LoadBalancer external endpoint..."
+		        sleep 10
+                	export PUBLISHED_ADDRESS=$( k8 "${ns}" "services" "${podname}" ".status.loadBalancer.ingress[0].ip" )
+                	if [ -z "${PUBLISHED_ADDRESS}" ]; then
+                    		export PUBLISHED_ADDRESS=$( k8 "${ns}" "services" "${podname}" ".status.loadBalancer.ingress[0].hostname" )
+                	fi
+		fi
+                export PUBLISHED_PORT=$( k8 "${ns}" "services" "${podname}" ".spec.ports[0].port" )
             done
         elif [ "${service_type}" == "NodePort" ]; then
             nodename=$( k8 "${ns}" "pods" "${podname}" ".spec.nodeName" )
             while [ -z ${PUBLISHED_ADDRESS} ] || [ -z ${PUBLISHED_PORT} ]
             do
-                echo "Trying to obtain NodePort external endpoint..."
-                sleep 10
-                export PUBLISHED_ADDRESS=$( k8 "" "nodes" "${nodename}" ".status.addresses[] | select(.type == \"ExternalIP\") | .address" )
-                export PUBLISHED_PORT=$( k8 "${ns}" "services" "${podname}" ".spec.ports[].nodePort" )
-            done
+                if [ -z ${PUBLISHED_ADDRESS} ]; then
+		  echo "Trying to obtain NodePort external endpoint..."
+                  sleep 10
+                  export PUBLISHED_ADDRESS=$( k8 "" "nodes" "${nodename}" ".status.addresses[] | select(.type == \"ExternalIP\") | .address" )
+                  export PUBLISHED_PORT=$( k8 "${ns}" "services" "${podname}" ".spec.ports[0].nodePort" )
+            	fi
+	    done
         else
             echo "Unexpected service type ${service_type}. Exiting..."
             exit 1

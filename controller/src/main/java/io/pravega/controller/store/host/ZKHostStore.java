@@ -1,11 +1,17 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.controller.store.host;
 
@@ -14,13 +20,12 @@ import com.google.common.base.Preconditions;
 import io.pravega.common.cluster.Host;
 import io.pravega.common.cluster.HostContainerMap;
 import io.pravega.controller.util.ZKUtils;
+import io.pravega.shared.NameUtils;
 import io.pravega.shared.segment.SegmentToContainerMapper;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicReference;
-
-import io.pravega.shared.segment.StreamSegmentNameUtils;
 import lombok.SneakyThrows;
 import lombok.Synchronized;
 import lombok.extern.slf4j.Slf4j;
@@ -33,6 +38,7 @@ import javax.annotation.concurrent.GuardedBy;
 /**
  * Zookeeper based implementation of the HostControllerStore.
  */
+@SuppressWarnings("deprecation")
 @Slf4j
 public class ZKHostStore implements HostControllerStore {
 
@@ -43,7 +49,7 @@ public class ZKHostStore implements HostControllerStore {
     private final CuratorFramework zkClient;
 
     private final Object lock = new Object();
-    
+
     @GuardedBy("$lock")
     //To bootstrap zookeeper on first use.
     private boolean zkInit = false;
@@ -54,20 +60,22 @@ public class ZKHostStore implements HostControllerStore {
 
     private final AtomicReference<HostContainerMap> hostContainerMap;
     /**
-     * The tests can add listeners to get notification when the update has happed in the store. 
+     * The tests can add listeners to get notification when the update has happened in the store.
      */
     private final AtomicReference<Listener> listenerRef;
     /**
      * Zookeeper based host store implementation.
      *
      * @param client                    The curator client instance.
+     * @param containerCount            Number of containers in the system.
      */
-    ZKHostStore(CuratorFramework client, int containerCount) {
+    @VisibleForTesting
+    public ZKHostStore(CuratorFramework client, int containerCount) {
         Preconditions.checkNotNull(client, "client");
 
         zkClient = client;
         zkPath = ZKPaths.makePath("cluster", "segmentContainerHostMapping");
-        segmentMapper = new SegmentToContainerMapper(containerCount);
+        segmentMapper = new SegmentToContainerMapper(containerCount, true);
         hostContainerMapNode = new NodeCache(zkClient, zkPath);
         hostContainerMap = new AtomicReference<>(HostContainerMap.EMPTY);
         listenerRef = new AtomicReference<>();
@@ -78,7 +86,7 @@ public class ZKHostStore implements HostControllerStore {
     @SneakyThrows(Exception.class)
     private void tryInit() {
         if (!zkInit) {
-            // we are making remote calls under a lock but this is only done for initialization at 
+            // we are making remote calls under a lock but this is only done for initialization at
             // the start of controller process.
             ZKUtils.createPathIfNotExists(zkClient, zkPath, HostContainerMap.EMPTY.toBytes());
             hostContainerMapNode.getListenable().addListener(this::updateMap);
@@ -104,7 +112,7 @@ public class ZKHostStore implements HostControllerStore {
 
         return hostContainerMap.get().getHostContainerMap();
     }
-    
+
     @Override
     public void updateHostContainersMap(Map<Host, Set<Integer>> newMapping) {
         Preconditions.checkNotNull(newMapping, "newMapping");
@@ -121,25 +129,25 @@ public class ZKHostStore implements HostControllerStore {
     private Host getHostForContainer(int containerId) {
         tryInit();
 
-        // Note: the reference for hostContainerMap may be updated as we are accessing it. However, the map is immutable. 
+        // Note: the reference for hostContainerMap may be updated as we are accessing it. However, the map is immutable.
         Optional<Host> host = hostContainerMap.get().getHostContainerMap().entrySet().stream()
                                      .filter(x -> x.getValue().contains(containerId)).map(Map.Entry::getKey).findAny();
         if (host.isPresent()) {
             log.debug("Found owning host: {} for containerId: {}", host.get(), containerId);
             return host.get();
         } else {
-            throw new HostStoreException("Could not find host for container id: " + String.valueOf(containerId));
+            throw new HostStoreException("Could not find host for container id: " + containerId);
         }
     }
-    
+
     @Override
     public int getContainerCount() {
         return segmentMapper.getTotalContainerCount();
     }
-    
+
     @Override
     public Host getHostForSegment(String scope, String stream, long segmentId) {
-        String qualifiedName = StreamSegmentNameUtils.getQualifiedStreamSegmentName(scope, stream, segmentId);
+        String qualifiedName = NameUtils.getQualifiedStreamSegmentName(scope, stream, segmentId);
         return getHostForContainer(segmentMapper.getContainerId(qualifiedName));
     }
 
@@ -147,17 +155,17 @@ public class ZKHostStore implements HostControllerStore {
     public Host getHostForTableSegment(String tableName) {
         return getHostForContainer(segmentMapper.getContainerId(tableName));
     }
-    
+
     @VisibleForTesting
     public void addListener(Listener listener) {
         this.listenerRef.set(listener);
     }
-    
+
+    /**
+     * Functional interface to notify tests about changes to the map as they occur.
+     */
     @VisibleForTesting
     @FunctionalInterface
-    /**
-     * Functional interface to notify tests about changes to the map as they occur.  
-     */
     public interface Listener {
         void signal();
     }

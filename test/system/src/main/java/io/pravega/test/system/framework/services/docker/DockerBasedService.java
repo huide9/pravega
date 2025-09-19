@@ -1,11 +1,17 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.test.system.framework.services.docker;
 
@@ -20,36 +26,39 @@ import com.spotify.docker.client.messages.swarm.PortConfig;
 import com.spotify.docker.client.messages.swarm.Service;
 import com.spotify.docker.client.messages.swarm.ServiceMode;
 import com.spotify.docker.client.messages.swarm.ServiceSpec;
+import com.spotify.docker.client.messages.swarm.Task;
 import com.spotify.docker.client.messages.swarm.TaskSpec;
 import com.spotify.docker.client.messages.swarm.TaskStatus;
 import io.pravega.common.Exceptions;
+import io.pravega.common.concurrent.ExecutorServiceHelpers;
 import io.pravega.common.concurrent.Futures;
-import static io.pravega.test.system.framework.DockerBasedTestExecutor.DOCKER_CLIENT_PORT;
-import static org.junit.Assert.assertNotNull;
 import io.pravega.test.system.framework.TestFrameworkException;
 import io.pravega.test.system.framework.Utils;
-import lombok.extern.slf4j.Slf4j;
 import java.net.URI;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
-import com.spotify.docker.client.messages.swarm.Task;
+import lombok.extern.slf4j.Slf4j;
+
+import static io.pravega.test.system.framework.DockerBasedTestExecutor.DOCKER_CLIENT_PORT;
+import static org.junit.Assert.assertNotNull;
 
 @Slf4j
 public abstract class DockerBasedService implements io.pravega.test.system.framework.services.Service {
 
     static final int ZKSERVICE_ZKPORT = 2181;
     static final String IMAGE_PATH = Utils.isAwsExecution() ? "" :  System.getProperty("dockerImageRegistry") + "/";
+    static final String IMAGE_PREFIX = System.getProperty("imagePrefix", "pravega") + "/";
+    static final String PRAVEGA_IMAGE_NAME = System.getProperty("pravegaImageName", "pravega") + ":";
     static final String PRAVEGA_VERSION = System.getProperty("imageVersion");
     static final String MASTER_IP = Utils.isAwsExecution() ? System.getProperty("awsMasterIP").trim() : System.getProperty("masterIP");
     private static final String CMD_SHELL = "CMD-SHELL"; // Docker Instruction used to run a health check command.
     final DockerClient dockerClient;
     final String serviceName;
-    private final ScheduledExecutorService executorService = Executors.newScheduledThreadPool(3);
+    private final ScheduledExecutorService executorService = ExecutorServiceHelpers.newScheduledThreadPool(3, "test");
 
     DockerBasedService(final String serviceName) {
         this.dockerClient = DefaultDockerClient.builder().uri("http://" + MASTER_IP + ":" + DOCKER_CLIENT_PORT).build();
@@ -122,7 +131,7 @@ public abstract class DockerBasedService implements io.pravega.test.system.frame
             long replicas = getReplicas();
             log.info("Replicas {}", replicas);
             log.info("Task running count {}", taskRunningCount);
-            if (((long) taskRunningCount) == replicas) {
+            if (taskRunningCount == replicas) {
                 return true;
             }
         } catch (DockerException e) {
@@ -180,7 +189,16 @@ public abstract class DockerBasedService implements io.pravega.test.system.frame
             String serviceId = getServiceID();
             EndpointSpec endpointSpec = Exceptions.handleInterruptedCall(() -> dockerClient.inspectService(serviceId).spec().endpointSpec());
             Service service = Exceptions.handleInterruptedCall(() -> dockerClient.inspectService(serviceId));
-            Exceptions.handleInterrupted(() -> dockerClient.updateService(serviceId, service.version().index(), ServiceSpec.builder().endpointSpec(endpointSpec).mode(ServiceMode.withReplicas(instanceCount)).taskTemplate(taskSpec).name(serviceName).networks(service.spec().networks()).build()));
+            Exceptions.handleInterrupted(
+                () -> dockerClient.updateService(
+                    serviceId, service.version().index(),
+                    ServiceSpec.builder()
+                               .endpointSpec(endpointSpec)
+                               .mode(ServiceMode.withReplicas(instanceCount))
+                               .taskTemplate(taskSpec)
+                               .name(serviceName)
+                               .networks(service.spec().networks())
+                               .build()));
             return Exceptions.handleInterruptedCall(() -> waitUntilServiceRunning());
         } catch (DockerException e) {
             throw new TestFrameworkException(TestFrameworkException.Type.RequestFailed, "Test failure: Unable to scale service to given instances=" + instanceCount, e);
@@ -221,7 +239,8 @@ public abstract class DockerBasedService implements io.pravega.test.system.frame
 
     // Default Health Check which uses netstat command to ensure the service is  up and running.
     List<String> defaultHealthCheck(int port) {
-        return  customHealthCheck("netstat -ltn 2> /dev/null | grep " + port + " || ss -ltn 2> /dev/null | grep " +  port + " || exit 1");
+        return customHealthCheck("netstat -ltn 2> /dev/null | grep " + port + " || ss -ltn 2> /dev/null | grep " + port
+                               + "  || echo ruok | nc 127.0.0.1 " + port + " 2> /dev/null | grep imok || exit 1");
     }
 
     //Custom Health check with the command provided by the service.

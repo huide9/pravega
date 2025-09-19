@@ -1,20 +1,31 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.common.util;
+
 import io.pravega.common.concurrent.Futures;
 import io.pravega.common.concurrent.SequentialProcessor;
+import java.util.Iterator;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
+import java.util.function.Function;
 import java.util.function.Predicate;
+import lombok.NonNull;
+import lombok.val;
 
 /**
  * Defines an Iterator for which every invocation results in an async call with a delayed response.
@@ -94,5 +105,50 @@ public interface AsyncIterator<T> {
                 return CompletableFuture.completedFuture(null);
             }
         });
+    }
+
+    /**
+     * Returns a new {@link AsyncIterator} that wraps this instance and converts all items from this one into items of a
+     * new type.
+     *
+     * @param converter A {@link Function} that will convert T to U.
+     * @param <U>       New type.
+     * @return A new {@link AsyncIterator}.
+     */
+    default <U> AsyncIterator<U> thenApply(@NonNull Function<? super T, ? extends U> converter) {
+        return () -> AsyncIterator.this.getNext().thenApply(item -> item == null ? null : converter.apply(item));
+    }
+
+    /**
+     * Returns a new {@link AsyncIterator} that wraps this instance and converts all items from this one into items of a
+     * new type using an async call.
+     *
+     * @param converter A {@link Function} that will convert T to U.
+     * @param <U>       New type.
+     * @return A new {@link AsyncIterator}.
+     */
+    default <U> AsyncIterator<U> thenCompose(@NonNull Function<? super T, CompletableFuture<U>> converter) {
+        return () -> AsyncIterator.this.getNext()
+                .thenCompose(item -> item == null ? CompletableFuture.completedFuture(null) : converter.apply(item));
+    }
+
+    /**
+     * Returns an {@link Iterator} that wraps this instance.
+     *
+     * @return A new {@link BlockingAsyncIterator} wrapping this instance.
+     */
+    default Iterator<T> asIterator() {
+        return new BlockingAsyncIterator<>(this);
+    }
+
+    /**
+     * Returns an {@link AsyncIterator} with exactly one item.
+     * @param item The Item to return
+     * @param <T> Item type.
+     * @return A singleton {@link AsyncIterator}.
+     */
+    static <T> AsyncIterator<T> singleton(T item) {
+        val returned = new AtomicBoolean(false);
+        return () -> CompletableFuture.completedFuture(returned.getAndSet(true) ? null : item);
     }
 }

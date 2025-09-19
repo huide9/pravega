@@ -1,11 +1,17 @@
 /**
- * Copyright (c) 2018 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.test.integration;
 
@@ -16,91 +22,48 @@ import io.pravega.client.admin.impl.StreamManagerImpl;
 import io.pravega.client.byteStream.ByteStreamReader;
 import io.pravega.client.byteStream.ByteStreamWriter;
 import io.pravega.client.byteStream.impl.ByteStreamClientImpl;
-import io.pravega.client.netty.impl.ConnectionFactoryImpl;
+import io.pravega.client.connection.impl.ConnectionFactory;
+import io.pravega.client.connection.impl.ConnectionPool;
+import io.pravega.client.connection.impl.ConnectionPoolImpl;
+import io.pravega.client.connection.impl.SocketConnectionFactoryImpl;
+import io.pravega.client.segment.impl.SegmentInputStreamFactoryImpl;
+import io.pravega.client.segment.impl.SegmentMetadataClientFactoryImpl;
+import io.pravega.client.segment.impl.SegmentOutputStreamFactoryImpl;
+import io.pravega.client.segment.impl.SegmentTruncatedException;
 import io.pravega.client.stream.StreamConfiguration;
-import io.pravega.client.stream.impl.Controller;
 import io.pravega.client.stream.impl.PendingEvent;
 import io.pravega.common.io.StreamHelpers;
-import io.pravega.segmentstore.contracts.StreamSegmentStore;
-import io.pravega.segmentstore.contracts.tables.TableStore;
-import io.pravega.segmentstore.server.host.handler.PravegaConnectionListener;
-import io.pravega.segmentstore.server.store.ServiceBuilder;
-import io.pravega.segmentstore.server.store.ServiceBuilderConfig;
 import io.pravega.test.common.AssertExtensions;
-import io.pravega.test.common.TestUtils;
-import io.pravega.test.common.TestingServerStarter;
-import io.pravega.test.integration.demo.ControllerWrapper;
+import io.pravega.test.common.LeakDetectorTestSuite;
 import java.io.IOException;
 import java.util.Arrays;
 import lombok.Cleanup;
+import lombok.SneakyThrows;
 import lombok.val;
 import lombok.extern.slf4j.Slf4j;
-import org.apache.curator.test.TestingServer;
-import org.junit.After;
-import org.junit.Before;
+import org.junit.ClassRule;
 import org.junit.Test;
+import org.mockito.Mockito;
 
+import static io.pravega.test.common.AssertExtensions.assertThrows;
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
 
 @Slf4j
-public class ByteStreamTest {
+public class ByteStreamTest extends LeakDetectorTestSuite {
 
-    private TestingServer zkTestServer = null;
-    private PravegaConnectionListener server = null;
-    private ControllerWrapper controllerWrapper = null;
-    private Controller controller = null;
-
-    @Before
-    public void setup() throws Exception {
-        final int controllerPort = TestUtils.getAvailableListenPort();
-        final String serviceHost = "localhost";
-        final int servicePort = TestUtils.getAvailableListenPort();
-        final int containerCount = 4;
-
-        // 1. Start ZK
-        this.zkTestServer = new TestingServerStarter().start();
-
-        // 2. Start Pravega SegmentStore service.
-        ServiceBuilder serviceBuilder = ServiceBuilder.newInMemoryBuilder(ServiceBuilderConfig.getDefaultConfig());
-        serviceBuilder.initialize();
-        StreamSegmentStore store = serviceBuilder.createStreamSegmentService();
-        TableStore tableStore = serviceBuilder.createTableStoreService();
-
-        this.server = new PravegaConnectionListener(false, servicePort, store,  tableStore);
-        this.server.startListening();
-
-        // 3. Start Pravega Controller service
-        this.controllerWrapper = new ControllerWrapper(zkTestServer.getConnectString(), false, controllerPort,
-                                                       serviceHost, servicePort, containerCount);
-        this.controllerWrapper.awaitRunning();
-        this.controller = controllerWrapper.getController();
-    }
-
-    @After
-    public void tearDown() throws Exception {
-        if (this.controllerWrapper != null) {
-            this.controllerWrapper.close();
-            this.controllerWrapper = null;
-        }
-        if (this.server != null) {
-            this.server.close();
-            this.server = null;
-        }
-        if (this.zkTestServer != null) {
-            this.zkTestServer.close();
-            this.zkTestServer = null;
-        }
-    }
+    @ClassRule
+    public static final PravegaResource PRAVEGA = new PravegaResource();
 
     @Test(timeout = 30000)
     public void readWriteTest() throws IOException {
         String scope = "ByteStreamTest";
-        String stream = "ReadWriteTest";
+        String stream = "readWriteTest";
 
         StreamConfiguration config = StreamConfiguration.builder().build();
         @Cleanup
-        StreamManager streamManager = new StreamManagerImpl(controller, null);
+        StreamManager streamManager = new StreamManagerImpl(PRAVEGA.getLocalController(), Mockito.mock(ConnectionPool.class));
         // create a scope
         Boolean createScopeStatus = streamManager.createScope(scope);
         log.info("Create scope status {}", createScopeStatus);
@@ -113,7 +76,9 @@ public class ByteStreamTest {
         byte[] payload = new byte[] { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 };
         byte[] readBuffer = new byte[10];
 
+        @Cleanup
         ByteStreamWriter writer = client.createByteStreamWriter(stream);
+        @Cleanup
         ByteStreamReader reader = client.createByteStreamReader(stream);
 
         AssertExtensions.assertBlocks(() -> reader.read(readBuffer), () -> writer.write(payload));
@@ -137,13 +102,66 @@ public class ByteStreamTest {
     }
 
     @Test(timeout = 30000)
-    public void readLargeWrite() throws IOException {
+    public void readWriteTestTruncate() throws IOException {
         String scope = "ByteStreamTest";
-        String stream = "ReadWriteTest";
+        String stream = "readWriteTestTruncate";
 
         StreamConfiguration config = StreamConfiguration.builder().build();
         @Cleanup
-        StreamManager streamManager = new StreamManagerImpl(controller, null);
+        StreamManager streamManager = new StreamManagerImpl(PRAVEGA.getLocalController(), Mockito.mock(ConnectionPool.class));
+        // create a scope
+        Boolean createScopeStatus = streamManager.createScope(scope);
+        log.info("Create scope status {}", createScopeStatus);
+        // create a stream
+        Boolean createStreamStatus = streamManager.createStream(scope, stream, config);
+        log.info("Create stream status {}", createStreamStatus);
+        @Cleanup
+        ByteStreamClientFactory client = createClientFactory(scope);
+
+        byte[] payload = new byte[]{0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+        byte[] readBuffer = new byte[10];
+
+        @Cleanup
+        ByteStreamWriter writer = client.createByteStreamWriter(stream);
+        @Cleanup
+        ByteStreamReader reader = client.createByteStreamReader(stream);
+        // Verify reads and writes.
+        AssertExtensions.assertBlocks(() -> reader.read(readBuffer), () -> writer.write(payload));
+        assertArrayEquals(payload, readBuffer);
+
+        //Truncate data before offset 5
+        writer.truncateDataBefore(5);
+
+        // seek to an invalid truncated offset and verify if truncation is successful.
+        reader.seekToOffset(reader.fetchHeadOffset() - 1);
+        assertThrows(SegmentTruncatedException.class, reader::read);
+
+        // seek to the new head and verify if we are able to read the data.
+        byte[] data = new byte[]{5, 6, 7, 8, 9};
+        reader.seekToOffset(reader.fetchHeadOffset());
+        byte[] readBuffer1 = new byte[5];
+        int bytesRead = reader.read(readBuffer1);
+        assertEquals(5, bytesRead);
+        assertArrayEquals(readBuffer1, data);
+
+        // create a new byteStream Reader.
+        ByteStreamReader reader1 = client.createByteStreamReader(stream);
+        // verify it is able to read
+        readBuffer1 = new byte[5];
+        bytesRead = reader1.read(readBuffer1);
+        //verify if all the bytes are read.
+        assertEquals(5, bytesRead);
+        assertArrayEquals(readBuffer1, data);
+    }
+
+    @Test(timeout = 30000)
+    public void readLargeWrite() throws IOException {
+        String scope = "ByteStreamTest";
+        String stream = "readLargeWrite";
+
+        StreamConfiguration config = StreamConfiguration.builder().build();
+        @Cleanup
+        StreamManager streamManager = new StreamManagerImpl(PRAVEGA.getLocalController(), Mockito.mock(ConnectionPool.class));
         // create a scope
         Boolean createScopeStatus = streamManager.createScope(scope);
         log.info("Create scope status {}", createScopeStatus);
@@ -158,7 +176,9 @@ public class ByteStreamTest {
         byte[] readBuffer = new byte[PendingEvent.MAX_WRITE_SIZE];
         Arrays.fill(readBuffer, (byte) 0);
 
+        @Cleanup
         ByteStreamWriter writer = client.createByteStreamWriter(stream);
+        @Cleanup
         ByteStreamReader reader = client.createByteStreamReader(stream);
         writer.write(payload);
         writer.closeAndSeal();
@@ -178,11 +198,11 @@ public class ByteStreamTest {
     @Test(timeout = 30000)
     public void testBlockingRead() throws IOException {
         String scope = "ByteStreamTest";
-        String stream = "ReadWriteTest";
+        String stream = "testBlockingRead";
 
         StreamConfiguration config = StreamConfiguration.builder().build();
         @Cleanup
-        StreamManager streamManager = new StreamManagerImpl(controller, null);
+        StreamManager streamManager = new StreamManagerImpl(PRAVEGA.getLocalController(), Mockito.mock(ConnectionPool.class));
         // create a scope
         Boolean createScopeStatus = streamManager.createScope(scope);
         log.info("Create scope status {}", createScopeStatus);
@@ -197,7 +217,9 @@ public class ByteStreamTest {
         byte[] readBuffer = new byte[200];
         Arrays.fill(readBuffer, (byte) 0);
 
+        @Cleanup
         ByteStreamWriter writer = client.createByteStreamWriter(stream);
+        @Cleanup
         ByteStreamReader reader = client.createByteStreamReader(stream);
         AssertExtensions.assertBlocks(() -> {
             assertEquals(100, reader.read(readBuffer));
@@ -218,10 +240,58 @@ public class ByteStreamTest {
         writer.closeAndSeal();
         assertEquals(-1, reader.read());
     }
-    
+
+    @Test(timeout = 30000)
+    public void testRecreateStream() {
+        String scope = "ByteStreamTest";
+        String stream = "testRecreateStream";
+
+        StreamConfiguration config = StreamConfiguration.builder().build();
+        @Cleanup
+        StreamManager streamManager = new StreamManagerImpl(PRAVEGA.getLocalController(), Mockito.mock(ConnectionPool.class));
+        // create a scope
+        streamManager.createScope(scope);
+        // create a stream
+        assertTrue("Create stream failed", streamManager.createStream(scope, stream, config));
+        // verify read and write.
+        verifyByteClientReadWrite(scope, stream);
+        // delete the stream and recreate
+        assertTrue("Seal stream operation failed", streamManager.sealStream(scope, stream));
+        assertTrue("Delete Stream operation failed", streamManager.deleteStream(scope, stream));
+        assertTrue("Recreate stream failed", streamManager.createStream(scope, stream, config));
+        // verify read and write.
+        verifyByteClientReadWrite(scope, stream);
+    }
+
+    @SneakyThrows(IOException.class)
+    private void verifyByteClientReadWrite(String scope, String stream) {
+        @Cleanup
+        ByteStreamClientFactory client = createClientFactory(scope);
+
+        byte[] payload = new byte[100];
+        Arrays.fill(payload, (byte) 1);
+        byte[] readBuffer = new byte[200];
+        Arrays.fill(readBuffer, (byte) 0);
+
+        @Cleanup
+        ByteStreamWriter writer = client.createByteStreamWriter(stream);
+        @Cleanup
+        ByteStreamReader reader = client.createByteStreamReader(stream);
+        AssertExtensions.assertBlocks(() -> {
+            assertEquals(100, reader.read(readBuffer));
+        }, () -> writer.write(payload));
+        assertEquals(1, readBuffer[99]);
+        assertEquals(0, readBuffer[100]);
+    }
+
     ByteStreamClientFactory createClientFactory(String scope) {
-        val connectionFactory = new ConnectionFactoryImpl(ClientConfig.builder().build());
-        return new ByteStreamClientImpl(scope, controller, connectionFactory);
+        ClientConfig config = ClientConfig.builder().build();
+        ConnectionFactory connectionFactory = new SocketConnectionFactoryImpl(config);
+        ConnectionPool pool = new ConnectionPoolImpl(config, connectionFactory);
+        val inputStreamFactory = new SegmentInputStreamFactoryImpl(PRAVEGA.getLocalController(), pool);
+        val outputStreamFactory = new SegmentOutputStreamFactoryImpl(PRAVEGA.getLocalController(), pool);
+        val metaStreamFactory = new SegmentMetadataClientFactoryImpl(PRAVEGA.getLocalController(), pool);
+        return new ByteStreamClientImpl(scope, PRAVEGA.getLocalController(), pool, inputStreamFactory, outputStreamFactory, metaStreamFactory);
     }
 
 }

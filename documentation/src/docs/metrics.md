@@ -1,11 +1,17 @@
 <!--
-Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+Copyright Pravega Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
 -->
 
 # Pravega Metrics
@@ -41,7 +47,7 @@ In the Pravega Metrics Framework, we use [Micrometer Metrics](https://micrometer
 
 ## Metrics Service Provider — Interface StatsProvider
 
-Pravega Metric Framework is initiated using the `StatsProvider` interface: it provides the _start_ and _stop_ methods for the Metric service. It also provides `startWithoutExporting()` for testing purpose, which only stores metrics in memory without exporting them to external systems. Currently we have support for [StatsD](https://github.com/b/statsd_spec) and [InfluxDB](https://www.influxdata.com/) registries.
+Pravega Metric Framework is initiated using the `StatsProvider` interface: it provides the _start_ and _stop_ methods for the Metric service. It also provides `startWithoutExporting()` for testing purpose, which only stores metrics in memory without exporting them to external systems. Currently we have support for [InfluxDB](https://www.influxdata.com/), [Prometheus](https://prometheus.io), and [StatsD](https://github.com/b/statsd_spec) registries.
 
 [StatsProvider](https://github.com/pravega/pravega/blob/master/shared/metrics/src/main/java/io/pravega/shared/metrics/StatsProvider.java)
 
@@ -244,7 +250,7 @@ Following are some common combinations of component and sub-components (or abstr
 - `segmentstore.bookkeeper`: Metrics related to Bookkeeper (Tier 1)
 - `segmentstore.container`: Metrics for Segment Containers
 - `segmentstore.thread_pool`: Metrics for Segment Store thread pool
-- `segmentstore.cache`: Cache-related metrics (RocksDB)
+- `segmentstore.cache`: Cache-related metrics
 - `controller.stream`: Metrics for operations on Streams (e.g., number of streams created)
 - `controller.segments`: Metrics about Segments, per Stream (e.g., count, splits, merges)
 - `controller.transactions`: Metrics related to Transactions (e.g., created, committed, aborted)

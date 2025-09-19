@@ -1,29 +1,42 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.segmentstore.server.containers;
 
 import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Preconditions;
 import io.pravega.common.Exceptions;
 import io.pravega.common.LoggerHelpers;
 import io.pravega.common.ObjectBuilder;
 import io.pravega.common.ObjectClosedException;
 import io.pravega.common.TimeoutTimer;
+import io.pravega.common.concurrent.FutureSupplier;
 import io.pravega.common.concurrent.Futures;
 import io.pravega.common.io.SerializationException;
 import io.pravega.common.io.serialization.RevisionDataInput;
 import io.pravega.common.io.serialization.RevisionDataOutput;
 import io.pravega.common.io.serialization.VersionedSerializer;
 import io.pravega.common.util.ArrayView;
+import io.pravega.common.util.BufferView;
+import io.pravega.segmentstore.contracts.AttributeId;
 import io.pravega.segmentstore.contracts.AttributeUpdate;
+import io.pravega.segmentstore.contracts.AttributeUpdateCollection;
+import io.pravega.segmentstore.contracts.AttributeUpdateType;
 import io.pravega.segmentstore.contracts.Attributes;
 import io.pravega.segmentstore.contracts.SegmentProperties;
+import io.pravega.segmentstore.contracts.SegmentType;
 import io.pravega.segmentstore.contracts.StreamSegmentExistsException;
 import io.pravega.segmentstore.contracts.StreamSegmentInformation;
 import io.pravega.segmentstore.contracts.StreamSegmentMergedException;
@@ -48,6 +61,8 @@ import java.util.stream.Collectors;
 import javax.annotation.concurrent.GuardedBy;
 import javax.annotation.concurrent.NotThreadSafe;
 import javax.annotation.concurrent.ThreadSafe;
+
+import io.pravega.shared.NameUtils;
 import lombok.Builder;
 import lombok.Data;
 import lombok.Getter;
@@ -56,6 +71,8 @@ import lombok.RequiredArgsConstructor;
 import lombok.SneakyThrows;
 import lombok.extern.slf4j.Slf4j;
 import lombok.val;
+
+import static io.pravega.segmentstore.server.containers.MetadataStore.SegmentInfo.newSegment;
 
 /**
  * Stores Segment Metadata information and assigns unique Ids to the same.
@@ -111,6 +128,17 @@ public abstract class MetadataStore implements AutoCloseable {
      */
     abstract CompletableFuture<Void> initialize(Duration timeout);
 
+    /**
+     * Unlike the initialize method which initializes blbank container metadata, this method
+     * takes in a SegmentProperties to initialize container metadata with. This method will be
+     * used for the recover-from-storage workflow, where we construct a SegmentProperties object
+     * for container metadata with data that is stored in storage.
+     * @param segmentProperties SegmentProperties of the recovered container metadata.
+     * @param timeout Timeout for the operation.
+     * @return A CompletableFuture that, when completed, will indicate the initialization is done.
+     */
+    abstract CompletableFuture<Void> recover(SegmentProperties segmentProperties, Duration timeout);
+
     //endregion
 
     //region Create Segments
@@ -119,6 +147,7 @@ public abstract class MetadataStore implements AutoCloseable {
      * Creates a new Segment with given name.
      *
      * @param segmentName The case-sensitive Segment Name.
+     * @param segmentType Type of Segment.
      * @param attributes  The initial attributes for the StreamSegment, if any.
      * @param timeout     Timeout for the operation.
      * @return A CompletableFuture that, when completed normally, will indicate the Segment has been created.
@@ -127,7 +156,11 @@ public abstract class MetadataStore implements AutoCloseable {
      * <li>{@link StreamSegmentExistsException} If the Segment already exists.
      * </ul>
      */
-    CompletableFuture<Void> createSegment(String segmentName, Collection<AttributeUpdate> attributes, Duration timeout) {
+    CompletableFuture<Void> createSegment(String segmentName, SegmentType segmentType, Collection<AttributeUpdate> attributes, Duration timeout) {
+        if (segmentType.isTransientSegment() && !NameUtils.isTransientSegment(segmentName)) {
+            return Futures.failedFuture(new IllegalArgumentException(String.format("Invalid name %s for SegmentType: %s", segmentName, segmentType)));
+        }
+
         long traceId = LoggerHelpers.traceEnterWithContext(log, traceObjectId, "createSegment", segmentName);
         long segmentId = this.connector.containerMetadata.getStreamSegmentId(segmentName, true);
         if (isValidSegmentId(segmentId)) {
@@ -135,8 +168,11 @@ public abstract class MetadataStore implements AutoCloseable {
             return Futures.failedFuture(new StreamSegmentExistsException(segmentName));
         }
 
-        ArrayView segmentInfo = SegmentInfo.serialize(SegmentInfo.newSegment(segmentName, attributes));
-        CompletableFuture<Void> result = createSegment(segmentName, segmentInfo, new TimeoutTimer(timeout));
+        ArrayView segmentInfo = SegmentInfo.serialize(SegmentInfo.newSegment(segmentName, segmentType, attributes));
+        CompletableFuture<Void> result = segmentType.isTransientSegment() ?
+                createTransientSegment(segmentName, attributes, timeout) :
+                createSegment(segmentName, segmentInfo, new TimeoutTimer(timeout));
+
         if (log.isTraceEnabled()) {
             result.thenAccept(v -> LoggerHelpers.traceLeave(log, traceObjectId, "createSegment", traceId, segmentName));
         }
@@ -153,6 +189,20 @@ public abstract class MetadataStore implements AutoCloseable {
      * @return A CompletableFuture that, when completed, will indicate that the Segment has been successfully created.
      */
     protected abstract CompletableFuture<Void> createSegment(String segmentName, ArrayView segmentInfo, TimeoutTimer timer);
+
+    /**
+     * Creates a new Transient Segment with given name.
+     *
+     * @param segmentName The case-sensitive Segment Name.
+     * @param attributes  The initial attributes for the StreamSegment, if any.
+     * @param timeout     Timeout for the operation.
+     * @return A CompletableFuture that, when completed normally, will indicate the TransientSegment has been created.
+     */
+    private CompletableFuture<Void> createTransientSegment(String segmentName, Collection<AttributeUpdate> attributes, Duration timeout) {
+        AttributeUpdateCollection attrs = AttributeUpdateCollection.from(attributes);
+        attrs.add(new AttributeUpdate(Attributes.CREATION_EPOCH, AttributeUpdateType.None, this.connector.containerMetadata.getContainerEpoch()));
+        return Futures.toVoid(submitAssignmentWithRetry(newSegment(segmentName, SegmentType.TRANSIENT_SEGMENT, attrs), timeout));
+    }
 
     //endregion
 
@@ -243,17 +293,11 @@ public abstract class MetadataStore implements AutoCloseable {
         CompletableFuture<SegmentProperties> result;
         if (isValidSegmentId(streamSegmentId)) {
             // Looks like the Segment is active and we have it in our Metadata. Return the result from there.
-            SegmentMetadata sm = this.connector.containerMetadata.getStreamSegmentMetadata(streamSegmentId);
-            if (sm.isDeleted() || sm.isMerged()) {
-                result = Futures.failedFuture(new StreamSegmentNotExistsException(segmentName));
-            } else {
-                result = CompletableFuture.completedFuture(sm.getSnapshot());
-            }
+            result = getSegmentSnapshot(streamSegmentId, segmentName);
         } else {
             // The Segment is not yet active.
             // First, check to see if we have a pending assignment. If so, piggyback on that.
-            QueuedCallback<SegmentProperties> queuedCallback = checkConcurrentAssignment(segmentName,
-                    id -> CompletableFuture.completedFuture(this.connector.containerMetadata.getStreamSegmentMetadata(id).getSnapshot()));
+            QueuedCallback<SegmentProperties> queuedCallback = checkConcurrentAssignment(segmentName, id -> getSegmentSnapshot(id, segmentName));
 
             if (queuedCallback != null) {
                 result = queuedCallback.result;
@@ -268,6 +312,23 @@ public abstract class MetadataStore implements AutoCloseable {
     }
 
     /**
+     * Creates a new {@link SegmentProperties} instance representing the current state of the given segment in the metadata.
+     *
+     * @param segmentId   The Id of the Segment.
+     * @param segmentName The Name of the Segment.
+     * @return A CompletableFuture that either contains a {@link SegmentProperties} with the current state of the segment
+     * or is failed with {@link StreamSegmentNotExistsException} if the Segment does not exist anymore.
+     */
+    private CompletableFuture<SegmentProperties> getSegmentSnapshot(long segmentId, String segmentName) {
+        SegmentMetadata sm = this.connector.containerMetadata.getStreamSegmentMetadata(segmentId);
+        if (sm == null || sm.isDeleted() || sm.isMerged()) {
+            return Futures.failedFuture(new StreamSegmentNotExistsException(segmentName));
+        } else {
+            return CompletableFuture.completedFuture(sm.getSnapshot());
+        }
+    }
+
+    /**
      * Gets raw information about a Segment, as it exists in the Metadata Store. This is a sequence of bytes that can
      * be deserialized into a {@link SegmentInfo}.
      *
@@ -279,7 +340,7 @@ public abstract class MetadataStore implements AutoCloseable {
      * <li>{@link StreamSegmentNotExistsException} If the Segment already exists.
      * </ul>
      */
-    protected abstract CompletableFuture<ArrayView> getSegmentInfoInternal(String segmentName, Duration timeout);
+    protected abstract CompletableFuture<BufferView> getSegmentInfoInternal(String segmentName, Duration timeout);
 
     /**
      * Updates information about a Segment.
@@ -422,7 +483,7 @@ public abstract class MetadataStore implements AutoCloseable {
     }
 
     /**
-     * Invokes the {@link Connector#getMapSegmentId()} callback in order to assign an Id to a Segment. Upon completion,
+     * Invokes the {@link MetadataStore.Connector#getMapSegmentId()} callback in order to assign an Id to a Segment. Upon completion,
      * this operation will have mapped the given Segment to a new internal Segment Id if none was provided in the given
      * SegmentInfo. If the given SegmentInfo already has a SegmentId set, then all efforts will be made to map that Segment
      * with the requested Segment Id.
@@ -441,16 +502,56 @@ public abstract class MetadataStore implements AutoCloseable {
             return Futures.failedFuture(new StreamSegmentNotExistsException(properties.getName()));
         }
 
-        long existingSegmentId = this.connector.containerMetadata.getStreamSegmentId(properties.getName(), true);
+        long existingSegmentId = this.connector.getContainerMetadata().getStreamSegmentId(properties.getName(), true);
         if (isValidSegmentId(existingSegmentId)) {
-            // Looks like someone else beat us to it.
-            completeAssignment(properties.getName(), existingSegmentId);
-            return CompletableFuture.completedFuture(existingSegmentId);
+            // Looks like someone else beat us to it. Still, we need to know if the Segment needs to be pinned.
+            return pinSegment(existingSegmentId, properties.getName(), pin, timeout);
         } else {
+            String streamSegmentName = properties.getName();
             return this.connector.getMapSegmentId()
-                                 .apply(segmentInfo.getSegmentId(), segmentInfo.getProperties(), pin, timeout)
-                                 .thenApply(id -> completeAssignment(properties.getName(), id));
+                                 .apply(segmentInfo.getSegmentId(), properties, pin, timeout)
+                                 .thenApply(id -> completeAssignment(streamSegmentName, id));
         }
+    }
+
+    /**
+     * Marks an existing Segment as pinned to the in-memory metadata, if needed.
+     *
+     * @param segmentId Segment id of the Segment to pin.
+     * @param segmentName Name of the Segment.
+     * @param pin Whether we should pin the Segment to memory.
+     * @param timeout Timeout for the operation.
+     * @return A {@link CompletableFuture} that, when completed normally, will return the id of the Segment pinned to memory.
+     */
+    private CompletableFuture<Long> pinSegment(long segmentId, String segmentName, boolean pin, Duration timeout) {
+        boolean needsToBePinned = pin && !this.connector.getContainerMetadata().getStreamSegmentMetadata(segmentId).isPinned();
+        CompletableFuture<Boolean> pinFuture = needsToBePinned ?
+                this.connector.getPinSegment().apply(segmentId, segmentName, pin, timeout) :
+                CompletableFuture.completedFuture(false);
+        return pinFuture.thenCompose(pinned -> {
+            if (pinned) {
+                log.info("{}: Segment {} ({}) has been pinned to memory.", this.traceObjectId, segmentId, segmentName);
+            }
+            completeAssignment(segmentName, segmentId);
+            return CompletableFuture.completedFuture(segmentId);
+        });
+    }
+
+    /**
+     * Pins an existing Segment with given name to memory, so it cannot get evicted from metadata.
+     *
+     * @param segmentName The case-sensitive Segment Name.
+     * @param timeout     Timeout for the operation.
+     * @return A CompletableFuture that, when completed normally, when completed normally, will return the id of the
+     * Segment pinned to memory. If the operation failed, this will contain the exception that caused the failure.
+     */
+    CompletableFuture<Long> pinSegmentToMemory(String segmentName, Duration timeout) {
+        long existingSegmentId = this.connector.getContainerMetadata().getStreamSegmentId(segmentName, true);
+        if (!isValidSegmentId(existingSegmentId)) {
+            return Futures.failedFuture(new StreamSegmentNotExistsException(segmentName));
+        }
+
+        return pinSegment(existingSegmentId, segmentName, true, timeout);
     }
 
     /**
@@ -458,7 +559,7 @@ public abstract class MetadataStore implements AutoCloseable {
      */
     private long completeAssignment(String streamSegmentName, long streamSegmentId) {
         assert streamSegmentId != ContainerMetadata.NO_STREAM_SEGMENT_ID : "no valid streamSegmentId given";
-        finishPendingRequests(streamSegmentName, PendingRequest::complete, streamSegmentId);
+        finishPendingRequests(streamSegmentName, PendingRequest::complete, streamSegmentId, true);
         return streamSegmentId;
     }
 
@@ -466,10 +567,10 @@ public abstract class MetadataStore implements AutoCloseable {
      * Fails the assignment for the given StreamSegment Id with the given reason.
      */
     private void failAssignment(String streamSegmentName, Throwable reason) {
-        finishPendingRequests(streamSegmentName, PendingRequest::completeExceptionally, reason);
+        finishPendingRequests(streamSegmentName, PendingRequest::completeExceptionally, reason, false);
     }
 
-    private <T> void finishPendingRequests(String streamSegmentName, BiConsumer<PendingRequest, T> completionMethod, T completionArgument) {
+    private <T> void finishPendingRequests(String streamSegmentName, BiConsumer<PendingRequest, T> completionMethod, T completionArgument, boolean isSuccess) {
         assert streamSegmentName != null : "no streamSegmentName given";
         // Get any pending requests and complete all of them, in order. We are running this in a loop (and replacing
         // the existing PendingRequest with an empty one) because more requests may come in while we are executing the
@@ -482,12 +583,19 @@ public abstract class MetadataStore implements AutoCloseable {
                 if (pendingRequest == null || pendingRequest.callbacks.size() == 0) {
                     // No more requests. Safe to exit.
                     break;
-                } else {
+                } else if (isSuccess) {
                     this.pendingRequests.put(streamSegmentName, new PendingRequest());
                 }
             }
 
             completionMethod.accept(pendingRequest, completionArgument);
+            if (!isSuccess) {
+                // If failed, we do not guarantee ordering (as it doesn't make any sense). This helps solve a situation
+                // where an inexistent segment is queried, then immediately created and then queried again. If we do not
+                // break here, it is possible that the first rejection (since it doesn't exist) may incorrectly spill over
+                // to the second attempt when the segment actually exists.
+                break;
+            }
         }
     }
 
@@ -525,9 +633,9 @@ public abstract class MetadataStore implements AutoCloseable {
      * @param <T>   Return type of Future.
      * @return A CompletableFuture with the result, or failure cause.
      */
-    private <T> CompletableFuture<T> retryWithCleanup(Supplier<CompletableFuture<T>> toTry) {
+    private <T> CompletableFuture<T> retryWithCleanup(FutureSupplier<T> toTry) {
         CompletableFuture<T> result = new CompletableFuture<>();
-        toTry.get()
+        toTry.getFuture()
              .thenAccept(result::complete)
              .exceptionally(ex -> {
                  // Check if the exception indicates the Metadata has reached capacity. In that case, force a cleanup
@@ -537,7 +645,10 @@ public abstract class MetadataStore implements AutoCloseable {
                          log.debug("{}: Forcing metadata cleanup due to capacity exceeded ({}).", this.traceObjectId,
                                  Exceptions.unwrap(ex).getMessage());
 
-                         CompletableFuture<T> f = this.connector.getMetadataCleanup().get().thenComposeAsync(v -> toTry.get(), this.executor);
+                         CompletableFuture<T> f = this.connector.getMetadataCleanup()
+                                                                .get()
+                                                                .thenComposeAsync(v -> toTry.getFuture(),
+                                                                                  this.executor);
                          f.thenAccept(result::complete);
                          Futures.exceptionListener(f, result::completeExceptionally);
                      } else {
@@ -599,6 +710,12 @@ public abstract class MetadataStore implements AutoCloseable {
         @NonNull
         private Supplier<CompletableFuture<Void>> metadataCleanup;
 
+        /**
+         * A Function that, when invoked, updates the metadata of an existing Segment by setting the pinned flag.
+         */
+        @NonNull
+        private final PinSegment pinSegment;
+
         @FunctionalInterface
         public interface MapSegmentId {
             CompletableFuture<Long> apply(long segmentId, SegmentProperties segmentProperties, boolean pin, Duration timeout);
@@ -612,6 +729,11 @@ public abstract class MetadataStore implements AutoCloseable {
         @FunctionalInterface
         public interface LazyDeleteSegment {
             CompletableFuture<Void> apply(long segmentId, Duration timeout);
+        }
+
+        @FunctionalInterface
+        public interface PinSegment {
+            CompletableFuture<Boolean> apply(long segmentId, String segmentName, boolean pin, Duration timeout);
         }
     }
 
@@ -666,23 +788,52 @@ public abstract class MetadataStore implements AutoCloseable {
 
     @Data
     @Builder
-    protected static class SegmentInfo {
+    public static class SegmentInfo {
         private static final SegmentInfoSerializer SERIALIZER = new SegmentInfoSerializer();
         private final long segmentId;
         private final SegmentProperties properties;
 
-        static SegmentInfo newSegment(String name, Collection<AttributeUpdate> attributeUpdates) {
+        static SegmentInfo newSegment(String name, SegmentType segmentType, Collection<AttributeUpdate> attributeUpdates) {
             val infoBuilder = StreamSegmentInformation
                     .builder()
                     .name(name);
-            if (attributeUpdates != null) {
-                infoBuilder.attributes(attributeUpdates.stream().collect(Collectors.toMap(AttributeUpdate::getAttributeId, AttributeUpdate::getValue)));
-            }
+            val attributes = attributeUpdates == null
+                    ? new HashMap<AttributeId, Long>()
+                    : attributeUpdates.stream().collect(Collectors.toMap(AttributeUpdate::getAttributeId, AttributeUpdate::getValue));
+            attributes.put(Attributes.ATTRIBUTE_SEGMENT_TYPE, segmentType.getValue());
+
+            // Validate ATTRIBUTE_ID_LENGTH. This is an unmodifiable attribute, so this is the only time we can possibly set it.
+            // If it's not set, then this is a Stream Segment - so all attributes are UUIDs.
+            val idLength = attributes.getOrDefault(Attributes.ATTRIBUTE_ID_LENGTH, 0L);
+            Preconditions.checkArgument(idLength >= 0 && idLength <= AttributeId.MAX_LENGTH,
+                    "ATTRIBUTE_ID_LENGTH must be a value in the interval [0, %s]. Given: %s.", AttributeId.MAX_LENGTH, idLength);
+
+            infoBuilder.attributes(attributes);
 
             return builder()
                     .segmentId(ContainerMetadata.NO_STREAM_SEGMENT_ID)
                     .properties(infoBuilder.build())
                     .build();
+        }
+
+        /**
+         * The method takes in details of a segment i.e., name, length and sealed status and creates a
+         * {@link StreamSegmentInformation} instance, which is returned after serialization.
+         * @param streamSegmentName     The name of the segment.
+         * @param length                The length of the segment.
+         * @param isSealed              The sealed status of the segment.
+         * @return                      An instance of ArrayView with segment information.
+         */
+        static ArrayView recoveredSegment(String streamSegmentName, long length, boolean isSealed) {
+            StreamSegmentInformation segmentProp = StreamSegmentInformation.builder()
+                    .name(streamSegmentName)
+                    .length(length)
+                    .sealed(isSealed)
+                    .build();
+            return serialize(builder()
+                    .segmentId(ContainerMetadata.NO_STREAM_SEGMENT_ID)
+                    .properties(segmentProp)
+                    .build());
         }
 
         @SneakyThrows(IOException.class)
@@ -691,7 +842,7 @@ public abstract class MetadataStore implements AutoCloseable {
         }
 
         @SneakyThrows(IOException.class)
-        static SegmentInfo deserialize(ArrayView contents) {
+        static SegmentInfo deserialize(BufferView contents) {
             try {
                 return SERIALIZER.deserialize(contents);
             } catch (EOFException | SerializationException ex) {
@@ -699,10 +850,10 @@ public abstract class MetadataStore implements AutoCloseable {
             }
         }
 
-        static class SegmentInfoBuilder implements ObjectBuilder<SegmentInfo> {
+        public static class SegmentInfoBuilder implements ObjectBuilder<SegmentInfo> {
         }
 
-        private static class SegmentInfoSerializer extends VersionedSerializer.WithBuilder<SegmentInfo, SegmentInfo.SegmentInfoBuilder> {
+        public static class SegmentInfoSerializer extends VersionedSerializer.WithBuilder<SegmentInfo, SegmentInfo.SegmentInfoBuilder> {
             @Override
             protected SegmentInfo.SegmentInfoBuilder newBuilder() {
                 return SegmentInfo.builder();
@@ -725,9 +876,8 @@ public abstract class MetadataStore implements AutoCloseable {
                 output.writeLong(sp.getLength());
                 output.writeLong(sp.getStartOffset());
                 output.writeBoolean(sp.isSealed());
-
                 // We only serialize Core Attributes. Extended Attributes can be retrieved from the AttributeIndex.
-                output.writeMap(Attributes.getCoreNonNullAttributes(sp.getAttributes()), RevisionDataOutput::writeUUID, RevisionDataOutput::writeLong);
+                output.writeMap(Attributes.getCoreNonNullAttributes(sp.getAttributes()), this::writeAttributeId00, RevisionDataOutput::writeLong);
             }
 
             private void read00(RevisionDataInput input, SegmentInfo.SegmentInfoBuilder builder) throws IOException {
@@ -738,8 +888,18 @@ public abstract class MetadataStore implements AutoCloseable {
                         .length(input.readLong())
                         .startOffset(input.readLong())
                         .sealed(input.readBoolean());
-                infoBuilder.attributes(input.readMap(RevisionDataInput::readUUID, RevisionDataInput::readLong));
+                infoBuilder.attributes(input.readMap(this::readAttributeId00, RevisionDataInput::readLong));
                 builder.properties(infoBuilder.build());
+            }
+
+            private void writeAttributeId00(RevisionDataOutput out, AttributeId attributeId) throws IOException {
+                assert attributeId.isUUID();
+                out.writeLong(attributeId.getBitGroup(0));
+                out.writeLong(attributeId.getBitGroup(1));
+            }
+
+            private AttributeId readAttributeId00(RevisionDataInput in) throws IOException {
+                return AttributeId.uuid(in.readLong(), in.readLong());
             }
         }
     }

@@ -1,11 +1,17 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.controller.store.checkpoint;
 
@@ -22,6 +28,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 import lombok.AllArgsConstructor;
@@ -36,12 +43,13 @@ import org.apache.zookeeper.data.Stat;
  * Zookeeper based checkpoint store.
  */
 @Slf4j
-class ZKCheckpointStore implements CheckpointStore {
+public class ZKCheckpointStore implements CheckpointStore {
 
     private static final String ROOT = "eventProcessors";
     private final CuratorFramework client;
     private final Serializer<Position> positionSerializer;
     private final JavaSerializer<ReaderGroupData> groupDataSerializer;
+    private final AtomicBoolean isZKConnected = new AtomicBoolean(false);
 
     ZKCheckpointStore(CuratorFramework client) {
         this.client = client;
@@ -57,6 +65,12 @@ class ZKCheckpointStore implements CheckpointStore {
             }
         };
         this.groupDataSerializer = new JavaSerializer<>();
+        this.isZKConnected.set(client.getZookeeperClient().isConnected());
+        //Listen for any zookeeper connection state changes
+        client.getConnectionStateListenable().addListener(
+                (curatorClient, newState) -> {
+                    this.isZKConnected.set(newState.isConnected());
+                });
     }
 
     @Data
@@ -71,6 +85,16 @@ class ZKCheckpointStore implements CheckpointStore {
         private final List<String> readerIds;
     }
 
+    /**
+     * Get the zookeeper health status.
+     *
+     * @return true if zookeeper is connected.
+     */
+    @Override
+    public boolean isHealthy() {
+        return isZKConnected.get();
+     }
+
     @Override
     public void setPosition(String process, String readerGroup, String readerId, Position position) throws CheckpointStoreException {
         updateNode(getReaderPath(process, readerGroup, readerId), positionSerializer.serialize(position).array());
@@ -80,6 +104,8 @@ class ZKCheckpointStore implements CheckpointStore {
     public Map<String, Position> getPositions(String process, String readerGroup) throws CheckpointStoreException {
         Map<String, Position> map = new HashMap<>();
         String path = getReaderGroupPath(process, readerGroup);
+        ReaderGroupData rgData = groupDataSerializer.deserialize(ByteBuffer.wrap(getData(path)));
+        rgData.getReaderIds().forEach(x -> map.put(x, null));
         for (String child : getChildren(path)) {
             Position position = null;
             byte[] data = getData(path + "/" + child);
@@ -201,7 +227,7 @@ class ZKCheckpointStore implements CheckpointStore {
             });
 
         } catch (KeeperException.NoNodeException e) {
-            throw new CheckpointStoreException(CheckpointStoreException.Type.NoNode, e);
+            log.debug("ZNode for reader {} in Reader Group {} for Controller {} not found.", readerId, readerGroup, process);
         } catch (KeeperException.ConnectionLossException | KeeperException.OperationTimeoutException
                 | KeeperException.SessionExpiredException e) {
             throw new CheckpointStoreException(CheckpointStoreException.Type.Connectivity, e);
@@ -253,7 +279,6 @@ class ZKCheckpointStore implements CheckpointStore {
                 .retryingOn(KeeperException.BadVersionException.class)
                 .throwingOn(Exception.class)
                 .run(() -> {
-
                     byte[] data = client.getData().storingStatIn(stat).forPath(path);
                     ReaderGroupData groupData = groupDataSerializer.deserialize(ByteBuffer.wrap(data));
                     groupData = updater.apply(groupData);

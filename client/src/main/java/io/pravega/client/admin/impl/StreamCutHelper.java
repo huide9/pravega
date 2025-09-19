@@ -1,15 +1,24 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.client.admin.impl;
 
-import io.pravega.client.netty.impl.ConnectionFactory;
+import io.pravega.client.connection.impl.ConnectionPool;
+import io.pravega.client.control.impl.Controller;
+import io.pravega.client.security.auth.DelegationTokenProvider;
+import io.pravega.client.security.auth.DelegationTokenProviderFactory;
 import io.pravega.client.segment.impl.Segment;
 import io.pravega.client.segment.impl.SegmentInfo;
 import io.pravega.client.segment.impl.SegmentMetadataClient;
@@ -17,16 +26,17 @@ import io.pravega.client.segment.impl.SegmentMetadataClientFactory;
 import io.pravega.client.segment.impl.SegmentMetadataClientFactoryImpl;
 import io.pravega.client.stream.Stream;
 import io.pravega.client.stream.StreamCut;
-import io.pravega.client.stream.impl.Controller;
 import io.pravega.client.stream.impl.StreamCutImpl;
 import io.pravega.client.stream.impl.StreamImpl;
-import lombok.Cleanup;
-import lombok.extern.slf4j.Slf4j;
-
+import io.pravega.common.concurrent.Futures;
+import io.pravega.shared.security.auth.AccessOperation;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
+import lombok.extern.slf4j.Slf4j;
 
 /**
  * Helper class to obtain the current HEAD and TAIL {@link StreamCut}s for a given {@link Stream}.
@@ -35,12 +45,10 @@ import java.util.stream.Collectors;
 public class StreamCutHelper {
     private final Controller controller;
     private final SegmentMetadataClientFactory segmentMetadataClientFactory;
-    private final AtomicReference<String> latestDelegationToken;
 
-    public StreamCutHelper(Controller controller, ConnectionFactory connectionFactory) {
+    public StreamCutHelper(Controller controller, ConnectionPool connectionPool) {
         this.controller = controller;
-        this.segmentMetadataClientFactory = new SegmentMetadataClientFactoryImpl(controller, connectionFactory);
-        this.latestDelegationToken = new AtomicReference<>();
+        this.segmentMetadataClientFactory = new SegmentMetadataClientFactoryImpl(controller, connectionPool);
     }
 
     /**
@@ -60,19 +68,25 @@ public class StreamCutHelper {
      * @return {@link StreamCut} pointing to the TAIL of the Stream.
      */
     public CompletableFuture<StreamCut> fetchTailStreamCut(final Stream stream) {
+        final DelegationTokenProvider tokenProvider = DelegationTokenProviderFactory.create(controller,
+                stream.getScope(), stream.getStreamName(), AccessOperation.READ);
         return controller.getCurrentSegments(stream.getScope(), stream.getStreamName())
-                         .thenApply(s -> {
-                             latestDelegationToken.set(s.getDelegationToken());
-                             Map<Segment, Long> pos =
-                                     s.getSegments().stream().map(this::segmentToInfo)
-                                      .collect(Collectors.toMap(SegmentInfo::getSegment, SegmentInfo::getWriteOffset));
-                             return new StreamCutImpl(stream, pos);
-                         });
+            .thenCompose(streamsegments -> segmentToInfos(streamsegments.getSegments(), tokenProvider))
+            .thenApply(infos -> {
+                Map<Segment, Long> pos = infos.stream()
+                    .collect(Collectors.toMap(SegmentInfo::getSegment, SegmentInfo::getWriteOffset));
+                return new StreamCutImpl(stream, pos);
+            });
     }
 
-    private SegmentInfo segmentToInfo(Segment s) {
-        @Cleanup
-        SegmentMetadataClient client = segmentMetadataClientFactory.createSegmentMetadataClient(s, latestDelegationToken.get());
-        return client.getSegmentInfo();
+    private CompletableFuture<List<SegmentInfo>> segmentToInfos(Collection<Segment> segments, DelegationTokenProvider tokenProvider) {
+        List<CompletableFuture<SegmentInfo>> results = new ArrayList<>();
+        for (Segment s : segments) {
+            SegmentMetadataClient client = segmentMetadataClientFactory.createSegmentMetadataClient(s, tokenProvider);
+            CompletableFuture<SegmentInfo> info = client.getSegmentInfo();
+            results.add(info);
+            info.whenComplete((v, e) -> client.close());
+        }
+        return Futures.allOfWithResults(results);
     }
 }

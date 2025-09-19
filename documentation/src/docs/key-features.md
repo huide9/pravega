@@ -1,11 +1,17 @@
 <!--
-Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+Copyright Pravega Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
 -->
 # Pravega Key Features
 
@@ -28,7 +34,7 @@ These applications uses the following systems to ingest and store data: [Apache 
 
 Pravega focuses on both ingesting and storing Stream data. Pravega approaches streaming applications from a storage perspective. It enables applications to ingest Stream data continuously and stores it permanently. Such Stream data can be accessed with low latency (order of milliseconds) and also analyzes historical data.
 
-The design of Pravega incorporates lessons learned from using the [**Lambda Architecture**](http://lambda-architecture.net/)
+The design of Pravega incorporates lessons learned from using the [**Lambda Architecture**](https://en.wikipedia.org/wiki/Lambda_architecture)
 to build streaming applications and the challenges to deploy streaming applications
 at scale that consistently deliver accurate results in a fault tolerant manner.
 The Pravega Architecture provides strong durability and consistency guarantees,

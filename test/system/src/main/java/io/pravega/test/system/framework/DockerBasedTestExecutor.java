@@ -1,11 +1,17 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.test.system.framework;
 
@@ -29,10 +35,10 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.atomic.AtomicReference;
 import lombok.extern.slf4j.Slf4j;
+import org.junit.After;
 import org.junit.Assert;
 
 import static io.pravega.test.system.framework.Utils.DOCKER_NETWORK;
@@ -44,12 +50,18 @@ public class DockerBasedTestExecutor implements TestExecutor {
 
     public static final int DOCKER_CLIENT_PORT = 2375;
     private final static String IMAGE = "java:8";
+    private static final String LOG_LEVEL = System.getProperty("log.level", "DEBUG");
     private final AtomicReference<String> id = new AtomicReference<String>();
     private final String masterIp = Utils.isAwsExecution() ? getConfig("awsMasterIP", "Invalid Master IP").trim() : getConfig("masterIP", "Invalid Master IP");
     private final DockerClient client = DefaultDockerClient.builder().uri("http://" + masterIp
-             + ":" + DOCKER_CLIENT_PORT).build();
+            + ":" + DOCKER_CLIENT_PORT).build();
     private final String expectedDockerApiVersion = "1.22";
-    private final ScheduledExecutorService executorService = Executors.newScheduledThreadPool(3);
+    private final ScheduledExecutorService executorService = ExecutorServiceHelpers.newScheduledThreadPool(3, "test");
+
+    @After
+    public void tearDown() {
+        ExecutorServiceHelpers.shutdown(executorService);
+    }
 
     @Override
     public CompletableFuture<Void> startTestExecution(Method testMethod) {
@@ -172,7 +184,7 @@ public class DockerBasedTestExecutor implements TestExecutor {
                 .user("root")
                 .workingDir("/data")
                 .cmd("sh", "-c", "java -DmasterIP=" + LoginClient.MESOS_MASTER + " -DexecType=" + getConfig("execType",
-                        "LOCAL") + " -cp /data/build/libs/test-docker-collection.jar io.pravega.test.system." +
+                        "LOCAL") + " -Dlog.level=" + LOG_LEVEL +  " -cp /data/build/libs/test-docker-collection.jar io.pravega.test.system." +
                         "SingleJUnitTestRunner " + className + "#" + methodName + " > server.log 2>&1")
                 .labels(labels)
                 .build();

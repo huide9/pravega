@@ -1,11 +1,17 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.controller.task.Stream;
 import com.google.common.annotations.VisibleForTesting;
@@ -26,19 +32,19 @@ import static io.pravega.controller.util.RetryHelper.UNCONDITIONAL_PREDICATE;
 import static io.pravega.controller.util.RetryHelper.withRetries;
 import static io.pravega.controller.util.RetryHelper.withRetriesAsync;
 
-@Slf4j
 /**
  * This method implements a failover sweeper for requests posted via {@link StreamMetadataTasks} into request stream.
- * Stream metadata task indexes the request in hostRequestIndex before initiating the work in metadata store. 
- * If controller fails before the event is posted, the sweeper will be invoked upon failover. 
- * The sweeper fetches indexed requests and posts corresponding event into request stream. 
+ * Stream metadata task indexes the request in hostRequestIndex before initiating the work in metadata store.
+ * If controller fails before the event is posted, the sweeper will be invoked upon failover.
+ * The sweeper fetches indexed requests and posts corresponding event into request stream.
  *
- * This class wait before becoming ready until {@link StreamMetadataTasks} has its event writer set up.  
+ * This class wait before becoming ready until {@link StreamMetadataTasks} has its event writer set up.
  */
+@Slf4j
 public class RequestSweeper implements FailoverSweeper {
 
     public static final int LIMIT = 100;
-    
+
     private final StreamMetadataStore metadataStore;
     private final ScheduledExecutorService executor;
     private final StreamMetadataTasks streamMetadataTasks;
@@ -46,7 +52,7 @@ public class RequestSweeper implements FailoverSweeper {
 
     /**
      * Constructor for RequestSweeper object.
-     * 
+     *
      * @param metadataStore stream metadata store
      * @param executor executor
      * @param streamMetadataTasks stream metadata tasks
@@ -116,7 +122,7 @@ public class RequestSweeper implements FailoverSweeper {
                                     tasks.entrySet().stream().map(entry ->
                                             streamMetadataTasks.writeEvent(entry.getValue())
                                                                .thenCompose(v ->
-                                                                       metadataStore.removeTaskFromIndex(oldHostId, entry.getKey()))
+                                                                       streamMetadataTasks.removeTaskFromIndex(oldHostId, entry.getKey()))
                                                                .thenApply(v -> entry.getKey()))
                                          .collect(Collectors.toList())), executor);
     }

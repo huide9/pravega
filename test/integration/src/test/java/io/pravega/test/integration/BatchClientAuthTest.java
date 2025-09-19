@@ -1,25 +1,31 @@
 /**
- * Copyright (c) 2019 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.test.integration;
 
 import io.grpc.StatusRuntimeException;
 import io.pravega.client.ClientConfig;
-import io.pravega.client.stream.impl.DefaultCredentials;
-import io.pravega.controller.server.rpc.auth.StrongPasswordProcessor;
+import io.pravega.shared.security.auth.DefaultCredentials;
+import io.pravega.shared.security.crypto.StrongPasswordProcessor;
 import io.pravega.segmentstore.server.host.stat.AutoScalerConfig;
 import io.pravega.segmentstore.server.store.ServiceBuilder;
 import io.pravega.segmentstore.server.store.ServiceBuilderConfig;
 import io.pravega.segmentstore.server.store.ServiceConfig;
 import io.pravega.test.common.AssertExtensions;
-import io.pravega.test.integration.utils.PasswordAuthHandlerInput;
-import io.pravega.test.integration.demo.ControllerWrapper;
+import io.pravega.shared.security.auth.PasswordAuthHandlerInput;
+import io.pravega.test.integration.utils.ControllerWrapper;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.exception.ExceptionUtils;
 import org.junit.AfterClass;
@@ -82,6 +88,7 @@ public class BatchClientAuthTest extends BatchClientTest {
         return ServiceBuilder.newInMemoryBuilder(configBuilder.build());
     }
 
+    @Override
     protected ControllerWrapper createControllerWrapper() {
         return new ControllerWrapper(zkTestServer.getConnectString(),
                 false, true,
@@ -114,7 +121,7 @@ public class BatchClientAuthTest extends BatchClientTest {
 
         AssertExtensions.assertThrows("Auth exception did not occur.",
                 () -> this.listAndReadSegmentsUsingBatchClient("testScope", "testBatchStream", config),
-                e -> hasAuthExceptionAsRootCause(e));
+                e -> hasAuthenticationExceptionAsRootCause(e));
     }
 
     @Test(timeout = 250000)
@@ -126,7 +133,7 @@ public class BatchClientAuthTest extends BatchClientTest {
 
         AssertExtensions.assertThrows("Auth exception did not occur.",
                 () -> this.listAndReadSegmentsUsingBatchClient("testScope", "testBatchStream", config),
-                e -> hasAuthExceptionAsRootCause(e));
+                e -> hasAuthenticationExceptionAsRootCause(e));
     }
 
     @Test(timeout = 250000)
@@ -137,12 +144,11 @@ public class BatchClientAuthTest extends BatchClientTest {
             setClientAuthProperties("unauthorizeduser", "1111_aaaa");
             ClientConfig config = ClientConfig.builder()
                     .controllerURI(URI.create(this.controllerUri()))
-                    .credentials(new DefaultCredentials("1111_aaaa", "unauthorizeduser"))
                     .build();
 
             AssertExtensions.assertThrows("Auth exception did not occur.",
                     () -> this.listAndReadSegmentsUsingBatchClient("testScope", "testBatchStream", config),
-                    e -> hasAuthExceptionAsRootCause(e));
+                    e -> hasAuthorizationExceptionAsRootCause(e));
             unsetClientAuthProperties();
         } finally {
             sequential.unlock();
@@ -150,6 +156,7 @@ public class BatchClientAuthTest extends BatchClientTest {
     }
 
     private static File createAuthFile() {
+        @SuppressWarnings("resource")
         PasswordAuthHandlerInput result = new PasswordAuthHandlerInput("BatchClientAuth", ".txt");
 
         StrongPasswordProcessor passwordProcessor = StrongPasswordProcessor.builder().build();
@@ -157,9 +164,9 @@ public class BatchClientAuthTest extends BatchClientTest {
             String encryptedPassword = passwordProcessor.encryptPassword("1111_aaaa");
 
             List<PasswordAuthHandlerInput.Entry> entries = Arrays.asList(
-                    PasswordAuthHandlerInput.Entry.of("admin", encryptedPassword, "*,READ_UPDATE;"),
-                    PasswordAuthHandlerInput.Entry.of("appaccount", encryptedPassword, "*,READ_UPDATE;"),
-                    PasswordAuthHandlerInput.Entry.of("unauthorizeduser", encryptedPassword, "")
+                    PasswordAuthHandlerInput.Entry.of("admin", encryptedPassword, "prn::*,READ_UPDATE;"),
+                    PasswordAuthHandlerInput.Entry.of("appaccount", encryptedPassword, "prn::*,READ_UPDATE;"),
+                    PasswordAuthHandlerInput.Entry.of("unauthorizeduser", encryptedPassword, "prn::")
             );
             result.postEntries(entries);
         } catch (NoSuchAlgorithmException | InvalidKeySpecException e) {
@@ -182,13 +189,23 @@ public class BatchClientAuthTest extends BatchClientTest {
         System.clearProperty("pravega.client.auth.token");
     }
 
-    private boolean hasAuthExceptionAsRootCause(Throwable e) {
+    private boolean hasAuthorizationExceptionAsRootCause(Throwable e) {
         Throwable innermostException = ExceptionUtils.getRootCause(e);
 
         // Depending on an exception message for determining whether the given exception represents auth failure
         // is not a good thing to do, but we have no other choice here because auth failures are represented as the
         // overly general io.grpc.StatusRuntimeException.
-        return innermostException instanceof StatusRuntimeException &&
+        return innermostException != null && innermostException instanceof StatusRuntimeException &&
+                innermostException.getMessage().toUpperCase().contains("PERMISSION_DENIED");
+    }
+
+    private boolean hasAuthenticationExceptionAsRootCause(Throwable e) {
+        Throwable innermostException = ExceptionUtils.getRootCause(e);
+
+        // Depending on an exception message for determining whether the given exception represents auth failure
+        // is not a good thing to do, but we have no other choice here because auth failures are represented as the
+        // overly general io.grpc.StatusRuntimeException.
+        return innermostException != null && innermostException instanceof StatusRuntimeException &&
                 innermostException.getMessage().toUpperCase().contains("UNAUTHENTICATED");
     }
 }

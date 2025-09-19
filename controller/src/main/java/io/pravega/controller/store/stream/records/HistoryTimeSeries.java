@@ -1,11 +1,17 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.controller.store.stream.records;
 
@@ -22,12 +28,13 @@ import lombok.SneakyThrows;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.util.stream.Collectors;
 
-@Data
 /**
  * This class stores chunks of the history time series.
  * Each chunk is of fixed size and contains list of epochs in form of HistoryTimeSeriesRecord.
  */
+@Data
 public class HistoryTimeSeries {
     public static final HistoryTimeSeriesSerializer SERIALIZER = new HistoryTimeSeriesSerializer();
     public static final int HISTORY_CHUNK_SIZE = 1000;
@@ -38,10 +45,17 @@ public class HistoryTimeSeries {
     public HistoryTimeSeries(@NonNull ImmutableList<HistoryTimeSeriesRecord> historyRecords) {
         this.historyRecords = historyRecords;
     }
-    
+
     @SneakyThrows(IOException.class)
     public byte[] toBytes() {
         return SERIALIZER.serialize(this).getCopy();
+    }
+
+    @Override
+    public String toString() {
+        return String.format("%s = [%n    %s%n]", "historyRecords", historyRecords.stream()
+                .map(historyTimeSeriesRecord -> historyTimeSeriesRecord.toString().replace("\n", "\n    "))
+                .collect(Collectors.joining("\n,\n    ")));
     }
 
     @SneakyThrows(IOException.class)
@@ -53,7 +67,7 @@ public class HistoryTimeSeries {
     private static class HistoryTimeSeriesBuilder implements ObjectBuilder<HistoryTimeSeries> {
 
     }
-    
+
     public HistoryTimeSeriesRecord getLatestRecord() {
         return historyRecords.get(historyRecords.size() - 1);
     }
@@ -68,11 +82,11 @@ public class HistoryTimeSeries {
             listBuilder.add(record);
         } else if (list.get(list.size() - 1).getEpoch() != record.getEpoch()) {
             throw new IllegalArgumentException("new epoch record is not continuous");
-        } 
+        }
 
         return new HistoryTimeSeries(listBuilder.build());
     }
-    
+
     private static class HistoryTimeSeriesSerializer extends
             VersionedSerializer.WithBuilder<HistoryTimeSeries, HistoryTimeSeries.HistoryTimeSeriesBuilder> {
         @Override

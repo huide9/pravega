@@ -1,19 +1,25 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.controller.store.client;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import io.pravega.common.Exceptions;
-import io.pravega.common.auth.JKSHelper;
-import io.pravega.common.auth.ZKTLSUtils;
+import io.pravega.common.security.JKSHelper;
+import io.pravega.common.security.ZKTLSUtils;
 import lombok.AccessLevel;
 import lombok.Setter;
 import lombok.Synchronized;
@@ -91,13 +97,14 @@ public class StoreClientFactory {
                 .retryPolicy(retryPolicy)
                 .sessionTimeoutMs(zkClientConfig.getSessionTimeoutMs())
                 .build();
-        zkClient.start();
 
         zkClient.getConnectionStateListenable().addListener((client1, newState) -> {
             if (newState.equals(ConnectionState.LOST)) {
                 expiryHandler.accept(null);
             }
         });
+        
+        zkClient.start();
 
         return zkClient;
     }
@@ -114,37 +121,17 @@ public class StoreClientFactory {
         @Override
         @Synchronized
         public ZooKeeper newZooKeeper(String connectString, int sessionTimeout, Watcher watcher, boolean canBeReadOnly) throws Exception {
-            // prevent creating a new client, stick to the same client created earlier
-            // this trick prevents curator from re-creating ZK client on session expiry
             if (client == null) {
                 Exceptions.checkNotNullOrEmpty(connectString, "connectString");
                 Preconditions.checkArgument(sessionTimeout > 0, "sessionTimeout should be a positive integer");
                 this.connectString = connectString;
                 this.sessionTimeout = sessionTimeout;
                 this.canBeReadOnly = canBeReadOnly;
-                this.client = new ZooKeeper(connectString, sessionTimeout, watcher, canBeReadOnly);
-            } else {
-                try {
-                    Preconditions.checkArgument(this.connectString.equals(connectString), "connectString differs");
-                    Preconditions.checkArgument(this.sessionTimeout == sessionTimeout, "sessionTimeout differs");
-                    Preconditions.checkArgument(this.canBeReadOnly == canBeReadOnly, "canBeReadOnly differs");
-                    this.client.register(watcher);
-                } catch (IllegalArgumentException e) {
-                    log.warn("Input argument for new ZooKeeper client ({}, {}, {}) changed with respect to existing client ({}, {}, {}).",
-                        connectString, sessionTimeout, canBeReadOnly, this.connectString, this.sessionTimeout, this.canBeReadOnly);
-                    closeClient(client);
-                }
             }
+            // Ensure that a new instance of Zookeeper clients in Curator are always created
+            // So it can be resolved to a new IP in the case of a Zookeeper instance restart.
+            this.client = new ZooKeeper(this.connectString, this.sessionTimeout, watcher, this.canBeReadOnly);
             return this.client;
-        }
-
-        private void closeClient(ZooKeeper client) {
-            try {
-                client.close();
-            } catch (Exception e) {
-                // We prevent throwing uncontrolled exceptions here, which may lead Curator to retry indefinitely.
-                log.error("Exception while attempting to close ZooKeeper client.", e);
-            }
         }
     }
 

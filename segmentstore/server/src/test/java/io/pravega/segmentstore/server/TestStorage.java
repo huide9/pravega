@@ -1,11 +1,17 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.segmentstore.server;
 
@@ -21,6 +27,7 @@ import io.pravega.test.common.ErrorInjector;
 import java.io.InputStream;
 import java.time.Duration;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.Executor;
@@ -60,6 +67,8 @@ public class TestStorage implements Storage {
     private ErrorInjector<Exception> getErrorInjector;
     @Setter
     private ErrorInjector<Exception> existsErrorInjector;
+    @Setter
+    private CreateInterceptor createInterceptor;
     @Setter
     private WriteInterceptor writeInterceptor;
     @Setter
@@ -101,12 +110,21 @@ public class TestStorage implements Storage {
 
     @Override
     public CompletableFuture<SegmentHandle> create(String streamSegmentName, SegmentRollingPolicy rollingPolicy, Duration timeout) {
-        return ErrorInjector.throwAsyncExceptionIfNeeded(this.createErrorInjector,
-                () -> this.wrappedStorage.create(streamSegmentName, rollingPolicy, timeout))
-                            .thenApply(sp -> {
-                                this.truncationOffsets.put(streamSegmentName, 0L);
-                                return sp;
-                            });
+        return ErrorInjector
+                .throwAsyncExceptionIfNeeded(this.createErrorInjector, () -> {
+                    CreateInterceptor ci = this.createInterceptor;
+                    CompletableFuture<Void> result = null;
+                    if (ci != null) {
+                        result = ci.apply(streamSegmentName, rollingPolicy, this.wrappedStorage);
+                    }
+
+                    return result != null ? result : CompletableFuture.completedFuture(null);
+                })
+                .thenCompose(v -> this.wrappedStorage.create(streamSegmentName, rollingPolicy, timeout))
+                .thenApply(sp -> {
+                    this.truncationOffsets.put(streamSegmentName, 0L);
+                    return sp;
+                });
     }
 
     @Override
@@ -188,6 +206,16 @@ public class TestStorage implements Storage {
     }
 
     @Override
+    public boolean supportsAtomicWrites() {
+        return this.wrappedStorage.supportsAtomicWrites();
+    }
+
+    @Override
+    public CompletableFuture<Iterator<SegmentProperties>> listSegments() {
+        return CompletableFuture.completedFuture(null);
+    }
+
+    @Override
     public CompletableFuture<Integer> read(SegmentHandle handle, long offset, byte[] buffer, int bufferOffset, int length, Duration timeout) {
         ReadInterceptor ri = this.readInterceptor;
         if (ri != null) {
@@ -225,6 +253,11 @@ public class TestStorage implements Storage {
 
     public long getTruncationOffset(String streamSegmentName) {
         return this.truncationOffsets.get(streamSegmentName);
+    }
+
+    @FunctionalInterface
+    public interface CreateInterceptor {
+        CompletableFuture<Void> apply(String streamSegmentName, SegmentRollingPolicy rollingPolicy, Storage wrappedStorage);
     }
 
     @FunctionalInterface

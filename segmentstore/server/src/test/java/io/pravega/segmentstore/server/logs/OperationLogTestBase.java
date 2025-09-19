@@ -1,22 +1,30 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.segmentstore.server.logs;
 
 import com.google.common.collect.Iterators;
 import io.pravega.common.ObjectClosedException;
 import io.pravega.common.concurrent.Futures;
-import io.pravega.common.util.SequencedItemList;
+import io.pravega.common.util.BufferView;
+import io.pravega.common.util.ByteArraySegment;
+import io.pravega.segmentstore.contracts.AttributeId;
 import io.pravega.segmentstore.contracts.AttributeUpdate;
+import io.pravega.segmentstore.contracts.AttributeUpdateCollection;
 import io.pravega.segmentstore.contracts.AttributeUpdateType;
 import io.pravega.segmentstore.contracts.ReadResult;
-import io.pravega.segmentstore.contracts.ReadResultEntryContents;
 import io.pravega.segmentstore.contracts.StreamSegmentInformation;
 import io.pravega.segmentstore.server.ContainerMetadata;
 import io.pravega.segmentstore.server.DataCorruptionException;
@@ -29,15 +37,15 @@ import io.pravega.segmentstore.server.UpdateableSegmentMetadata;
 import io.pravega.segmentstore.server.logs.operations.MergeSegmentOperation;
 import io.pravega.segmentstore.server.logs.operations.MetadataCheckpointOperation;
 import io.pravega.segmentstore.server.logs.operations.Operation;
+import io.pravega.segmentstore.server.logs.operations.OperationPriority;
 import io.pravega.segmentstore.server.logs.operations.StreamSegmentAppendOperation;
 import io.pravega.segmentstore.server.logs.operations.StreamSegmentMapOperation;
 import io.pravega.segmentstore.server.logs.operations.StreamSegmentSealOperation;
 import io.pravega.segmentstore.storage.DurableDataLogException;
-import io.pravega.shared.segment.StreamSegmentNameUtils;
+import io.pravega.shared.NameUtils;
 import io.pravega.test.common.AssertExtensions;
 import io.pravega.test.common.IntentionalException;
 import io.pravega.test.common.ThreadPooledTestSuite;
-import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.SequenceInputStream;
@@ -45,7 +53,6 @@ import java.time.Duration;
 import java.util.AbstractMap;
 import java.util.ArrayList;
 import java.util.Collection;
-import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -55,7 +62,6 @@ import java.util.UUID;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import lombok.Cleanup;
 import lombok.RequiredArgsConstructor;
@@ -67,7 +73,6 @@ import org.junit.Assert;
  */
 abstract class OperationLogTestBase extends ThreadPooledTestSuite {
     protected static final Duration TIMEOUT = Duration.ofMillis(30000);
-    private static final Supplier<CompletableFuture<Void>> NO_OP_METADATA_CLEANUP = () -> CompletableFuture.completedFuture(null);
     private static final int MAX_SEGMENT_COUNT = 1000 * 1000;
 
     @Override
@@ -104,7 +109,7 @@ abstract class OperationLogTestBase extends ThreadPooledTestSuite {
         for (int i = 0; i < streamSegmentCount; i++) {
             val op = new StreamSegmentMapOperation(StreamSegmentInformation.builder().name(getStreamSegmentName(i)).build());
             operations.add(op);
-            futures.add(durableLog.add(op, TIMEOUT));
+            futures.add(durableLog.add(op, OperationPriority.Normal, TIMEOUT));
         }
 
         Futures.allOf(futures).join();
@@ -125,7 +130,7 @@ abstract class OperationLogTestBase extends ThreadPooledTestSuite {
                 long transactionId = getTransactionId(streamSegmentId, i);
                 assert result.put(transactionId, streamSegmentId) == null : "duplicate TransactionId generated: " + transactionId;
                 assert !streamSegmentIds.contains(transactionId) : "duplicate StreamSegmentId (Transaction) generated: " + transactionId;
-                String transactionName = StreamSegmentNameUtils.getTransactionNameFromId(streamSegmentName, UUID.randomUUID());
+                String transactionName = NameUtils.getTransactionNameFromId(streamSegmentName, UUID.randomUUID());
                 UpdateableSegmentMetadata transactionMetadata = containerMetadata.mapStreamSegmentId(transactionName, transactionId);
                 transactionMetadata.setLength(0);
                 transactionMetadata.setStorageLength(0);
@@ -145,9 +150,9 @@ abstract class OperationLogTestBase extends ThreadPooledTestSuite {
             String streamSegmentName = containerMetadata.getStreamSegmentMetadata(streamSegmentId).getName();
 
             for (int i = 0; i < transactionsPerStreamSegment; i++) {
-                String transactionName = StreamSegmentNameUtils.getTransactionNameFromId(streamSegmentName, UUID.randomUUID());
+                String transactionName = NameUtils.getTransactionNameFromId(streamSegmentName, UUID.randomUUID());
                 StreamSegmentMapOperation op = new StreamSegmentMapOperation(StreamSegmentInformation.builder().name(transactionName).build());
-                durableLog.add(op, TIMEOUT).join();
+                durableLog.add(op, OperationPriority.Normal, TIMEOUT).join();
                 result.put(op.getStreamSegmentId(), streamSegmentId);
             }
         }
@@ -182,7 +187,7 @@ abstract class OperationLogTestBase extends ThreadPooledTestSuite {
         int appendId = 0;
         for (long streamSegmentId : streamSegmentIds) {
             for (int i = 0; i < appendsPerStreamSegment; i++) {
-                val attributes = Collections.singletonList(new AttributeUpdate(UUID.randomUUID(), AttributeUpdateType.Replace, i));
+                val attributes = AttributeUpdateCollection.from(new AttributeUpdate(AttributeId.randomUUID(), AttributeUpdateType.Replace, i));
                 result.add(new StreamSegmentAppendOperation(streamSegmentId, generateAppendData(appendId), attributes));
                 addCheckpointIfNeeded(result, metadataCheckpointsEvery);
                 appendId++;
@@ -191,7 +196,7 @@ abstract class OperationLogTestBase extends ThreadPooledTestSuite {
 
         for (long transactionId : transactionIds.keySet()) {
             for (int i = 0; i < appendsPerStreamSegment; i++) {
-                val attributes = Collections.singletonList(new AttributeUpdate(UUID.randomUUID(), AttributeUpdateType.Replace, i));
+                val attributes = AttributeUpdateCollection.from(new AttributeUpdate(AttributeId.randomUUID(), AttributeUpdateType.Replace, i));
                 result.add(new StreamSegmentAppendOperation(transactionId, generateAppendData(appendId), attributes));
                 addCheckpointIfNeeded(result, metadataCheckpointsEvery);
                 appendId++;
@@ -220,8 +225,8 @@ abstract class OperationLogTestBase extends ThreadPooledTestSuite {
         return result;
     }
 
-    private byte[] generateAppendData(int appendId) {
-        return String.format("Append_%d", appendId).getBytes();
+    protected ByteArraySegment generateAppendData(int appendId) {
+        return new ByteArraySegment(String.format("Append_%d", appendId).getBytes());
     }
 
     private void addCheckpointIfNeeded(Collection<Operation> operations, int metadataCheckpointsEvery) {
@@ -276,13 +281,13 @@ abstract class OperationLogTestBase extends ThreadPooledTestSuite {
             ReadResult readResult = readIndex.read(e.getKey(), 0, expectedLength, TIMEOUT);
             int readLength = 0;
             while (readResult.hasNext()) {
-                ReadResultEntryContents entry = readResult.next().getContent().join();
+                BufferView entry = readResult.next().getContent().join();
                 int length = entry.getLength();
                 readLength += length;
                 int streamSegmentOffset = expectedLengths.getOrDefault(e.getKey(), 0);
                 expectedLengths.put(e.getKey(), streamSegmentOffset + length);
                 AssertExtensions.assertStreamEquals(String.format("Unexpected data returned from ReadIndex. StreamSegmentId = %d, Offset = %d.",
-                        e.getKey(), streamSegmentOffset), e.getValue(), entry.getData(), length);
+                        e.getKey(), streamSegmentOffset), e.getValue(), entry.getReader(), length);
             }
 
             Assert.assertEquals("Not enough bytes were read from the ReadIndex for StreamSegment " + e.getKey(), expectedLength, readLength);
@@ -320,7 +325,7 @@ abstract class OperationLogTestBase extends ThreadPooledTestSuite {
                 StreamSegmentAppendOperation appendOperation = (StreamSegmentAppendOperation) o.operation;
                 result.put(
                         appendOperation.getStreamSegmentId(),
-                        result.getOrDefault(appendOperation.getStreamSegmentId(), 0) + appendOperation.getData().length);
+                        result.getOrDefault(appendOperation.getStreamSegmentId(), 0) + appendOperation.getData().getLength());
             } else if (o.operation instanceof MergeSegmentOperation) {
                 MergeSegmentOperation mergeOperation = (MergeSegmentOperation) o.operation;
 
@@ -339,7 +344,7 @@ abstract class OperationLogTestBase extends ThreadPooledTestSuite {
      * contents of that StreamSegment. Only considers operations of type StreamSegmentAppendOperation and MergeSegmentOperation.
      */
     private AbstractMap<Long, InputStream> getExpectedContents(Collection<OperationWithCompletion> operations) {
-        HashMap<Long, List<ByteArrayInputStream>> partialContents = new HashMap<>();
+        HashMap<Long, List<InputStream>> partialContents = new HashMap<>();
         for (OperationWithCompletion o : operations) {
             Assert.assertTrue("Operation is not completed.", o.completion.isDone());
             if (o.completion.isCompletedExceptionally()) {
@@ -349,22 +354,22 @@ abstract class OperationLogTestBase extends ThreadPooledTestSuite {
 
             if (o.operation instanceof StreamSegmentAppendOperation) {
                 StreamSegmentAppendOperation appendOperation = (StreamSegmentAppendOperation) o.operation;
-                List<ByteArrayInputStream> segmentContents = partialContents.get(appendOperation.getStreamSegmentId());
+                List<InputStream> segmentContents = partialContents.get(appendOperation.getStreamSegmentId());
                 if (segmentContents == null) {
                     segmentContents = new ArrayList<>();
                     partialContents.put(appendOperation.getStreamSegmentId(), segmentContents);
                 }
 
-                segmentContents.add(new ByteArrayInputStream(appendOperation.getData()));
+                segmentContents.add(appendOperation.getData().getReader());
             } else if (o.operation instanceof MergeSegmentOperation) {
                 MergeSegmentOperation mergeOperation = (MergeSegmentOperation) o.operation;
-                List<ByteArrayInputStream> targetSegmentContents = partialContents.get(mergeOperation.getStreamSegmentId());
+                List<InputStream> targetSegmentContents = partialContents.get(mergeOperation.getStreamSegmentId());
                 if (targetSegmentContents == null) {
                     targetSegmentContents = new ArrayList<>();
                     partialContents.put(mergeOperation.getStreamSegmentId(), targetSegmentContents);
                 }
 
-                List<ByteArrayInputStream> sourceSegmentContents = partialContents.get(mergeOperation.getSourceSegmentId());
+                List<InputStream> sourceSegmentContents = partialContents.get(mergeOperation.getSourceSegmentId());
                 targetSegmentContents.addAll(sourceSegmentContents);
                 partialContents.remove(mergeOperation.getSourceSegmentId());
             }
@@ -372,7 +377,7 @@ abstract class OperationLogTestBase extends ThreadPooledTestSuite {
 
         // Construct final result.
         HashMap<Long, InputStream> result = new HashMap<>();
-        for (Map.Entry<Long, List<ByteArrayInputStream>> e : partialContents.entrySet()) {
+        for (Map.Entry<Long, List<InputStream>> e : partialContents.entrySet()) {
             result.put(e.getKey(), new SequenceInputStream(Iterators.asEnumeration(e.getValue().iterator())));
         }
 
@@ -400,18 +405,17 @@ abstract class OperationLogTestBase extends ThreadPooledTestSuite {
     // region CorruptedMemoryOperationLog
 
     @RequiredArgsConstructor
-    static class CorruptedMemoryOperationLog extends SequencedItemList<Operation> {
+    static class CorruptedMemoryOperationLog extends InMemoryLog {
         private final long corruptAtIndex;
         private final AtomicLong addCount = new AtomicLong();
 
         @Override
-        public boolean add(Operation item) {
+        public void add(Operation item) {
             if (this.addCount.incrementAndGet() == this.corruptAtIndex) {
-                // Still add the item, but report that we haven't added it.
-                return false;
+                throw new InMemoryLog.OutOfOrderOperationException("Intentional");
             }
 
-            return super.add(item);
+            super.add(item);
         }
     }
 

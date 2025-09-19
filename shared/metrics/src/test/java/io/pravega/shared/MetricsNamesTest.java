@@ -1,11 +1,17 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.shared;
 
@@ -13,6 +19,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.junit.Test;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNull;
 
 @Slf4j
 public class MetricsNamesTest {
@@ -20,7 +27,7 @@ public class MetricsNamesTest {
     @Test
     public void testFailMetricName() {
 
-        assertEquals(null, MetricsNames.failMetricName(null));
+        assertNull(MetricsNames.failMetricName(null));
         assertEquals("", MetricsNames.failMetricName(""));
         assertEquals("tag_fail", MetricsNames.failMetricName("tag"));
         assertEquals("0_fail", MetricsNames.failMetricName("0"));
@@ -61,23 +68,23 @@ public class MetricsNamesTest {
 
     @Test (expected = IllegalArgumentException.class)
     public void testMetricKeyWithTagNameOnly() {
-        MetricsNames.MetricKey keys = MetricsNames.metricKey("metric", "tagName");
+        MetricsNames.metricKey("metric", "tagName");
     }
 
     @Test (expected = IllegalArgumentException.class)
     public void testMetricKeyWithOddNumberTags() {
-        MetricsNames.MetricKey keys = MetricsNames.metricKey("metric", "tag1", "value1", "tag2");
+        MetricsNames.metricKey("metric", "tag1", "value1", "tag2");
     }
 
     @Test
     public void testMetricKeyWithSingleNull() {
-        MetricsNames.MetricKey keys = MetricsNames.metricKey("metric", null);
+        MetricsNames.MetricKey keys = MetricsNames.metricKey("metric", (String[]) null);
         assertEquals("metric", keys.getCacheKey());
         assertEquals("metric", keys.getRegistryKey());
     }
 
     @Test  (expected = IllegalArgumentException.class)
     public void testMetricKeyWithDoubleNull() {
-        MetricsNames.MetricKey keys = MetricsNames.metricKey("metric", null, null);
+        MetricsNames.metricKey("metric", null, null);
     }
 }

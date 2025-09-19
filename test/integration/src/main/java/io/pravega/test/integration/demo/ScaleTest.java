@@ -1,40 +1,46 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.test.integration.demo;
 
-import io.pravega.common.concurrent.ExecutorServiceHelpers;
-import io.pravega.controller.util.Config;
-import io.pravega.segmentstore.contracts.StreamSegmentStore;
-import io.pravega.segmentstore.contracts.tables.TableStore;
-import io.pravega.segmentstore.server.host.handler.PravegaConnectionListener;
-import io.pravega.segmentstore.server.store.ServiceBuilder;
-import io.pravega.segmentstore.server.store.ServiceBuilderConfig;
+import io.pravega.client.control.impl.Controller;
 import io.pravega.client.stream.ScalingPolicy;
 import io.pravega.client.stream.Stream;
 import io.pravega.client.stream.StreamConfiguration;
 import io.pravega.client.stream.Transaction;
-import io.pravega.client.stream.impl.Controller;
 import io.pravega.client.stream.impl.StreamImpl;
 import io.pravega.client.stream.impl.TxnSegments;
-
+import io.pravega.common.concurrent.ExecutorServiceHelpers;
+import io.pravega.controller.util.Config;
+import io.pravega.segmentstore.contracts.StreamSegmentStore;
+import io.pravega.segmentstore.contracts.tables.TableStore;
+import io.pravega.segmentstore.server.host.handler.IndexAppendProcessor;
+import io.pravega.segmentstore.server.host.handler.PravegaConnectionListener;
+import io.pravega.segmentstore.server.store.ServiceBuilder;
+import io.pravega.segmentstore.server.store.ServiceBuilderConfig;
+import io.pravega.test.common.TestingServerStarter;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
 
-import io.pravega.test.common.TestingServerStarter;
+import io.pravega.test.integration.utils.ControllerWrapper;
 import lombok.Cleanup;
 import lombok.extern.slf4j.Slf4j;
+import lombok.val;
 import org.apache.curator.test.TestingServer;
 
 import static io.pravega.common.concurrent.Futures.getAndHandleExceptions;
@@ -47,7 +53,8 @@ public class ScaleTest {
 
     public static void main(String[] args) throws Exception {
         try {
-            ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor();
+            @Cleanup("shutdownNow")
+            val executor = ExecutorServiceHelpers.newScheduledThreadPool(1, "test");
             @Cleanup
             TestingServer zkTestServer = new TestingServerStarter().start();
 
@@ -56,8 +63,10 @@ public class ScaleTest {
             StreamSegmentStore store = serviceBuilder.createStreamSegmentService();
             TableStore tableStore = serviceBuilder.createTableStoreService();
             int port = Config.SERVICE_PORT;
+            IndexAppendProcessor indexAppendProcessor = new IndexAppendProcessor(serviceBuilder.getLowPriorityExecutor(), store);
             @Cleanup
-            PravegaConnectionListener server = new PravegaConnectionListener(false, port, store, tableStore);
+            PravegaConnectionListener server = new PravegaConnectionListener(false, port, store, tableStore,
+                    serviceBuilder.getLowPriorityExecutor(), indexAppendProcessor);
             server.startListening();
 
             // Create controller object for testing against a separate controller report.
@@ -66,7 +75,7 @@ public class ScaleTest {
             Controller controller = controllerWrapper.getController();
 
             final String scope = "scope";
-            controllerWrapper.getControllerService().createScope(scope).get();
+            controllerWrapper.getControllerService().createScope(scope, 0L).get();
 
             final String streamName = "stream1";
             final StreamConfiguration config =

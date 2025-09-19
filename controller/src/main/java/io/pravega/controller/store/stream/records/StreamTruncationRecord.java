@@ -1,11 +1,17 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.controller.store.stream.records;
 
@@ -26,6 +32,7 @@ import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
 import java.util.Comparator;
+import java.util.stream.Collectors;
 
 /**
  * Data class for storing information about stream's truncation point.
@@ -126,6 +133,22 @@ public class StreamTruncationRecord {
     @SneakyThrows(IOException.class)
     public byte[] toBytes() {
         return SERIALIZER.serialize(this).getCopy();
+    }
+
+    @Override
+    public String toString() {
+        return String.format("%s = %s", "streamCut", streamCut.keySet().stream()
+                .map(key -> key + " : " + streamCut.get(key))
+                .collect(Collectors.joining(", ", "{", "}"))) + "\n" +
+                String.format("%s = {%n    %s%n}", "span", span.keySet().stream()
+                        .map(streamSegmentRecord ->
+                                String.format("key: %n    %s%nvalue: %s", streamSegmentRecord.toString().replace("\n", "\n    "),
+                                        span.get(streamSegmentRecord)).replace("\n", "\n    "))
+                        .collect(Collectors.joining("\n,\n    "))) + "\n" +
+                String.format("%s = %s", "deletedSegments", deletedSegments) + "\n" +
+                String.format("%s = %s", "toDelete", toDelete) + "\n" +
+                String.format("%s = %s", "sizeTill", sizeTill) + "\n" +
+                String.format("%s = %s", "updating", updating);
     }
     
     private static class TruncationRecordSerializer

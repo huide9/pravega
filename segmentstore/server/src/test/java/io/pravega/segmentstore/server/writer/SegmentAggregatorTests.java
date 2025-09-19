@@ -1,11 +1,17 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.segmentstore.server.writer;
 
@@ -13,14 +19,17 @@ import com.google.common.base.Preconditions;
 import io.pravega.common.Exceptions;
 import io.pravega.common.concurrent.Futures;
 import io.pravega.common.hash.RandomFactory;
-import io.pravega.common.io.FixedByteArrayOutputStream;
+import io.pravega.common.io.ByteBufferOutputStream;
+import io.pravega.common.util.BufferView;
+import io.pravega.common.util.ByteArraySegment;
+import io.pravega.segmentstore.contracts.AttributeId;
 import io.pravega.segmentstore.contracts.AttributeUpdate;
+import io.pravega.segmentstore.contracts.AttributeUpdateCollection;
 import io.pravega.segmentstore.contracts.AttributeUpdateType;
 import io.pravega.segmentstore.contracts.Attributes;
 import io.pravega.segmentstore.contracts.BadOffsetException;
 import io.pravega.segmentstore.contracts.SegmentProperties;
 import io.pravega.segmentstore.contracts.StreamSegmentNotExistsException;
-import io.pravega.segmentstore.contracts.StreamSegmentSealedException;
 import io.pravega.segmentstore.server.DataCorruptionException;
 import io.pravega.segmentstore.server.ManualTimer;
 import io.pravega.segmentstore.server.MetadataBuilder;
@@ -53,14 +62,13 @@ import java.time.Duration;
 import java.util.AbstractMap;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Random;
 import java.util.TreeMap;
-import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -72,7 +80,6 @@ import java.util.stream.Stream;
 import lombok.Cleanup;
 import lombok.RequiredArgsConstructor;
 import lombok.val;
-import org.apache.commons.io.IOUtils;
 import org.junit.Assert;
 import org.junit.Rule;
 import org.junit.Test;
@@ -88,8 +95,6 @@ public class SegmentAggregatorTests extends ThreadPooledTestSuite {
     private static final long TRANSACTION_ID_START = 1000000;
     private static final String TRANSACTION_NAME_PREFIX = "Transaction";
     private static final int TRANSACTION_COUNT = 10;
-    private static final UUID CORE_ATTRIBUTE_ID = Attributes.EVENT_COUNT;
-    private static final UUID EXTENDED_ATTRIBUTE_ID = UUID.randomUUID();
     private static final Duration TIMEOUT = Duration.ofSeconds(20);
     private static final WriterConfig DEFAULT_CONFIG = WriterConfig
             .builder()
@@ -112,7 +117,7 @@ public class SegmentAggregatorTests extends ThreadPooledTestSuite {
      * Tests the initialize() method.
      */
     @Test
-    public void testInitialize() {
+    public void testInitialize() throws Exception {
         @Cleanup
         TestContext context = new TestContext(DEFAULT_CONFIG);
 
@@ -127,6 +132,28 @@ public class SegmentAggregatorTests extends ThreadPooledTestSuite {
         context.transactionAggregators[3].initialize(TIMEOUT).join();
         Assert.assertTrue("isDeleted() flag not set on metadata for deleted segment.", sm3.isDeleted());
         Assert.assertTrue("isDeletedInStorage() flag not set on metadata for deleted segment.", sm3.isDeletedInStorage());
+
+        // Check behavior for already-deleted segments (in Metadata) that are also deleted from Storage.
+        val sm4  = (UpdateableSegmentMetadata) context.transactionAggregators[4].getMetadata();
+        sm4.markDeleted(); // We do not mark it as deleted in Storage.
+        val ag4 = context.transactionAggregators[4];
+        ag4.initialize(TIMEOUT).join();
+        Assert.assertTrue("Expected SegmentMetadata.isDeletedInStorage to be set to true post init.", sm4.isDeletedInStorage());
+        sm4.markSealed();
+        ag4.add(generateSealAndUpdateMetadata(sm4.getId(), context));
+        Assert.assertFalse("SegmentAggregator should have ignored new operation for deleted segment.", ag4.mustFlush());
+
+        // Check behavior for already-deleted segments (in Metadata) that are still present in Storage.
+        val sm5  = (UpdateableSegmentMetadata) context.transactionAggregators[5].getMetadata();
+        context.storage.create(sm5.getName(), TIMEOUT).join();
+        sm5.markDeleted(); // We do not mark it as deleted in Storage.
+        val ag5 = context.transactionAggregators[5];
+        ag5.initialize(TIMEOUT).join();
+        Assert.assertTrue("Expected SegmentMetadata.isDeletedInStorage to be set to true post init.", sm5.isDeletedInStorage());
+        Assert.assertFalse("Expected Segment to have been deleted from Storage.", context.storage.exists(sm5.getName(), TIMEOUT).join());
+        sm5.markSealed();
+        ag5.add(generateSealAndUpdateMetadata(sm5.getId(), context));
+        Assert.assertFalse("SegmentAggregator should have ignored new operation for deleted segment.", ag5.mustFlush());
 
         // Check behavior for already-sealed segments (in storage, but not in metadata)
         context.storage.create(context.transactionAggregators[1].getMetadata().getName(), TIMEOUT).join();
@@ -160,7 +187,7 @@ public class SegmentAggregatorTests extends ThreadPooledTestSuite {
         TestContext context = new TestContext(DEFAULT_CONFIG);
         AssertExtensions.assertThrows(
                 "add() was allowed before initialization.",
-                () -> context.segmentAggregator.add(new StreamSegmentAppendOperation(0, new byte[0], null)),
+                () -> context.segmentAggregator.add(new StreamSegmentAppendOperation(0, BufferView.empty(), null)),
                 ex -> ex instanceof IllegalStateException);
 
         AssertExtensions.assertThrows(
@@ -224,6 +251,10 @@ public class SegmentAggregatorTests extends ThreadPooledTestSuite {
         // Seal the parent, then truncate again.
         context.segmentAggregator.add(generateSealAndUpdateMetadata(SEGMENT_ID, context));
         context.segmentAggregator.add(generateTruncateAndUpdateMetadata(SEGMENT_ID, context));
+
+        // This should have no effect and not throw any errors.
+        context.segmentAggregator.add(new UpdateAttributesOperation(SEGMENT_ID,
+                AttributeUpdateCollection.from(new AttributeUpdate(AttributeId.randomUUID(), AttributeUpdateType.Replace, 1))));
     }
 
     /**
@@ -292,7 +323,7 @@ public class SegmentAggregatorTests extends ThreadPooledTestSuite {
                     StreamSegmentAppendOperation badAppend = new StreamSegmentAppendOperation(
                             parentAppend1.getStreamSegmentId(),
                             parentAppend1.getStreamSegmentOffset(),
-                            new byte[(int) parentAppend1.getLength()],
+                            new ByteArraySegment(new byte[(int) parentAppend1.getLength()]),
                             null);
                     context.segmentAggregator.add(badAppend);
                 },
@@ -302,11 +333,12 @@ public class SegmentAggregatorTests extends ThreadPooledTestSuite {
         context.segmentAggregator.add(parentAppend1);
 
         // 3b. Verify we cannot add anything beyond the DurableLogOffset (offset or offset+length).
+        val appendData = new ByteArraySegment("foo".getBytes());
         AssertExtensions.assertThrows(
                 "add() allowed an operation beyond the DurableLogOffset (offset).",
                 () -> {
                     // We have the correct offset, but we did not increase the Length.
-                    StreamSegmentAppendOperation badAppend = new StreamSegmentAppendOperation(context.segmentAggregator.getMetadata().getId(), "foo".getBytes(), null);
+                    StreamSegmentAppendOperation badAppend = new StreamSegmentAppendOperation(context.segmentAggregator.getMetadata().getId(), appendData, null);
                     badAppend.setStreamSegmentOffset(parentAppend1.getStreamSegmentOffset() + parentAppend1.getLength());
                     context.segmentAggregator.add(new CachedStreamSegmentAppendOperation(badAppend));
                 },
@@ -317,7 +349,7 @@ public class SegmentAggregatorTests extends ThreadPooledTestSuite {
                 "add() allowed an operation beyond the DurableLogOffset (offset+length).",
                 () -> {
                     // We have the correct offset, but we the append exceeds the Length by 1 byte.
-                    StreamSegmentAppendOperation badAppend = new StreamSegmentAppendOperation(context.segmentAggregator.getMetadata().getId(), "foo".getBytes(), null);
+                    StreamSegmentAppendOperation badAppend = new StreamSegmentAppendOperation(context.segmentAggregator.getMetadata().getId(), appendData, null);
                     badAppend.setStreamSegmentOffset(parentAppend1.getStreamSegmentOffset() + parentAppend1.getLength());
                     context.segmentAggregator.add(new CachedStreamSegmentAppendOperation(badAppend));
                 },
@@ -327,7 +359,7 @@ public class SegmentAggregatorTests extends ThreadPooledTestSuite {
         AssertExtensions.assertThrows(
                 "add() allowed an operation with wrong offset (too small).",
                 () -> {
-                    StreamSegmentAppendOperation badOffsetAppend = new StreamSegmentAppendOperation(context.segmentAggregator.getMetadata().getId(), "foo".getBytes(), null);
+                    StreamSegmentAppendOperation badOffsetAppend = new StreamSegmentAppendOperation(context.segmentAggregator.getMetadata().getId(), appendData, null);
                     badOffsetAppend.setStreamSegmentOffset(0);
                     context.segmentAggregator.add(new CachedStreamSegmentAppendOperation(badOffsetAppend));
                 },
@@ -336,7 +368,7 @@ public class SegmentAggregatorTests extends ThreadPooledTestSuite {
         AssertExtensions.assertThrows(
                 "add() allowed an operation with wrong offset (too large).",
                 () -> {
-                    StreamSegmentAppendOperation badOffsetAppend = new StreamSegmentAppendOperation(context.segmentAggregator.getMetadata().getId(), "foo".getBytes(), null);
+                    StreamSegmentAppendOperation badOffsetAppend = new StreamSegmentAppendOperation(context.segmentAggregator.getMetadata().getId(), appendData, null);
                     badOffsetAppend.setStreamSegmentOffset(parentAppend1.getStreamSegmentOffset() + parentAppend1.getLength() + 1);
                     context.segmentAggregator.add(new CachedStreamSegmentAppendOperation(badOffsetAppend));
                 },
@@ -351,7 +383,7 @@ public class SegmentAggregatorTests extends ThreadPooledTestSuite {
                     badTransactionMetadata.setLength(100);
                     badTransactionAggregator.initialize(TIMEOUT).join();
 
-                    StreamSegmentAppendOperation badOffsetAppend = new StreamSegmentAppendOperation(context.segmentAggregator.getMetadata().getId(), "foo".getBytes(), null);
+                    StreamSegmentAppendOperation badOffsetAppend = new StreamSegmentAppendOperation(context.segmentAggregator.getMetadata().getId(), appendData, null);
                     badOffsetAppend.setStreamSegmentOffset(1);
                     context.segmentAggregator.add(new CachedStreamSegmentAppendOperation(badOffsetAppend));
                 },
@@ -361,7 +393,7 @@ public class SegmentAggregatorTests extends ThreadPooledTestSuite {
         AssertExtensions.assertThrows(
                 "add() allowed an Append operation with wrong Segment Id.",
                 () -> {
-                    StreamSegmentAppendOperation badIdAppend = new StreamSegmentAppendOperation(Integer.MAX_VALUE, "foo".getBytes(), null);
+                    StreamSegmentAppendOperation badIdAppend = new StreamSegmentAppendOperation(Integer.MAX_VALUE, appendData, null);
                     badIdAppend.setStreamSegmentOffset(parentAppend1.getStreamSegmentOffset() + parentAppend1.getLength());
                     context.segmentAggregator.add(new CachedStreamSegmentAppendOperation(badIdAppend));
                 },
@@ -429,16 +461,22 @@ public class SegmentAggregatorTests extends ThreadPooledTestSuite {
             sequenceNumbers.record(appendOp);
 
             boolean expectFlush = outstandingSize.get() >= config.getFlushThresholdBytes();
-            Assert.assertEquals("Unexpected value returned by mustFlush() (size threshold).", expectFlush, context.segmentAggregator.mustFlush());
-            Assert.assertEquals("Unexpected value returned by getLowestUncommittedSequenceNumber() before flush (size threshold).", sequenceNumbers.getLowestUncommitted(), context.segmentAggregator.getLowestUncommittedSequenceNumber());
+            Assert.assertEquals(
+                "Unexpected value returned by mustFlush() (size threshold).", expectFlush,
+                context.segmentAggregator.mustFlush());
+            Assert.assertEquals(
+                "Unexpected value returned by getLowestUncommittedSequenceNumber() before flush (size threshold).",
+                sequenceNumbers.getLowestUncommitted(), context.segmentAggregator.getLowestUncommittedSequenceNumber());
 
             // Call flush() and inspect the result.
             WriterFlushResult flushResult = context.segmentAggregator.flush(TIMEOUT).join();
             if (expectFlush) {
                 AssertExtensions.assertGreaterThanOrEqual("Not enough bytes were flushed (size threshold).", config.getFlushThresholdBytes(), flushResult.getFlushedBytes());
                 outstandingSize.addAndGet(-flushResult.getFlushedBytes());
-                Assert.assertEquals("Unexpected value returned by getLowestUncommittedSequenceNumber() after flush (size threshold).", sequenceNumbers.getLowestUncommitted(), context.segmentAggregator.getLowestUncommittedSequenceNumber());
-                checkAttributes(context);
+                Assert.assertEquals(
+                    "Unexpected value returned by getLowestUncommittedSequenceNumber() after flush (size threshold).",
+                    sequenceNumbers.getLowestUncommitted(),
+                    context.segmentAggregator.getLowestUncommittedSequenceNumber());
             } else {
                 Assert.assertEquals(String.format("Not expecting a flush. OutstandingSize=%s, Threshold=%d", outstandingSize, config.getFlushThresholdBytes()),
                         0, flushResult.getFlushedBytes());
@@ -460,7 +498,9 @@ public class SegmentAggregatorTests extends ThreadPooledTestSuite {
             // Call flush() and inspect the result.
             context.increaseTime(config.getFlushThresholdTime().toMillis() + 1); // Force a flush by incrementing the time by a lot.
             Assert.assertTrue("Unexpected value returned by mustFlush() (time threshold).", context.segmentAggregator.mustFlush());
-            Assert.assertEquals("Unexpected value returned by getLowestUncommittedSequenceNumber() before flush (time threshold).", sequenceNumbers.getLowestUncommitted(), context.segmentAggregator.getLowestUncommittedSequenceNumber());
+            Assert.assertEquals(
+                "Unexpected value returned by getLowestUncommittedSequenceNumber() before flush (time threshold).",
+                sequenceNumbers.getLowestUncommitted(), context.segmentAggregator.getLowestUncommittedSequenceNumber());
             WriterFlushResult flushResult = context.segmentAggregator.flush(TIMEOUT).join();
 
             // We are always expecting a flush.
@@ -468,9 +508,10 @@ public class SegmentAggregatorTests extends ThreadPooledTestSuite {
             outstandingSize.addAndGet(-flushResult.getFlushedBytes());
 
             Assert.assertFalse("Unexpected value returned by mustFlush() after flush (time threshold).", context.segmentAggregator.mustFlush());
-            Assert.assertEquals("Unexpected value returned by getLowestUncommittedSequenceNumber() after flush (time threshold).", sequenceNumbers.getLowestUncommitted(), context.segmentAggregator.getLowestUncommittedSequenceNumber());
+            Assert.assertEquals(
+                "Unexpected value returned by getLowestUncommittedSequenceNumber() after flush (time threshold).",
+                sequenceNumbers.getLowestUncommitted(), context.segmentAggregator.getLowestUncommittedSequenceNumber());
             Assert.assertEquals("Not expecting any merged bytes in this test.", 0, flushResult.getMergedBytes());
-            checkAttributes(context);
         }
 
         // Part 3: Transaction appends. This will force an internal loop inside flush() to do so repeatedly.
@@ -483,7 +524,10 @@ public class SegmentAggregatorTests extends ThreadPooledTestSuite {
                 context.segmentAggregator.add(appendOp);
                 getAppendData(appendOp, writtenData, context);
                 sequenceNumbers.record(appendOp);
-                Assert.assertEquals("Unexpected value returned by getLowestUncommittedSequenceNumber() before flush (Transaction appends).", sequenceNumbers.getLowestUncommitted(), context.segmentAggregator.getLowestUncommittedSequenceNumber());
+                Assert.assertEquals(
+                    "Unexpected value returned by getLowestUncommittedSequenceNumber() before flush (Transaction appends).",
+                    sequenceNumbers.getLowestUncommitted(),
+                    context.segmentAggregator.getLowestUncommittedSequenceNumber());
             }
 
             // Call flush() and inspect the result.
@@ -495,7 +539,9 @@ public class SegmentAggregatorTests extends ThreadPooledTestSuite {
             outstandingSize.addAndGet(-flushResult.getFlushedBytes());
 
             Assert.assertFalse("Unexpected value returned by mustFlush() after flush (Transaction appends).", context.segmentAggregator.mustFlush());
-            Assert.assertEquals("Unexpected value returned by getLowestUncommittedSequenceNumber() after flush (Transaction appends).", sequenceNumbers.getLowestUncommitted(), context.segmentAggregator.getLowestUncommittedSequenceNumber());
+            Assert.assertEquals(
+                "Unexpected value returned by getLowestUncommittedSequenceNumber() after flush (Transaction appends).",
+                sequenceNumbers.getLowestUncommitted(), context.segmentAggregator.getLowestUncommittedSequenceNumber());
             Assert.assertEquals("Not expecting any merged bytes in this test.", 0, flushResult.getMergedBytes());
         }
 
@@ -514,7 +560,9 @@ public class SegmentAggregatorTests extends ThreadPooledTestSuite {
             // Call flush() and inspect the result.
             context.increaseTime(config.getFlushThresholdTime().toMillis() + 1); // Force a flush by incrementing the time by a lot.
             Assert.assertTrue("Unexpected value returned by mustFlush() (large appends).", context.segmentAggregator.mustFlush());
-            Assert.assertEquals("Unexpected value returned by getLowestUncommittedSequenceNumber() before flush (large appends).", sequenceNumbers.getLowestUncommitted(), context.segmentAggregator.getLowestUncommittedSequenceNumber());
+            Assert.assertEquals(
+                "Unexpected value returned by getLowestUncommittedSequenceNumber() before flush (large appends).",
+                sequenceNumbers.getLowestUncommitted(), context.segmentAggregator.getLowestUncommittedSequenceNumber());
             WriterFlushResult flushResult = context.segmentAggregator.flush(TIMEOUT).join();
 
             // We are always expecting a flush.
@@ -522,9 +570,10 @@ public class SegmentAggregatorTests extends ThreadPooledTestSuite {
             outstandingSize.addAndGet(-flushResult.getFlushedBytes());
 
             Assert.assertFalse("Unexpected value returned by mustFlush() after flush (time threshold).", context.segmentAggregator.mustFlush());
-            Assert.assertEquals("Unexpected value returned by getLowestUncommittedSequenceNumber() after flush (large appends).", sequenceNumbers.getLowestUncommitted(), context.segmentAggregator.getLowestUncommittedSequenceNumber());
+            Assert.assertEquals(
+                "Unexpected value returned by getLowestUncommittedSequenceNumber() after flush (large appends).",
+                sequenceNumbers.getLowestUncommitted(), context.segmentAggregator.getLowestUncommittedSequenceNumber());
             Assert.assertEquals("Not expecting any merged bytes in this test (large appends).", 0, flushResult.getMergedBytes());
-            checkAttributes(context);
         }
 
         // Verify data.
@@ -611,168 +660,125 @@ public class SegmentAggregatorTests extends ThreadPooledTestSuite {
         long storageLength = context.storage.getStreamSegmentInfo(context.segmentAggregator.getMetadata().getName(), TIMEOUT).join().getLength();
         Assert.assertEquals("Unexpected number of bytes flushed to Storage.", expectedData.length, storageLength);
         context.storage.read(readHandle(context.segmentAggregator.getMetadata().getName()), 0, actualData, 0, actualData.length, TIMEOUT).join();
-        checkAttributes(context);
 
         Assert.assertArrayEquals("Unexpected data written to storage.", expectedData, actualData);
         AssertExtensions.assertGreaterThan("Not enough errors injected.", 0, exceptionCount);
     }
 
     /**
-     * Tests the flush() method with UpdateAttributeOperations.
+     * Tests the behavior of flush() empty appends.
      */
     @Test
-    public void testFlushUpdateAttributes() throws Exception {
+    public void testFlushEmptyAppend() throws Exception {
         final WriterConfig config = DEFAULT_CONFIG;
-        final int updateCount = 100;
-        final int updateBatch = 3;
+        val rnd = new Random(0);
+        final byte[] initialBytes = new byte[config.getMaxFlushSizeBytes()];
+        final byte[] mergedBytes = new byte[100];
+        final int segmentLength = initialBytes.length + mergedBytes.length;
+        rnd.nextBytes(initialBytes);
+        rnd.nextBytes(mergedBytes);
 
         @Cleanup
         TestContext context = new TestContext(config);
+
+        // Create a segment in Storage.
+        context.storage.create(SEGMENT_NAME, TIMEOUT).join();
         context.segmentAggregator.initialize(TIMEOUT).join();
+        val metadata = (UpdateableSegmentMetadata) context.segmentAggregator.getMetadata();
+        metadata.setLength(segmentLength);
 
-        // UpdateAttributesOperations can only be triggered by a time trigger.
-        for (int i = 0; i < updateCount; i++) {
-            for (int b = 0; b < updateBatch; b++) {
-                UpdateAttributesOperation updateAttributeOp = generateUpdateAttributesAndUpdateMetadata(SEGMENT_ID, context);
-                context.segmentAggregator.add(updateAttributeOp);
-                Assert.assertFalse("Not expecting any flush eligibility yet.", context.segmentAggregator.mustFlush());
-            }
+        // First append fills up the max limit for the AggregatedAppend buffer.
+        val append1 = new StreamSegmentAppendOperation(SEGMENT_ID, new ByteArraySegment(initialBytes), null);
+        append1.setStreamSegmentOffset(0);
+        append1.setSequenceNumber(context.containerMetadata.nextOperationSequenceNumber());
+        context.dataSource.recordAppend(append1);
+        context.segmentAggregator.add(new CachedStreamSegmentAppendOperation(append1));
 
-            // Call flush() and inspect the result.
-            context.increaseTime(config.getFlushThresholdTime().toMillis() + 1); // Force a flush by incrementing the time by a lot.
-            Assert.assertTrue("Unexpected value returned by mustFlush() (time threshold).", context.segmentAggregator.mustFlush());
-            WriterFlushResult flushResult = context.segmentAggregator.flush(TIMEOUT).join();
+        // Second append is empty.
+        val emptyAppend = new StreamSegmentAppendOperation(SEGMENT_ID, BufferView.empty(), null);
+        emptyAppend.setStreamSegmentOffset(initialBytes.length);
+        emptyAppend.setSequenceNumber(context.containerMetadata.nextOperationSequenceNumber());
+        context.dataSource.recordAppend(emptyAppend);
+        context.segmentAggregator.add(new CachedStreamSegmentAppendOperation(emptyAppend));
 
-            // We are always expecting a flush.
-            Assert.assertEquals("Not expecting any bytes to be flushed.", 0, flushResult.getFlushedBytes() + flushResult.getMergedBytes());
-            Assert.assertEquals("Expecting one attribute to be flushed.", 1, flushResult.getFlushedAttributes());
+        // Create a source segment.
+        val sourceAggregator = context.transactionAggregators[0];
+        val sourceMetadata = (UpdateableSegmentMetadata) sourceAggregator.getMetadata();
+        sourceMetadata.setLength(mergedBytes.length);
+        sourceMetadata.setStorageLength(mergedBytes.length);
+        context.storage.create(sourceMetadata.getName(), TIMEOUT).join();
+        context.storage.openWrite(sourceMetadata.getName())
+                .thenCompose(handle -> context.storage.write(handle, 0, new ByteArrayInputStream(mergedBytes), mergedBytes.length, TIMEOUT)
+                        .thenCompose(v -> context.storage.seal(handle, TIMEOUT)))
+                .join();
 
-            Assert.assertFalse("Unexpected value returned by mustFlush() after flush (time threshold).", context.segmentAggregator.mustFlush());
-            checkAttributes(context);
-        }
+        // And include it via a Merge Op.
+        sourceMetadata.markSealed();
+        sourceMetadata.markSealedInStorage();
+        sourceMetadata.markMerged();
+        val mergeOp = new MergeSegmentOperation(SEGMENT_ID, sourceMetadata.getId());
+        mergeOp.setStreamSegmentOffset(initialBytes.length);
+        mergeOp.setLength(sourceMetadata.getLength());
+        mergeOp.setSequenceNumber(context.containerMetadata.nextOperationSequenceNumber());
+        context.segmentAggregator.add(mergeOp);
+
+        // Flush, and verify the result.
+        val flushResult1 = context.segmentAggregator.flush(TIMEOUT).get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        Assert.assertEquals("Unexpected number of bytes flushed", initialBytes.length, flushResult1.getFlushedBytes());
+        Assert.assertEquals("Unexpected number of bytes merged", mergedBytes.length, flushResult1.getMergedBytes());
+        byte[] expectedData = new byte[initialBytes.length + mergedBytes.length];
+        System.arraycopy(initialBytes, 0, expectedData, 0, initialBytes.length);
+        System.arraycopy(mergedBytes, 0, expectedData, initialBytes.length, mergedBytes.length);
+        verifySegmentData(expectedData, context);
     }
 
     /**
-     * Tests the flush() method with a sequence of {@link MergeSegmentOperation}, {@link UpdateAttributesOperation} and
-     * {@link StreamSegmentAppendOperation}.
-     *
-     * This combination will cause the SegmentAggregator to have two operations in its queue: a {@link MergeSegmentOperation}
-     * and an AggregatedAppendOperation. The AggregatedAppendOperation is generated from the {@link UpdateAttributesOperation}
-     * which does not have a StorageOffset - this test verifies it correctly picks up the maximum value between
-     * StorageOffset and LastAddedOffset.
+     * Tests the flush() method with the force flag set.
+     * Verifies both length-based and time-based flush triggers, as well as flushing rather large operations.
      */
     @Test
-    public void testFlushUpdateAttributesWithMergersAndAppends() throws Exception {
+    public void testFlushForced() throws Exception {
         final WriterConfig config = DEFAULT_CONFIG;
 
         @Cleanup
-        ByteArrayOutputStream writtenData = new ByteArrayOutputStream();
-        @Cleanup
         TestContext context = new TestContext(config);
-        val toMerge = context.transactionAggregators[0];
         context.segmentAggregator.initialize(TIMEOUT).join();
-        toMerge.initialize(TIMEOUT).join();
 
-        // Write something to the source segment, then flush it to Storage.
-        val sourceAppendOp = generateAppendAndUpdateMetadata(0, toMerge.getMetadata().getId(), context);
-        toMerge.add(sourceAppendOp);
-        getAppendData(sourceAppendOp, writtenData, context);
-        toMerge.add(generateSealAndUpdateMetadata(toMerge.getMetadata().getId(), context));
-        flushAllSegments(context);
+        @Cleanup
+        ByteArrayOutputStream writtenData = new ByteArrayOutputStream();
+        AtomicLong outstandingSize = new AtomicLong(); // Number of bytes remaining to be flushed.
+        SequenceNumberCalculator sequenceNumbers = new SequenceNumberCalculator(context, outstandingSize);
 
-        // Merge the Source Segment, then add an UpdateAttributesOperation followed by a SegmentAppendOperation.
-        context.segmentAggregator.add(generateMergeTransactionAndUpdateMetadata(toMerge.getMetadata().getId(), context));
-        context.segmentAggregator.add(generateUpdateAttributesAndUpdateMetadata(SEGMENT_ID, context));
-        val appendOp = generateAppendAndUpdateMetadata(0, SEGMENT_ID, context);
+        // A single operation should be allow us to test this feature.
+        StorageOperation appendOp = generateAppendAndUpdateMetadata(0, SEGMENT_ID, context);
+        outstandingSize.addAndGet(appendOp.getLength());
         context.segmentAggregator.add(appendOp);
         getAppendData(appendOp, writtenData, context);
-        WriterFlushResult mergeFlushResult = context.segmentAggregator.flush(TIMEOUT).join();
-        AssertExtensions.assertGreaterThan("Expecting a merger to happen now.", 0, mergeFlushResult.getMergedBytes());
+        sequenceNumbers.record(appendOp);
+
+        Assert.assertFalse("Unexpected value returned by mustFlush() (size threshold).", context.segmentAggregator.mustFlush());
+        Assert.assertEquals("Unexpected value returned by getLowestUncommittedSequenceNumber() before flush.",
+                sequenceNumbers.getLowestUncommitted(), context.segmentAggregator.getLowestUncommittedSequenceNumber());
 
         // Call flush() and inspect the result.
-        context.increaseTime(config.getFlushThresholdTime().toMillis() + 1); // Force a flush by incrementing the time by a lot.
-        Assert.assertTrue("Unexpected value returned by mustFlush().", context.segmentAggregator.mustFlush());
-        WriterFlushResult flushResult = context.segmentAggregator.flush(TIMEOUT).join();
-        Assert.assertEquals("Expecting one attribute to be flushed.", 1, flushResult.getFlushedAttributes());
-        Assert.assertFalse("Unexpected value returned by mustFlush() after flush (time threshold).", context.segmentAggregator.mustFlush());
+        val flushResult = context.segmentAggregator.flush(TIMEOUT).join();
+        Assert.assertFalse("Not expecting a flush.", flushResult.isAnythingFlushed());
+        Assert.assertFalse("Unexpected value returned by mustFlush() after no-op flush.", context.segmentAggregator.mustFlush());
 
-        // Check data in storage.
+        val forceFlushResult = context.segmentAggregator.flush(true, TIMEOUT).join();
+        Assert.assertEquals("Unexpected flush result.", appendOp.getLength(), forceFlushResult.getFlushedBytes());
+        Assert.assertFalse("Unexpected value returned by mustFlush() after force flush.", context.segmentAggregator.mustFlush());
+        outstandingSize.set(0);
+        Assert.assertEquals("Unexpected value returned by getLowestUncommittedSequenceNumber() after force flush",
+                sequenceNumbers.getLowestUncommitted(), context.segmentAggregator.getLowestUncommittedSequenceNumber());
+
+        // Verify data.
         byte[] expectedData = writtenData.toByteArray();
         byte[] actualData = new byte[expectedData.length];
         long storageLength = context.storage.getStreamSegmentInfo(context.segmentAggregator.getMetadata().getName(), TIMEOUT).join().getLength();
         Assert.assertEquals("Unexpected number of bytes flushed to Storage.", expectedData.length, storageLength);
         context.storage.read(readHandle(context.segmentAggregator.getMetadata().getName()), 0, actualData, 0, actualData.length, TIMEOUT).join();
         Assert.assertArrayEquals("Unexpected data written to storage.", expectedData, actualData);
-
-        // Check attributes.
-        checkAttributes(context);
-    }
-
-    /**
-     * Tests the flush() method with UpdateAttributeOperations.
-     */
-    @Test
-    public void testFlushUpdateAttributesWithErrors() throws Exception {
-        final WriterConfig config = DEFAULT_CONFIG;
-        final int updateCount = 100;
-        final int updateBatch = 3;
-        final int failAsyncEvery = 5;
-
-        @Cleanup
-        TestContext context = new TestContext(config);
-        context.segmentAggregator.initialize(TIMEOUT).join();
-        AtomicReference<IntentionalException> setException = new AtomicReference<>();
-        Supplier<Exception> exceptionSupplier = () -> {
-            IntentionalException ex = new IntentionalException(Long.toString(context.timer.getElapsedMillis()));
-            setException.set(ex);
-            return ex;
-        };
-        context.dataSource.setPersistAttributesErrorInjector(new ErrorInjector<>(count -> count % failAsyncEvery == 0, exceptionSupplier));
-
-        // UpdateAttributesOperations can only be triggered by a time trigger.
-        int exceptionCount = 0;
-        for (int i = 0; i < updateCount; i++) {
-            for (int b = 0; b < updateBatch; b++) {
-                UpdateAttributesOperation updateAttributeOp = generateUpdateAttributesAndUpdateMetadata(SEGMENT_ID, context);
-                context.segmentAggregator.add(updateAttributeOp);
-                Assert.assertEquals("Not expecting any flush eligibility yet.", setException.get() != null, context.segmentAggregator.mustFlush());
-            }
-
-            // Call flush() and inspect the result.
-            setException.set(null);
-            context.increaseTime(config.getFlushThresholdTime().toMillis() + 1); // Force a flush by incrementing the time by a lot.
-            Assert.assertTrue("Unexpected value returned by mustFlush() (time threshold).", context.segmentAggregator.mustFlush());
-
-            WriterFlushResult flushResult = null;
-            try {
-                flushResult = context.segmentAggregator.flush(TIMEOUT).join();
-                Assert.assertNull("An exception was expected, but none was thrown.", setException.get());
-                Assert.assertNotNull("No FlushResult provided.", flushResult);
-            } catch (Exception ex) {
-                if (setException.get() != null) {
-                    Assert.assertEquals("Unexpected exception thrown.", setException.get(), Exceptions.unwrap(ex));
-                    exceptionCount++;
-                } else {
-                    // Not expecting any exception this time.
-                    throw ex;
-                }
-            }
-
-            // Check flush result.
-            if (flushResult != null) {
-                // We are always expecting a flush.
-                Assert.assertEquals("Not expecting any bytes to be flushed.", 0, flushResult.getFlushedBytes() + flushResult.getMergedBytes());
-                Assert.assertEquals("Expecting one attribute to be flushed.", 1, flushResult.getFlushedAttributes());
-                Assert.assertFalse("Unexpected value returned by mustFlush() after flush (time threshold).", context.segmentAggregator.mustFlush());
-            }
-        }
-
-        // Do one last flush at the end to make sure we clear out all the buffers, if there's anything else left.
-        context.increaseTime(config.getFlushThresholdTime().toMillis() + 1); // Force a flush by incrementing the time by a lot.
-        context.dataSource.setPersistAttributesErrorInjector(null);
-        context.segmentAggregator.flush(TIMEOUT).join();
-        checkAttributes(context);
-        AssertExtensions.assertGreaterThan("Not enough errors injected.", 0, exceptionCount);
     }
 
     /**
@@ -820,14 +826,18 @@ public class SegmentAggregatorTests extends ThreadPooledTestSuite {
         // Generate and add a Seal Operation.
         StorageOperation sealOp = generateSealAndUpdateMetadata(SEGMENT_ID, context);
         context.segmentAggregator.add(sealOp);
-        Assert.assertEquals("Unexpected value returned by getLowestUncommittedSequenceNumber() after adding StreamSegmentSealOperation.", sequenceNumbers.getLowestUncommitted(), context.segmentAggregator.getLowestUncommittedSequenceNumber());
+        Assert.assertEquals(
+            "Unexpected value returned by getLowestUncommittedSequenceNumber() after adding StreamSegmentSealOperation.",
+            sequenceNumbers.getLowestUncommitted(), context.segmentAggregator.getLowestUncommittedSequenceNumber());
         Assert.assertTrue("Unexpected value returned by mustFlush() after adding StreamSegmentSealOperation.", context.segmentAggregator.mustFlush());
 
         // Call flush and verify that the entire Aggregator got flushed and the Seal got persisted to Storage.
         WriterFlushResult flushResult = context.segmentAggregator.flush(TIMEOUT).join();
         Assert.assertEquals("Expected the entire Aggregator to be flushed.", outstandingSize.get(), flushResult.getFlushedBytes());
         Assert.assertFalse("Unexpected value returned by mustFlush() after flushing.", context.segmentAggregator.mustFlush());
-        Assert.assertEquals("Unexpected value returned by getLowestUncommittedSequenceNumber() after flushing.", Operation.NO_SEQUENCE_NUMBER, context.segmentAggregator.getLowestUncommittedSequenceNumber());
+        Assert.assertEquals(
+            "Unexpected value returned by getLowestUncommittedSequenceNumber() after flushing.",
+            Operation.NO_SEQUENCE_NUMBER, context.segmentAggregator.getLowestUncommittedSequenceNumber());
 
         // Verify data.
         byte[] expectedData = writtenData.toByteArray();
@@ -837,7 +847,6 @@ public class SegmentAggregatorTests extends ThreadPooledTestSuite {
         Assert.assertTrue("Segment is not sealed in storage post flush.", storageInfo.isSealed());
         Assert.assertTrue("Segment is not marked in metadata as sealed in storage post flush.", context.segmentAggregator.getMetadata().isSealedInStorage());
         context.storage.read(InMemoryStorage.newHandle(context.segmentAggregator.getMetadata().getName(), false), 0, actualData, 0, actualData.length, TIMEOUT).join();
-        checkAttributes(context);
         Assert.assertArrayEquals("Unexpected data written to storage.", expectedData, actualData);
     }
 
@@ -1084,9 +1093,6 @@ public class SegmentAggregatorTests extends ThreadPooledTestSuite {
         for (Map.Entry<Long, Long> e : actualMergeOpAck) {
             Assert.assertEquals("Unexpected target for invocation to completeMerge.", context.segmentAggregator.getMetadata().getId(), (long) e.getKey());
         }
-
-        //Verify attributes.
-        checkAttributes(context);
     }
 
     /**
@@ -1173,7 +1179,6 @@ public class SegmentAggregatorTests extends ThreadPooledTestSuite {
         long storageLength = context.storage.getStreamSegmentInfo(context.segmentAggregator.getMetadata().getName(), TIMEOUT).join().getLength();
         Assert.assertEquals("Unexpected number of bytes flushed/merged to Storage.", expectedData.length, storageLength);
         context.storage.read(readHandle(context.segmentAggregator.getMetadata().getName()), 0, actualData, 0, actualData.length, TIMEOUT).join();
-        checkAttributes(context);
         Assert.assertArrayEquals("Unexpected data written to storage.", expectedData, actualData);
     }
 
@@ -1381,26 +1386,28 @@ public class SegmentAggregatorTests extends ThreadPooledTestSuite {
                        .thenCompose(handle -> context.storage.write(handle, 0, new ByteArrayInputStream(new byte[]{1}), 1, TIMEOUT))
                        .join();
         ((UpdateableSegmentMetadata) notSealed.getMetadata()).setLength(1L);
-        context.dataSource.persistAttributes(notSealed.getMetadata().getId(), Collections.singletonMap(UUID.randomUUID(), 1L), TIMEOUT).join();
+        context.dataSource.persistAttributes(notSealed.getMetadata().getId(), Collections.singletonMap(AttributeId.randomUUID(), 1L), TIMEOUT).join();
 
         // Seal the sealed segment.
         ((UpdateableSegmentMetadata) sealed.getMetadata()).markSealed();
         context.storage.openWrite(sealed.getMetadata().getName())
                        .thenCompose(handle -> context.storage.seal(handle, TIMEOUT))
                        .join();
+        context.dataSource.persistAttributes(sealed.getMetadata().getId(), Collections.singletonMap(AttributeId.randomUUID(), 1L), TIMEOUT).join();
 
         // Create a source segment; we'll verify this was also deleted when its target was.
         context.storage.create(withMergerSource.getMetadata().getName(), TIMEOUT).join();
-        context.dataSource.persistAttributes(withMergerSource.getMetadata().getId(), Collections.singletonMap(UUID.randomUUID(), 2L), TIMEOUT).join();
+        context.dataSource.persistAttributes(withMergerSource.getMetadata().getId(), Collections.singletonMap(AttributeId.randomUUID(), 2L), TIMEOUT).join();
 
         // This segment has an attribute index, but no segment has been created yet (since no data has been written to it).
-        context.dataSource.persistAttributes(emptyWithAttributes.getMetadata().getId(), Collections.singletonMap(UUID.randomUUID(), 3L), TIMEOUT).join();
+        context.dataSource.persistAttributes(emptyWithAttributes.getMetadata().getId(), Collections.singletonMap(AttributeId.randomUUID(), 3L), TIMEOUT).join();
 
         for (val a : allAggregators) {
             // Initialize the Aggregator and add the DeleteSegmentOperation.
             a.initialize(TIMEOUT).join();
             if (a == withMergers) {
-                // Add a merged segment to this one.
+                // Add a merged segment to this one, but not before adding an arbitrary operation.
+                withMergers.add(generateAppendAndUpdateMetadata(1, withMergers.getMetadata().getId(), context));
                 a.add(generateMergeTransactionAndUpdateMetadata(withMergers.getMetadata().getId(), withMergerSource.getMetadata().getId(), context));
             }
 
@@ -1602,6 +1609,57 @@ public class SegmentAggregatorTests extends ThreadPooledTestSuite {
     }
 
     /**
+     * Tests the ability of the Segment Aggregator to create Segments in Storage using the appropriate Segment Rolling Policy.
+     */
+    @Test
+    public void testSegmentRollingSize() throws Exception {
+        val config = WriterConfig
+                .builder()
+                .with(WriterConfig.MAX_ROLLOVER_SIZE, 1024L)
+                .with(WriterConfig.FLUSH_THRESHOLD_BYTES, DEFAULT_CONFIG.getFlushThresholdBytes())
+                .with(WriterConfig.FLUSH_THRESHOLD_MILLIS, DEFAULT_CONFIG.getFlushThresholdTime().toMillis())
+                .with(WriterConfig.MAX_FLUSH_SIZE_BYTES, DEFAULT_CONFIG.getMaxFlushSizeBytes())
+                .with(WriterConfig.MIN_READ_TIMEOUT_MILLIS, DEFAULT_CONFIG.getMaxReadTimeout().toMillis())
+                .build();
+
+        @Cleanup
+        TestContext context = new TestContext(config);
+
+        // Configure rollover size on segment 1 to be much higher than the limit.
+        val a1 = context.segmentAggregator;
+        ((UpdateableSegmentMetadata) a1.getMetadata()).updateAttributes(
+                Collections.singletonMap(Attributes.ROLLOVER_SIZE, config.getMaxRolloverSize() * 10));
+        val expectedRollover1 = config.getMaxRolloverSize();
+
+        // Configure rollover size on segment 2 to be lower than the limit
+        val a2 = context.transactionAggregators[0];
+        ((UpdateableSegmentMetadata) a2.getMetadata()).updateAttributes(
+                Collections.singletonMap(Attributes.ROLLOVER_SIZE, config.getMaxRolloverSize() / 2));
+        val expectedRollover2 = config.getMaxRolloverSize() / 2;
+
+        // Intercept the Storage.create() call so we can figure out if the appropriate rolling size is passed.
+        val rolloverSizes = new HashMap<String, Long>();
+        context.storage.setCreateInterceptor((segmentName, policy, s) -> {
+            rolloverSizes.put(segmentName, policy.getMaxLength());
+            return CompletableFuture.completedFuture(null);
+        });
+
+        a1.initialize(TIMEOUT).join();
+        a1.add(generateAppendAndUpdateMetadata(0, a1.getMetadata().getId(), context));
+        a1.add(generateSealAndUpdateMetadata(a1.getMetadata().getId(), context));
+
+        a2.initialize(TIMEOUT).join();
+        a2.add(generateAppendAndUpdateMetadata(0, a2.getMetadata().getId(), context));
+        a2.add(generateSealAndUpdateMetadata(a2.getMetadata().getId(), context));
+        flushAllSegments(context);
+        Assert.assertEquals("Unexpected number of segments created.", 2, rolloverSizes.size());
+        Assert.assertEquals("Unexpected rollover size when limited by configuration.",
+                expectedRollover1, (long) rolloverSizes.get(a1.getMetadata().getName()));
+        Assert.assertEquals("Unexpected rollover size when not limited by configuration.",
+                expectedRollover2, (long) rolloverSizes.get(a2.getMetadata().getName()));
+    }
+
+    /**
      * Tests the case when a Segment's data is missing from the ReadIndex (but the Segment itself is not deleted).
      */
     @Test
@@ -1627,6 +1685,75 @@ public class SegmentAggregatorTests extends ThreadPooledTestSuite {
                 "flush() did not throw when unable to read data from ReadIndex.",
                 () -> context.segmentAggregator.flush(TIMEOUT),
                 ex -> ex instanceof DataCorruptionException);
+    }
+
+    @Test
+    public void testMismatchOperationAndStorageOffsets() throws Exception {
+        final WriterConfig config = DEFAULT_CONFIG;
+
+        @Cleanup
+        TestContext context = new TestContext(config);
+        context.segmentAggregator.initialize(TIMEOUT).join();
+
+        // Add one operation big enough to trigger a Flush.
+        byte[] appendData = new byte[config.getFlushThresholdBytes() + 1];
+        UpdateableSegmentMetadata segmentMetadata = context.containerMetadata.getStreamSegmentMetadata(SEGMENT_ID);
+        long offset = segmentMetadata.getLength();
+        segmentMetadata.setLength(offset + appendData.length);
+
+        // Normal Append so far.
+        StreamSegmentAppendOperation op = new StreamSegmentAppendOperation(SEGMENT_ID, new ByteArraySegment(appendData), null);
+        op.setStreamSegmentOffset(offset);
+        op.setSequenceNumber(context.containerMetadata.nextOperationSequenceNumber());
+
+        context.dataSource.recordAppend(op);
+        context.segmentAggregator.add(new CachedStreamSegmentAppendOperation(op));
+        Assert.assertTrue("Unexpected value returned by mustFlush() (size threshold).", context.segmentAggregator.mustFlush());
+
+        // Call flush() and verify it throws DataCorruptionException.
+        context.segmentAggregator.flush(TIMEOUT);
+
+        // Add one operation big enough to trigger a Flush.
+        segmentMetadata = context.containerMetadata.getStreamSegmentMetadata(SEGMENT_ID);
+        offset += segmentMetadata.getLength();
+        segmentMetadata.setLength(offset + appendData.length);
+
+        StreamSegmentAppendOperation op2 = new StreamSegmentAppendOperation(SEGMENT_ID, new ByteArraySegment(appendData), null);
+        op2.setSequenceNumber(context.containerMetadata.nextOperationSequenceNumber());
+
+        // By some reason, assume that there is a discrepancy between the offset in Storage we know about this Segment
+        // and the offset of the Append that is supposed to have.
+        op2.setStreamSegmentOffset(offset - 1);
+        context.dataSource.recordAppend(op2);
+
+        // This should be detected upon adding the Operation to the Aggregator.
+        AssertExtensions.assertThrows(DataCorruptionException.class, () -> context.segmentAggregator.add(new CachedStreamSegmentAppendOperation(op2)));
+    }
+
+    /**
+     * Tests a scenario where the Segment has been deleted (in the metadata) while it was actively flushing. This verifies
+     * that an ongoing flush operation will abort (i.e., eventually complete) so that the next iteration of the StorageWriter
+     * may properly delete the segment.
+     */
+    @Test
+    public void testSegmentDeletedWhileFlushing() throws Exception {
+        final WriterConfig config = DEFAULT_CONFIG;
+
+        @Cleanup
+        TestContext context = new TestContext(config);
+        context.segmentAggregator.initialize(TIMEOUT).join();
+
+        // Add one append, followed by a Seal.
+        StorageOperation appendOp = generateAppendAndUpdateMetadata(SEGMENT_ID, new byte[config.getFlushThresholdBytes() - 1], context);
+        context.segmentAggregator.add(appendOp);
+        context.segmentAggregator.add(generateSealAndUpdateMetadata(SEGMENT_ID, context));
+        Assert.assertTrue("Unexpected value returned by mustFlush().", context.segmentAggregator.mustFlush());
+
+        // Meanwhile, delete the segment (but do not notify the StorageWriter yet).
+        val sm = (UpdateableSegmentMetadata) context.segmentAggregator.getMetadata();
+        sm.markDeleted();
+        val flushResult = context.segmentAggregator.flush(TIMEOUT).join();
+        Assert.assertEquals("Unexpected number of bytes flushed.", 0, flushResult.getFlushedBytes());
     }
 
     //endregion
@@ -1673,7 +1800,6 @@ public class SegmentAggregatorTests extends ThreadPooledTestSuite {
         long storageLength = context.storage.getStreamSegmentInfo(context.segmentAggregator.getMetadata().getName(), TIMEOUT).join().getLength();
         Assert.assertEquals("Unexpected number of bytes flushed to Storage.", expectedData.length, storageLength);
         context.storage.read(readHandle(context.segmentAggregator.getMetadata().getName()), 0, actualData, 0, actualData.length, TIMEOUT).join();
-        checkAttributes(context);
         Assert.assertArrayEquals("Unexpected data written to storage.", expectedData, actualData);
     }
 
@@ -1685,6 +1811,7 @@ public class SegmentAggregatorTests extends ThreadPooledTestSuite {
         final WriterConfig config = DEFAULT_CONFIG;
         final int appendCount = 1000;
         final int failEvery = 3;
+        final int partialFailEvery = 6;
 
         @Cleanup
         TestContext context = new TestContext(config);
@@ -1694,14 +1821,21 @@ public class SegmentAggregatorTests extends ThreadPooledTestSuite {
         AtomicInteger writeCount = new AtomicInteger();
         AtomicReference<Exception> setException = new AtomicReference<>();
         context.storage.setWriteInterceptor((segmentName, offset, data, length, storage) -> {
-            if (writeCount.incrementAndGet() % failEvery == 0) {
+            int wc = writeCount.incrementAndGet();
+            if (wc % failEvery == 0) {
+                if (wc % partialFailEvery == 0) {
+                    // Only a part of the operation has been written. Verify that we can reconcile partially written
+                    // operations as well.
+                    length /= 2;
+                }
+
                 // Time to wreak some havoc.
                 return storage.write(writeHandle(segmentName), offset, data, length, TIMEOUT)
-                              .thenAccept(v -> {
-                                  IntentionalException ex = new IntentionalException(String.format("S=%s,O=%d,L=%d", segmentName, offset, length));
-                                  setException.set(ex);
-                                  throw ex;
-                              });
+                        .thenAccept(v -> {
+                            IntentionalException ex = new IntentionalException(String.format("S=%s,O=%d", segmentName, offset));
+                            setException.set(ex);
+                            throw ex;
+                        });
             } else {
                 setException.set(null);
                 return null;
@@ -1752,7 +1886,6 @@ public class SegmentAggregatorTests extends ThreadPooledTestSuite {
         long storageLength = context.storage.getStreamSegmentInfo(context.segmentAggregator.getMetadata().getName(), TIMEOUT).join().getLength();
         Assert.assertEquals("Unexpected number of bytes flushed to Storage.", expectedData.length, storageLength);
         context.storage.read(readHandle(context.segmentAggregator.getMetadata().getName()), 0, actualData, 0, actualData.length, TIMEOUT).join();
-        checkAttributes(context);
         Assert.assertArrayEquals("Unexpected data written to storage.", expectedData, actualData);
     }
 
@@ -1790,7 +1923,6 @@ public class SegmentAggregatorTests extends ThreadPooledTestSuite {
 
         // Verify outcome.
         Assert.assertTrue("Segment not marked as sealed in storage (in metadata).", context.segmentAggregator.getMetadata().isSealedInStorage());
-        checkAttributes(context);
     }
 
     /**
@@ -1858,7 +1990,6 @@ public class SegmentAggregatorTests extends ThreadPooledTestSuite {
         long storageLength = context.storage.getStreamSegmentInfo(context.segmentAggregator.getMetadata().getName(), TIMEOUT).join().getLength();
         Assert.assertEquals("Unexpected number of bytes flushed to Storage.", expectedData.length, storageLength);
         context.storage.read(readHandle(context.segmentAggregator.getMetadata().getName()), 0, actualData, 0, actualData.length, TIMEOUT).join();
-        checkAttributes(context);
         Assert.assertArrayEquals("Unexpected data written to storage.", expectedData, actualData);
     }
 
@@ -1971,10 +2102,10 @@ public class SegmentAggregatorTests extends ThreadPooledTestSuite {
             // Add another operation and record its length.
             StorageOperation appendOp = generateAppendAndUpdateMetadata(i, SEGMENT_ID, context);
             appendOperations.add(appendOp);
-            byte[] ad = new byte[(int) appendOp.getLength()];
-            getAppendData(appendOp, new FixedByteArrayOutputStream(ad, 0, ad.length), context);
-            appendData.add(new ByteArrayInputStream(ad));
-            writtenData.write(ad);
+            val adStream = new ByteBufferOutputStream((int) appendOp.getLength());
+            getAppendData(appendOp, adStream, context);
+            appendData.add(adStream.getData().getReader());
+            writtenData.write(adStream.getData().getCopy());
         }
 
         // Add each operation at at time, and every X appends, write ahead to storage (X-1 appends). This will force a
@@ -2017,7 +2148,6 @@ public class SegmentAggregatorTests extends ThreadPooledTestSuite {
         long storageLength = context.storage.getStreamSegmentInfo(context.segmentAggregator.getMetadata().getName(), TIMEOUT).join().getLength();
         Assert.assertEquals("Unexpected number of bytes flushed to Storage.", expectedData.length, storageLength);
         context.storage.read(readHandle(context.segmentAggregator.getMetadata().getName()), 0, actualData, 0, actualData.length, TIMEOUT).join();
-        checkAttributes(context);
         Assert.assertArrayEquals("Unexpected data written to storage.", expectedData, actualData);
     }
 
@@ -2146,7 +2276,6 @@ public class SegmentAggregatorTests extends ThreadPooledTestSuite {
         verifySegmentData(parentData.toByteArray(), context);
         AssertExtensions.assertListEquals("Unexpected callback calls to completeMerge for already processed operations.",
                 expectedMergeOpAck, actualMergeOpAck, Map.Entry::equals);
-        checkAttributes(context);
     }
 
     /**
@@ -2193,7 +2322,6 @@ public class SegmentAggregatorTests extends ThreadPooledTestSuite {
 
         // Verify that in the end, the contents of the parents is as expected.
         verifySegmentData(writtenData, context);
-        checkAttributes(context);
     }
 
     /**
@@ -2247,76 +2375,15 @@ public class SegmentAggregatorTests extends ThreadPooledTestSuite {
         Assert.assertTrue("Merge was not ack-ed for deleted source segment.", mergeAcked.get());
     }
 
-    /**
-     * Tests a scenario where an empty, sealed segment has one or more UpdateAttributesOperations that needs to be processed
-     * or reconciled.
-     */
-    @Test
-    public void testRecoverySealEmptySegmentWithAttributes() throws Exception {
-        @Cleanup
-        TestContext context = new TestContext(DEFAULT_CONFIG);
-
-        // Do not create the segment in Storage, but mark its metadata as sealed.
-        val sm = (UpdateableSegmentMetadata) context.segmentAggregator.getMetadata();
-        sm.markSealed();
-        context.segmentAggregator.initialize(TIMEOUT).join();
-
-        Assert.assertTrue("Expected isSealedInStorage to be true after initialization.", sm.isSealedInStorage());
-        val updateOp = generateUpdateAttributesAndUpdateMetadata(SEGMENT_ID, context);
-        val sealOp = generateSealAndUpdateMetadata(SEGMENT_ID, context);
-        context.segmentAggregator.add(updateOp);
-        context.segmentAggregator.add(sealOp);
-        Assert.assertEquals("Expected Attribute Operation to have been ignored.",
-                Long.MIN_VALUE, context.segmentAggregator.getLowestUncommittedSequenceNumber());
-        Assert.assertFalse("Not expecting anything to flush.", context.segmentAggregator.mustFlush());
-    }
-
     //endregion
 
     //region Helpers
 
-    private void checkAttributes(TestContext context) {
-        checkAttributes(context.segmentAggregator.getMetadata(), context);
-        for (val sa : context.transactionAggregators) {
-            checkAttributes(sa.getMetadata(), context);
-        }
-    }
-
-    private void checkAttributes(SegmentMetadata metadata, TestContext context) {
-        val persistedAttributes = context.dataSource.getPersistedAttributes(metadata.getId());
-        int extendedAttributeCount = 0;
-        if (context.transactionIds.containsKey(metadata.getId()) && metadata.isMerged()) {
-            Assert.assertEquals("Unexpected number of attributes in attribute index for merged transaction " + metadata.getId(),
-                    0, persistedAttributes.size());
-            AssertExtensions.assertFutureThrows(
-                    "Merged transaction attribute index still exists.",
-                    context.dataSource.persistAttributes(metadata.getId(), Collections.singletonMap(UUID.randomUUID(), 0L), TIMEOUT),
-                    ex -> ex instanceof StreamSegmentNotExistsException);
-        } else {
-            for (val e : metadata.getAttributes().entrySet()) {
-                if (Attributes.isCoreAttribute(e.getKey())) {
-                    Assert.assertFalse("Not expecting Core Attribute in Attribute Index for " + metadata.getId(), persistedAttributes.containsKey(e.getKey()));
-                } else {
-                    extendedAttributeCount++;
-                    Assert.assertEquals("Unexpected attribute value for " + metadata.getId(), e.getValue(), persistedAttributes.get(e.getKey()));
-                }
-            }
-
-            Assert.assertEquals("Unexpected number of attributes in attribute index for " + metadata.getId(), extendedAttributeCount, persistedAttributes.size());
-            if (metadata.isSealedInStorage()) {
-                AssertExtensions.assertFutureThrows(
-                        "Sealed segment attribute index accepted new values.",
-                        context.dataSource.persistAttributes(metadata.getId(), Collections.singletonMap(UUID.randomUUID(), 0L), TIMEOUT),
-                        ex -> ex instanceof StreamSegmentSealedException);
-            }
-        }
-    }
-
     private void getAppendData(StorageOperation operation, OutputStream stream, TestContext context) {
         Assert.assertTrue("Not an append operation: " + operation, operation instanceof CachedStreamSegmentAppendOperation);
-        InputStream result = context.dataSource.getAppendData(operation.getStreamSegmentId(), operation.getStreamSegmentOffset(), (int) operation.getLength());
+        BufferView result = context.dataSource.getAppendData(operation.getStreamSegmentId(), operation.getStreamSegmentOffset(), (int) operation.getLength());
         try {
-            IOUtils.copy(result, stream);
+            result.copyTo(stream);
         } catch (IOException ex) {
             Assert.fail("Not expecting this exception: " + ex);
         }
@@ -2365,20 +2432,6 @@ public class SegmentAggregatorTests extends ThreadPooledTestSuite {
         return sealOp;
     }
 
-    private UpdateAttributesOperation generateUpdateAttributesAndUpdateMetadata(long segmentId, TestContext context) {
-        UpdateableSegmentMetadata segmentMetadata = context.containerMetadata.getStreamSegmentMetadata(segmentId);
-        long coreAttributeValue = segmentMetadata.getAttributes().getOrDefault(CORE_ATTRIBUTE_ID, 0L) + 1;
-        long extendedAttributeValue = segmentMetadata.getAttributes().getOrDefault(EXTENDED_ATTRIBUTE_ID, 0L) + 13;
-        Collection<AttributeUpdate> attributeUpdates = Arrays.asList(
-                new AttributeUpdate(CORE_ATTRIBUTE_ID, AttributeUpdateType.Accumulate, coreAttributeValue),
-                new AttributeUpdate(EXTENDED_ATTRIBUTE_ID, AttributeUpdateType.Replace, extendedAttributeValue));
-        segmentMetadata.updateAttributes(
-                attributeUpdates.stream().collect(Collectors.toMap(AttributeUpdate::getAttributeId, AttributeUpdate::getValue)));
-        UpdateAttributesOperation op = new UpdateAttributesOperation(segmentId, attributeUpdates);
-        op.setSequenceNumber(context.containerMetadata.nextOperationSequenceNumber());
-        return op;
-    }
-
     private StorageOperation generateAppendAndUpdateMetadata(int appendId, long segmentId, TestContext context) {
         byte[] data = String.format("Append_%d", appendId).getBytes();
         return generateAppendAndUpdateMetadata(segmentId, data, context);
@@ -2389,9 +2442,7 @@ public class SegmentAggregatorTests extends ThreadPooledTestSuite {
         long offset = segmentMetadata.getLength();
         segmentMetadata.setLength(offset + data.length);
 
-        // Update some attributes.
-        val updateOp = generateUpdateAttributesAndUpdateMetadata(segmentId, context);
-        StreamSegmentAppendOperation op = new StreamSegmentAppendOperation(segmentId, data, updateOp.getAttributeUpdates());
+        StreamSegmentAppendOperation op = new StreamSegmentAppendOperation(segmentId, new ByteArraySegment(data), null);
         op.setStreamSegmentOffset(offset);
         op.setSequenceNumber(context.containerMetadata.nextOperationSequenceNumber());
 
@@ -2403,7 +2454,7 @@ public class SegmentAggregatorTests extends ThreadPooledTestSuite {
         byte[] data = "Append_Dummy".getBytes();
         UpdateableSegmentMetadata segmentMetadata = context.containerMetadata.getStreamSegmentMetadata(segmentId);
         long offset = segmentMetadata.getLength();
-        StreamSegmentAppendOperation op = new StreamSegmentAppendOperation(segmentId, data, null);
+        StreamSegmentAppendOperation op = new StreamSegmentAppendOperation(segmentId, new ByteArraySegment(data), null);
         op.setStreamSegmentOffset(offset);
         return op;
     }

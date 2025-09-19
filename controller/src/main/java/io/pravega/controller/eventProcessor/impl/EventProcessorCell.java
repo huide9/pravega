@@ -1,11 +1,17 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.controller.eventProcessor.impl;
 
@@ -53,6 +59,7 @@ class EventProcessorCell<T extends ControllerEvent> {
     private final EventStreamReader<T> reader;
     private final EventStreamWriter<T> selfWriter;
     private final CheckpointStore checkpointStore;
+    @Getter(AccessLevel.PACKAGE)
     private final String process;
     private final String readerGroupName;
     @Getter(AccessLevel.PACKAGE)
@@ -69,7 +76,7 @@ class EventProcessorCell<T extends ControllerEvent> {
      * This delegate provides a single thread of execution for the event processor.
      * This prevents sub-classes of EventProcessor from controlling EventProcessor's lifecycle.
      */
-    private final Service delegate;
+    private final Delegate delegate;
 
     private class Delegate extends AbstractExecutionThreadService {
 
@@ -77,6 +84,7 @@ class EventProcessorCell<T extends ControllerEvent> {
         private final EventProcessorConfig<T> eventProcessorConfig;
         private EventRead<T> event;
         private final CheckpointState state;
+        private final AtomicReference<Thread> currentThread = new AtomicReference<>();
 
         Delegate(final EventProcessorConfig<T> eventProcessorConfig) {
             this.eventProcessorConfig = eventProcessorConfig;
@@ -97,7 +105,7 @@ class EventProcessorCell<T extends ControllerEvent> {
         @Override
         protected final void run() throws Exception {
             log.debug("Event processor RUN {}, state={}", objectId, state());
-
+            this.currentThread.set(Thread.currentThread());
             while (isRunning()) {
                 try {
                     event = reader.readNextEvent(defaultTimeout);
@@ -109,14 +117,18 @@ class EventProcessorCell<T extends ControllerEvent> {
                         state.store(event.getPosition());
                     }
                 } catch (Exception e) {
-                    handleException(e);
+                    log.debug("Exception while reading the events {}", e);
+                    if (this.currentThread.get() != null) {
+                        handleException(e);
+                    }
                 }
             }
+            log.info("Event processor RUN {}, state={}, isRunning={}", objectId, state(), isRunning());
         }
 
         @Override
         protected final void shutDown() throws Exception {
-            log.info("Event processor SHUTDOWN {}, state={}", objectId, state());
+            log.info("Event processor SHUTDOWN {}, state={}, ISRUNNING={}", objectId, state(), isRunning());
             try {
                 actor.afterStop();
             } catch (Exception e) {
@@ -134,15 +146,7 @@ class EventProcessorCell<T extends ControllerEvent> {
                 try {
                     reader.closeAt(getCheckpoint());
                 } catch (Exception e) {
-                    log.info("Exception while closing EventProcessorCell reader from checkpointStore: {}.", e.getMessage());
-                }
-
-                // Next, clean up the reader and its position from checkpoint store
-                log.info("Cleaning up checkpoint store for {}", objectId);
-                try {
-                    checkpointStore.removeReader(process, readerGroupName, readerId);
-                } catch (Exception e) {
-                    log.info("Exception while removing reader from checkpointStore: {}.", e.getMessage());
+                    log.warn("Exception while closing EventProcessorCell reader from checkpointStore: {}.", e.getMessage());
                 }
             }
         }
@@ -166,6 +170,7 @@ class EventProcessorCell<T extends ControllerEvent> {
 
         private void handleException(Exception e) {
             ExceptionHandler.Directive directive = eventProcessorConfig.getExceptionHandler().run(e);
+            log.info("Exception handler directive is {}", directive);
             switch (directive) {
                 case Restart:
                     log.warn("Restarting event processor: {} due to exception: {}", objectId, e);
@@ -251,7 +256,7 @@ class EventProcessorCell<T extends ControllerEvent> {
         this.process = process;
         this.readerGroupName = eventProcessorConfig.getConfig().getReaderGroupName();
         this.readerId = readerId;
-        this.objectId = String.format("EventProcessor[%s:%s]", this.readerGroupName, index);
+        this.objectId = String.format("EventProcessor[%s:%d:%s]", this.readerGroupName, index, readerId);
         this.actor = createEventProcessor(eventProcessorConfig);
         this.delegate = new Delegate(eventProcessorConfig);
         this.lastCheckpoint = new AtomicReference<>();
@@ -266,10 +271,17 @@ class EventProcessorCell<T extends ControllerEvent> {
         }
     }
 
-    final void stopAsync() {
+    final void stopAsync(boolean interruptDelegate) {
         long traceId = LoggerHelpers.traceEnterWithContext(log, this.objectId, "stopAsync");
         try {
+            Thread thread = delegate.currentThread.get();
             delegate.stopAsync();
+            if (thread != null && interruptDelegate) {
+                delegate.currentThread.set(null);
+                log.debug("Event Processor {} is interrupted", objectId);
+                thread.interrupt();
+            }
+            log.info("Event processor cell {} SHUTDOWN issued", this.objectId);
         } finally {
             LoggerHelpers.traceLeave(log, this.objectId, "stopAsync", traceId);
         }
@@ -292,6 +304,7 @@ class EventProcessorCell<T extends ControllerEvent> {
 
     final void awaitTerminated() {
         delegate.awaitTerminated();
+        log.info("Event processor cell {} Terminated", this.objectId);
     }
 
     private EventProcessor<T> createEventProcessor(final EventProcessorConfig<T> eventProcessorConfig) {

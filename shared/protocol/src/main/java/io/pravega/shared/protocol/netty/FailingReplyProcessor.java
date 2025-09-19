@@ -1,11 +1,17 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.shared.protocol.netty;
 
@@ -109,7 +115,17 @@ public abstract class FailingReplyProcessor implements ReplyProcessor {
     public void segmentAttributeUpdated(WireCommands.SegmentAttributeUpdated segmentAttributeUpdated) {
         throw new IllegalStateException("Unexpected operation: " + segmentAttributeUpdated);
     }
-    
+
+    @Override
+    public void storageFlushed(WireCommands.StorageFlushed storageFlushed) {
+        throw new IllegalStateException("Unexpected operation: " + storageFlushed);
+    }
+
+    @Override
+    public void storageChunksListed(WireCommands.StorageChunksListed storageChunksListed) {
+        throw new IllegalStateException("Unexpected operation: " + storageChunksListed);
+    }
+
     @Override
     public void segmentAttribute(WireCommands.SegmentAttribute segmentAttribute) {
         throw new IllegalStateException("Unexpected operation: " + segmentAttribute);
@@ -131,6 +147,11 @@ public abstract class FailingReplyProcessor implements ReplyProcessor {
     }
 
     @Override
+    public void segmentsBatchMerged(WireCommands.SegmentsBatchMerged segmentsMerged) {
+        throw new IllegalStateException("Unexpected operation: " + segmentsMerged);
+    }
+
+    @Override
     public void segmentSealed(SegmentSealed segmentSealed) {
         throw new IllegalStateException("Unexpected operation: " + segmentSealed);
     }
@@ -145,6 +166,15 @@ public abstract class FailingReplyProcessor implements ReplyProcessor {
         throw new IllegalStateException("Unexpected operation: " + segmentDeleted);
     }
 
+    @Override
+    public void authTokenCheckFailed(WireCommands.AuthTokenCheckFailed authFailed) {
+        throw new IllegalStateException("Unexpected operation: " + authFailed);
+    }
+
+    @Override
+    public void tableSegmentInfo(WireCommands.TableSegmentInfo info) {
+        throw new IllegalStateException("Unexpected operation: " + info);
+    }
 
     @Override
     public void tableEntriesUpdated(WireCommands.TableEntriesUpdated tableEntriesUpdated) {
@@ -173,7 +203,7 @@ public abstract class FailingReplyProcessor implements ReplyProcessor {
 
     @Override
     public void keepAlive(KeepAlive keepAlive) {
-        throw new IllegalStateException("Unexpected operation: " + keepAlive);
+        log.trace("KeepAlive received");
     }
 
     @Override
@@ -194,5 +224,20 @@ public abstract class FailingReplyProcessor implements ReplyProcessor {
     @Override
     public void tableEntriesRead(WireCommands.TableEntriesRead tableEntriesRead) {
         throw new IllegalStateException("Unexpected operation: " + tableEntriesRead);
+    }
+
+    @Override
+    public void tableEntriesDeltaRead(WireCommands.TableEntriesDeltaRead tableEntriesDeltaRead) {
+        throw new IllegalStateException("Unexpected operation: " + tableEntriesDeltaRead);
+    }
+    
+    @Override
+    public void offsetLocated(WireCommands.OffsetLocated offsetLocated) {
+        throw new IllegalStateException("Unexpected operation: " + offsetLocated);
+    }
+
+    @Override
+    public void errorMessage(WireCommands.ErrorMessage errorMessage) {
+        throw new IllegalStateException("Unexpected operation: " + errorMessage);
     }
 }

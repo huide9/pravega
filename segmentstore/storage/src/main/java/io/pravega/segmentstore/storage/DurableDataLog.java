@@ -1,16 +1,22 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.segmentstore.storage;
 
-import io.pravega.common.util.ArrayView;
 import io.pravega.common.util.CloseableIterator;
+import io.pravega.common.util.CompositeArrayView;
 import java.io.InputStream;
 import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
@@ -84,13 +90,13 @@ public interface DurableDataLog extends AutoCloseable {
      * is always reported when the CompletableFuture returned by this method is completed exceptionally.
      * </ul>
      *
-     * @param data    An ArrayView representing the data to append.
+     * @param data    A CompositeArrayView representing the data to append.
      * @param timeout Timeout for the operation.
      * @return A CompletableFuture that, when completed, will contain the LogAddress within the log for the entry. If the entry
      * failed to be added, this Future will complete with the appropriate exception.
      * @throws IllegalStateException If the DurableDataLog is not currently initialized (which implies being enabled).
      */
-    CompletableFuture<LogAddress> append(ArrayView data, Duration timeout);
+    CompletableFuture<LogAddress> append(CompositeArrayView data, Duration timeout);
 
     /**
      * Truncates the log up to the given sequence.
@@ -123,9 +129,17 @@ public interface DurableDataLog extends AutoCloseable {
     CloseableIterator<ReadItem, DurableDataLogException> getReader() throws DurableDataLogException;
 
     /**
-     * Gets the maximum number of bytes allowed for a single append.
+     * Gets a {@link WriteSettings} containing limitations for appends.
+     * @return A new {@link WriteSettings} object.
      */
-    int getMaxAppendLength();
+    WriteSettings getWriteSettings();
+
+    /**
+     * Fetch the metadata for this log.
+     * @return the metadata persisted for this DurableDataLog.
+     * @throws DataLogInitializationException any exception with ZK while fetching metadata.
+     */
+    ReadOnlyLogMetadata loadMetadata() throws DataLogInitializationException;
 
     /**
      * Gets a value indicating the current Epoch of this DurableDataLog.
@@ -144,11 +158,28 @@ public interface DurableDataLog extends AutoCloseable {
     long getEpoch();
 
     /**
+     * Override the epoch in the log metadata. To be used in cases where we initialize container from storage
+     * where we override the epoch in container metadata with epoch read from starage.
+     * @param epoch epoch to be overriden
+     * @throws  DurableDataLogException in case of exceptions while overriding.
+     */
+    void overrideEpoch(long epoch) throws DurableDataLogException;
+
+    /**
      * Gets a QueueStats with information about the current state of the queue.
      *
      * @return The result.
      */
     QueueStats getQueueStatistics();
+
+    /**
+     * Registers a {@link ThrottleSourceListener} that will be invoked every time the internal queue state changes by having
+     * added or removed from it.
+     *
+     * @param listener The {@link ThrottleSourceListener} to register. This listener will be unregistered when its
+     *                 {@link ThrottleSourceListener#isClosed()} is determined to be true.
+     */
+    void registerQueueStateChangeListener(ThrottleSourceListener listener);
 
     /**
      * Closes this instance of a DurableDataLog and releases any resources it holds.

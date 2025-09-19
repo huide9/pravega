@@ -1,11 +1,17 @@
 /**
- * Copyright (c) 2018 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.test.integration;
 
@@ -26,6 +32,7 @@ import io.pravega.client.stream.mock.MockClientFactory;
 import io.pravega.client.stream.mock.MockStreamManager;
 import io.pravega.segmentstore.contracts.StreamSegmentStore;
 import io.pravega.segmentstore.contracts.tables.TableStore;
+import io.pravega.segmentstore.server.host.handler.IndexAppendProcessor;
 import io.pravega.segmentstore.server.host.handler.PravegaConnectionListener;
 import io.pravega.segmentstore.server.store.ServiceBuilder;
 import io.pravega.segmentstore.server.store.ServiceBuilderConfig;
@@ -57,7 +64,7 @@ public class IdleSegmentTest {
         this.serviceBuilder.close();
     }
 
-    @Test(timeout = 5000)
+    @Test(timeout = 30000)
     public void testByteBufferEventsWithIdleSegments() throws ReinitializationRequiredException {
         String endpoint = "localhost";
         String streamName = "abc";
@@ -70,10 +77,12 @@ public class IdleSegmentTest {
         TableStore tableStore = serviceBuilder.createTableStoreService();
 
         @Cleanup
-        PravegaConnectionListener server = new PravegaConnectionListener(false, port, store, tableStore);
+        PravegaConnectionListener server = new PravegaConnectionListener(false, port, store, tableStore,
+                serviceBuilder.getLowPriorityExecutor(), new IndexAppendProcessor(serviceBuilder.getLowPriorityExecutor(), store));
         server.startListening();
         @Cleanup
         MockStreamManager streamManager = new MockStreamManager(scope, endpoint, port);
+        @Cleanup
         MockClientFactory clientFactory = streamManager.getClientFactory();
         ReaderGroupConfig groupConfig = ReaderGroupConfig.builder()
                                                          .stream(Stream.of(scope, streamName))
@@ -86,6 +95,7 @@ public class IdleSegmentTest {
                                                       .build());
         streamManager.createReaderGroup(readerGroup, groupConfig);
         Serializer<ByteBuffer> serializer = new ByteBufferSerializer();
+        @Cleanup
         EventStreamWriter<ByteBuffer> producer = clientFactory.createEventWriter(streamName, serializer,
                                                                              EventWriterConfig.builder().build());
         List<CompletableFuture<Void>> results = new ArrayList<>();
@@ -94,7 +104,6 @@ public class IdleSegmentTest {
             System.out.println("Writing event " + i);
         }
         producer.flush();
-        System.err.println(results);
 
         @Cleanup
         EventStreamReader<ByteBuffer> reader = clientFactory.createReader(readerName, readerGroup, serializer,

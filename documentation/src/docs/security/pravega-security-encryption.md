@@ -1,17 +1,23 @@
 <!--
-Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+Copyright Pravega Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
 -->
 # Pravega Encryption
 
 ## Encryption of data in flight
 Pravega ensures that all the data in flight can be passed by applying encryption.
-The different [channels](https://github.com/pravega/pravega/wiki/PDP-23:-Pravega-security----encryption-and-Role-Based-Access-Control#b-encryption-of-data-in-flight-over-network-and-in-tier-1)
+The different [channels](https://github.com/pravega/pravega/wiki/PDP-23-%28Pravega-Security-Encryption-and-Role-Based-Access-Control%29)
 can be configured with TLS and encryption can be enabled for them.
 
 ### Certificate Management
@@ -28,7 +34,7 @@ Pravega Segment Store uses Apache Bookkeeper as Tier 1 Storage. Apache Bookkeepe
 
 ### Encrypted access to Apache Zookeeper
 Pravega Segment Store and Pravega Controller interact with Apache Zookeeper. These connections can be encrypted based on configuration.
-The details about the configurations can be found at for [Pravega Segment Store](pravega-security-configurations.md#pravega-segment-store) and for [Pravega Controller](pravega-security-configurations.md#pravega-controller).
+The details about the configurations can be found at for [Pravega Segment Store](pravega-security-configurations.md#segment-store-tls-configuration-parameters) and for [Pravega Controller](pravega-security-configurations.md#controller-tls-configuration-parameters).
 
 ## Encryption of data at rest
 ### Encryption of data in Tier 1

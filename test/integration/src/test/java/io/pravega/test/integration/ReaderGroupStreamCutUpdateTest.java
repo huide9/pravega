@@ -1,11 +1,17 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.test.integration;
 
@@ -25,19 +31,18 @@ import io.pravega.client.stream.Stream;
 import io.pravega.client.stream.StreamConfiguration;
 import io.pravega.client.stream.StreamCut;
 import io.pravega.client.stream.impl.JavaSerializer;
-import io.pravega.common.concurrent.ExecutorServiceHelpers;
 import io.pravega.segmentstore.contracts.StreamSegmentStore;
 import io.pravega.segmentstore.contracts.tables.TableStore;
+import io.pravega.segmentstore.server.host.handler.IndexAppendProcessor;
 import io.pravega.segmentstore.server.host.handler.PravegaConnectionListener;
 import io.pravega.segmentstore.server.store.ServiceBuilder;
 import io.pravega.segmentstore.server.store.ServiceBuilderConfig;
 import io.pravega.test.common.TestUtils;
 import io.pravega.test.common.TestingServerStarter;
-import io.pravega.test.integration.demo.ControllerWrapper;
+import io.pravega.test.common.ThreadPooledTestSuite;
+import io.pravega.test.integration.utils.ControllerWrapper;
 import java.net.URI;
 import java.util.Map;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
 import lombok.Cleanup;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.curator.test.TestingServer;
@@ -47,7 +52,7 @@ import org.junit.Before;
 import org.junit.Test;
 
 @Slf4j
-public class ReaderGroupStreamCutUpdateTest {
+public class ReaderGroupStreamCutUpdateTest extends ThreadPooledTestSuite {
 
     private final int controllerPort = TestUtils.getAvailableListenPort();
     private final String serviceHost = "localhost";
@@ -58,11 +63,14 @@ public class ReaderGroupStreamCutUpdateTest {
     private PravegaConnectionListener server;
     private ControllerWrapper controllerWrapper;
     private ServiceBuilder serviceBuilder;
-    private ScheduledExecutorService executor;
+
+    @Override
+    protected int getThreadPoolSize() {
+        return 1;
+    }
 
     @Before
     public void setUp() throws Exception {
-        executor = Executors.newSingleThreadScheduledExecutor();
         zkTestServer = new TestingServerStarter().start();
 
         serviceBuilder = ServiceBuilder.newInMemoryBuilder(ServiceBuilderConfig.getDefaultConfig());
@@ -70,7 +78,8 @@ public class ReaderGroupStreamCutUpdateTest {
         StreamSegmentStore store = serviceBuilder.createStreamSegmentService();
         TableStore tableStore = serviceBuilder.createTableStoreService();
 
-        server = new PravegaConnectionListener(false, servicePort, store, tableStore);
+        server = new PravegaConnectionListener(false, servicePort, store, tableStore, serviceBuilder.getLowPriorityExecutor(),
+                new IndexAppendProcessor(serviceBuilder.getLowPriorityExecutor(), store));
         server.startListening();
 
         controllerWrapper = new ControllerWrapper(zkTestServer.getConnectString(),
@@ -84,7 +93,6 @@ public class ReaderGroupStreamCutUpdateTest {
 
     @After
     public void tearDown() throws Exception {
-        ExecutorServiceHelpers.shutdown(executor);
         controllerWrapper.close();
         server.close();
         serviceBuilder.close();
@@ -101,6 +109,7 @@ public class ReaderGroupStreamCutUpdateTest {
         final int numEvents = 100;
 
         // First, create the stream.
+        @Cleanup
         StreamManager streamManager = StreamManager.create(controllerURI);
         Assert.assertTrue(streamManager.createScope(scope));
         StreamConfiguration streamConfiguration = StreamConfiguration.builder()
@@ -128,7 +137,7 @@ public class ReaderGroupStreamCutUpdateTest {
                 new JavaSerializer<>(), ReaderConfig.builder().build());
 
         Map<Stream, StreamCut> currentStreamcuts = readerGroup.getStreamCuts();
-        EventRead eventRead;
+        EventRead<Double> eventRead;
         int lastIteration = 0, iteration = 0;
         int assertionFrequency = checkpointingIntervalMs / readerSleepInterval;
         do {

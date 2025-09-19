@@ -1,11 +1,17 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.controller.server.rpc.grpc;
 
@@ -42,6 +48,7 @@ public interface GRPCServerConfig extends ServerConfig {
      *
      * @return Whether this deployment has auth enabled.
      */
+    @Override
     boolean isAuthorizationEnabled();
 
     /**
@@ -58,6 +65,12 @@ public interface GRPCServerConfig extends ServerConfig {
       * @return A flag representing TLS status.
      */
     boolean isTlsEnabled();
+
+    /**
+     * A configuration for TLS protocol versions.
+     * @return A variable for tls protocol version
+     */
+    String[] getTlsProtocolVersion();
 
     /**
      * The truststore to be used while talking to segmentstore over TLS.
@@ -86,6 +99,22 @@ public interface GRPCServerConfig extends ServerConfig {
      * @return The string to be used for signing the token.
      */
     String getTokenSigningKey();
+
+    /**
+     * Returns the delegation token time-to-live (TTL) value. The TTL in turn determines the time at which the
+     * delegation token expires.
+     *
+     * @return time-to-live value of the access token in seconds.
+     */
+    Integer getAccessTokenTTLInSeconds();
+
+    /**
+     * Indicates whether writes to reader group streams are allowed with read permissions. If false, writes to those streams
+     * will require write permissions too.
+     *
+     * @return Whether writes for reader groups streams are allowed with read permissions.
+     */
+    boolean isRGWritesWithReadPermEnabled();
 
     /**
      * Returns whether the controller should send back to the client a full stack trace describing an error upon a

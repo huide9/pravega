@@ -1,14 +1,21 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.client.stream.impl;
 
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import io.pravega.client.segment.impl.Segment;
@@ -16,14 +23,16 @@ import io.pravega.client.state.Revision;
 import io.pravega.client.stream.ReaderGroupConfig;
 import io.pravega.client.stream.Stream;
 import io.pravega.client.stream.StreamCut;
+import io.pravega.client.stream.impl.ReaderGroupState.AcquireSegment;
 import io.pravega.client.stream.impl.ReaderGroupState.AddReader;
+import io.pravega.client.stream.impl.ReaderGroupState.SegmentCompleted;
+import io.pravega.client.stream.impl.ReaderGroupState.UpdatingConfig;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
-
 import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
@@ -48,8 +57,10 @@ public class ReaderGroupStateTest {
 
     @Before
     public void setup() {
-        readerState = new ReaderGroupState("stream", revision, readerConf,
-                                           getOffsetMap(asList("S1", "S2"), 1L), Collections.emptyMap());
+        Map<SegmentWithRange, Long> offsetMap = new HashMap<>();
+        offsetMap.put(new SegmentWithRange(new Segment(SCOPE, "S1", 0), 0, 1), 1L);
+        offsetMap.put(new SegmentWithRange(new Segment(SCOPE, "S2", 0), 0, 1), 1L);
+        readerState = new ReaderGroupState("stream", revision, readerConf, offsetMap, Collections.emptyMap(), false);
     }
     
 
@@ -63,10 +74,13 @@ public class ReaderGroupStateTest {
         addR2.applyTo(readerState, revision);
         assertEquals(2, readerState.getOnlineReaders().size());
         new ReaderGroupState.AcquireSegment("r1", getSegment("S1")).applyTo(readerState, revision);
-        new ReaderGroupState.UpdateDistanceToTail("r1", 1).applyTo(readerState, revision);
+        SegmentWithRange s1r = new SegmentWithRange(getSegment("S1"), 0, 1);
+        ImmutableMap<SegmentWithRange, Long> positions = ImmutableMap.of(s1r, 123L);
+        new ReaderGroupState.UpdateDistanceToTail("r1", 1, positions).applyTo(readerState, revision);
         assertEquals(Collections.singleton(getSegment("S1")), readerState.getSegments("r1"));
         assertEquals(0, readerState.getRanking("r1"));
         assertEquals(1, readerState.getRanking("r2"));
+        assertEquals(123L, readerState.getLastReadPositions(getStream("S1")).get(s1r).longValue());
         new ReaderGroupState.AcquireSegment("r1", getSegment("S2")).applyTo(readerState, revision);
         assertEquals(2, readerState.getSegments("r1").size());
         assertEquals(0, readerState.getRanking("r1"));
@@ -75,10 +89,41 @@ public class ReaderGroupStateTest {
         new ReaderGroupState.ReleaseSegment("r1", getSegment("S2"), 1).applyTo(readerState, revision);
         new ReaderGroupState.AcquireSegment("r2", getSegment("S1")).applyTo(readerState, revision);
         new ReaderGroupState.AcquireSegment("r2", getSegment("S2")).applyTo(readerState, revision);
-        new ReaderGroupState.UpdateDistanceToTail("r2", 1).applyTo(readerState, revision);
+        SegmentWithRange s2r = new SegmentWithRange(getSegment("S2"), 0, 1);
+        positions = ImmutableMap.of(s2r, 123L);
+        new ReaderGroupState.UpdateDistanceToTail("r2", 1, positions).applyTo(readerState, revision);
         assertEquals(0, readerState.getSegments("r1").size());
         assertEquals(1, readerState.getRanking("r1"));
         assertEquals(0, readerState.getRanking("r2"));
+        assertEquals(1L, readerState.getLastReadPositions(getStream("S1")).get(s1r).longValue());
+        assertEquals(123L, readerState.getLastReadPositions(getStream("S2")).get(s2r).longValue());
+    }
+    
+    @Test
+    public void testLastReadPositions() {
+        Map<SegmentWithRange, Long> p1 = readerState.getLastReadPositions(Stream.of(SCOPE, "S1"));
+        assertEquals(1, p1.size());
+        Segment s1 = new Segment(SCOPE, "S1", 0);
+        SegmentWithRange sr1 = new SegmentWithRange(s1, 0, 1);
+        assertEquals(Long.valueOf(1), p1.get(sr1));
+        Map<SegmentWithRange, Long> p2 = readerState.getLastReadPositions(Stream.of(SCOPE, "S2"));
+        assertEquals(1, p2.size());
+        Segment s2 = new Segment(SCOPE, "S2", 0);
+        SegmentWithRange sr2 = new SegmentWithRange(s2, 0, 1);
+        assertEquals(Long.valueOf(1), p2.get(sr2));
+        
+        AddReader addR1 = new ReaderGroupState.AddReader("r1");
+        addR1.applyTo(readerState, revision);
+        AcquireSegment aquire = new ReaderGroupState.AcquireSegment("r1", getSegment("S1"));
+        aquire.applyTo(readerState, revision);
+        SegmentWithRange sr3 = new SegmentWithRange(new Segment(SCOPE, "S1", 1), 0, 1);
+        ImmutableMap<SegmentWithRange, List<Long>> successors = ImmutableMap.of(sr3, ImmutableList.of(0L));
+        SegmentCompleted completed = new ReaderGroupState.SegmentCompleted("r1", sr1, successors);
+        completed.applyTo(readerState, revision);
+        
+        p1 = readerState.getLastReadPositions(Stream.of(SCOPE, "S1"));
+        assertEquals(1, p1.size());
+        assertEquals(Long.valueOf(0), p1.get(sr3));
     }
     
 
@@ -91,9 +136,22 @@ public class ReaderGroupStateTest {
         chkPointState.readerCheckpointed("chk1", "r2", getOffsetMap(singletonList("S2"), 2L));
 
         Optional<Map<Stream, Map<Segment, Long>>> latestPosition = readerState.getPositionsForLastCompletedCheckpoint();
+
         assertTrue(latestPosition.isPresent());
         assertEquals(1L, latestPosition.get().get(getStream("S1")).get(getSegment("S1")).longValue());
         assertEquals(2L, latestPosition.get().get(getStream("S2")).get(getSegment("S2")).longValue());
+
+        //add new checkpoint and verify for last checkpoint
+        chkPointState.beginNewCheckpoint("chk2",
+                ImmutableSet.of("r1", "r2"), getOffsetMap(asList("S1", "S2"), 4L));
+        chkPointState.readerCheckpointed("chk2", "r1", getOffsetMap(singletonList("S1"), 5L));
+        chkPointState.readerCheckpointed("chk2", "r2", getOffsetMap(singletonList("S2"), 6L));
+        Optional<Map<Stream, Map<Segment, Long>>> latestPosition2 = readerState.getPositionsForLastCompletedCheckpoint();
+
+        assertTrue(latestPosition2.isPresent());
+        assertEquals(5L, latestPosition2.get().get(getStream("S1")).get(getSegment("S1")).longValue());
+        assertEquals(6L, latestPosition2.get().get(getStream("S2")).get(getSegment("S2")).longValue());
+
     }
 
     @Test
@@ -175,6 +233,17 @@ public class ReaderGroupStateTest {
         Optional<Map<Stream, StreamCut>> streamCuts = readerState.getStreamCutsForCompletedCheckpoint("chk1");
         assertTrue(streamCuts.isPresent());
         assertEquals(expectedStreamCuts, streamCuts.get());
+    }
+
+    @Test
+    public void testUpdatingConfig() {
+        UpdatingConfig update1 = new UpdatingConfig(true);
+        update1.applyTo(readerState, revision);
+        assertTrue(readerState.isUpdatingConfig());
+
+        UpdatingConfig update2 = new UpdatingConfig(false);
+        update2.applyTo(readerState, revision);
+        assertFalse(readerState.isUpdatingConfig());
     }
 
     private Segment getSegment(String streamName) {

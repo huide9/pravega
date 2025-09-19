@@ -1,11 +1,17 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.segmentstore.server.tables;
 
@@ -13,13 +19,14 @@ import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import com.google.common.hash.HashFunction;
 import com.google.common.hash.Hashing;
-import io.pravega.common.util.ArrayView;
 import io.pravega.common.util.BitConverter;
+import io.pravega.common.util.BufferView;
 import io.pravega.common.util.ByteArraySegment;
 import java.util.UUID;
 import java.util.function.Function;
 import lombok.NonNull;
 import lombok.RequiredArgsConstructor;
+import lombok.val;
 
 /**
  * Defines a Hasher for a Table Key.
@@ -56,7 +63,7 @@ abstract class KeyHasher {
      * @param key The Key to hash.
      * @return A UUID representing the Hash for the given Key.
      */
-    public abstract UUID hash(@NonNull ArrayView key);
+    public abstract UUID hash(@NonNull BufferView key);
 
     protected UUID toUUID(byte[] rawHash) {
         assert rawHash.length == HASH_SIZE_BYTES;
@@ -120,11 +127,11 @@ abstract class KeyHasher {
     /**
      * Creates a new instance of the KeyHasher class that generates custom hashes, based on the given Function.
      *
-     * @param hashFunction A Function that, given an {@link ArrayView}, produces a byte array representing its hash.
+     * @param hashFunction A Function that, given an {@link BufferView}, produces a byte array representing its hash.
      * @return A new instance of the KeyHasher class.
      */
     @VisibleForTesting
-    static KeyHasher custom(Function<ArrayView, byte[]> hashFunction) {
+    static KeyHasher custom(Function<BufferView, byte[]> hashFunction) {
         return new CustomHasher(hashFunction);
     }
 
@@ -134,9 +141,11 @@ abstract class KeyHasher {
         private static final HashFunction HASH = Hashing.sha256();
 
         @Override
-        public UUID hash(@NonNull ArrayView key) {
+        public UUID hash(@NonNull BufferView key) {
+            val h = HASH.newHasher();
+            key.collect(h::putBytes);
             byte[] rawHash = new byte[HASH_SIZE_BYTES];
-            int c = HASH.hashBytes(key.array(), key.arrayOffset(), key.getLength()).writeBytesTo(rawHash, 0, rawHash.length);
+            int c = h.hash().writeBytesTo(rawHash, 0, rawHash.length);
             assert c == rawHash.length;
             return toUUID(rawHash);
         }
@@ -149,10 +158,10 @@ abstract class KeyHasher {
     @RequiredArgsConstructor
     private static class CustomHasher extends KeyHasher {
         @NonNull
-        private final Function<ArrayView, byte[]> hashFunction;
+        private final Function<BufferView, byte[]> hashFunction;
 
         @Override
-        public UUID hash(@NonNull ArrayView key) {
+        public UUID hash(@NonNull BufferView key) {
             byte[] rawHash = this.hashFunction.apply(key);
             Preconditions.checkState(rawHash.length == HASH_SIZE_BYTES, "Resulting KeyHash has incorrect length.");
             return toUUID(rawHash);

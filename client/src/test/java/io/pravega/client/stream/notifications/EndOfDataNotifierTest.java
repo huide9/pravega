@@ -1,11 +1,17 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.client.stream.notifications;
 
@@ -72,6 +78,28 @@ public class EndOfDataNotifierTest {
 
         notifier.unregisterAllListeners();
         verify(system, times(1)).removeListeners(EndOfDataNotification.class.getSimpleName());
+    }
+
+    @Test(timeout = 10000)
+    public void endOfStreamNotifierWithEmptyState() throws Exception {
+        AtomicBoolean listenerInvoked = new AtomicBoolean();
+
+        when(state.isEndOfData()).thenReturn(false).thenReturn(true);
+        when(sync.getState()).thenReturn(null).thenReturn(state);
+
+        Listener<EndOfDataNotification> listener1 = notification -> {
+            log.info("listener 1 invoked");
+            listenerInvoked.set(true);
+        };
+
+        EndOfDataNotifier notifier = new EndOfDataNotifier(system, sync, executor);
+        notifier.registerListener(listener1);
+        verify(executor, times(1)).scheduleAtFixedRate(any(Runnable.class), eq(0L), anyLong(), any(TimeUnit.class));
+        notifier.pollNow();
+        verify(state, times(1)).isEndOfData();
+        notifier.pollNow();
+        verify(state, times(2)).isEndOfData();
+        assertTrue(listenerInvoked.get());
     }
 
     @After

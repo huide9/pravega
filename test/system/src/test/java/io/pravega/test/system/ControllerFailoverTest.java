@@ -1,24 +1,31 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.test.system;
 
 import io.pravega.client.ClientConfig;
+import io.pravega.client.control.impl.Controller;
+import io.pravega.client.control.impl.ControllerImpl;
+import io.pravega.client.control.impl.ControllerImplConfig;
 import io.pravega.client.stream.ScalingPolicy;
 import io.pravega.client.stream.StreamConfiguration;
-import io.pravega.client.stream.impl.Controller;
-import io.pravega.client.stream.impl.ControllerImpl;
-import io.pravega.client.stream.impl.ControllerImplConfig;
 import io.pravega.client.stream.impl.StreamImpl;
 import io.pravega.client.stream.impl.StreamSegments;
+import io.pravega.common.concurrent.ExecutorServiceHelpers;
 import io.pravega.common.concurrent.Futures;
-import io.pravega.shared.segment.StreamSegmentNameUtils;
+import io.pravega.shared.NameUtils;
 import io.pravega.test.system.framework.Environment;
 import io.pravega.test.system.framework.SystemTestRunner;
 import io.pravega.test.system.framework.Utils;
@@ -29,13 +36,13 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.stream.Collectors;
 import lombok.Cleanup;
 import lombok.extern.slf4j.Slf4j;
 import mesosphere.marathon.client.MarathonException;
 import org.apache.commons.lang3.RandomStringUtils;
+import org.junit.After;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Rule;
@@ -53,8 +60,9 @@ public class ControllerFailoverTest extends AbstractSystemTest {
     @Rule
     public Timeout globalTimeout = Timeout.seconds(3 * 60);
 
-    private final ScheduledExecutorService executorService = Executors.newScheduledThreadPool(5);
-    private Service controllerService1 = null;
+    private final ScheduledExecutorService executorService = ExecutorServiceHelpers.newScheduledThreadPool(5, "test");
+    private Service controllerService = null;
+    private Service segmentStoreService = null;
     private URI controllerURIDirect = null;
 
     @Environment
@@ -72,19 +80,29 @@ public class ControllerFailoverTest extends AbstractSystemTest {
         List<URI> zkUris = zkService.getServiceDetails();
         log.info("zookeeper service details: {}", zkUris);
 
-        controllerService1 = Utils.createPravegaControllerService(zkUris.get(0));
-        if (!controllerService1.isRunning()) {
-            controllerService1.start(true);
+        controllerService = Utils.createPravegaControllerService(zkUris.get(0));
+        if (!controllerService.isRunning()) {
+            controllerService.start(true);
         }
 
-        List<URI> conUris = controllerService1.getServiceDetails();
-        log.info("conuris {} {}", conUris.get(0), conUris.get(1));
-        log.debug("Pravega Controller service  details: {}", conUris);
+        List<URI> controllerUris = controllerService.getServiceDetails();
+        log.info("Controller uris: {} {}", controllerUris.get(0), controllerUris.get(1));
+        log.debug("Pravega Controller service  details: {}", controllerUris);
         // Fetch all the RPC endpoints and construct the client URIs.
-        final List<String> uris = conUris.stream().filter(ISGRPC).map(URI::getAuthority).collect(Collectors.toList());
+        final List<String> uris = controllerUris.stream().filter(ISGRPC).map(URI::getAuthority).collect(Collectors.toList());
 
-        controllerURIDirect = URI.create("tcp://" + String.join(",", uris));
+        controllerURIDirect = Utils.getControllerURI(uris);
         log.info("Controller Service direct URI: {}", controllerURIDirect);
+
+        segmentStoreService = Utils.createPravegaSegmentStoreService(zkUris.get(0), controllerUris.get(0));
+    }
+
+    @After
+    public void cleanup() {
+        // This test scales the controller instances to 0.
+        // Scale down the segment store instances to 0 to ensure the next tests starts with a clean slate.
+        segmentStoreService.scaleService(0);
+        ExecutorServiceHelpers.shutdown(executorService);
     }
 
     @Test
@@ -117,19 +135,19 @@ public class ControllerFailoverTest extends AbstractSystemTest {
         controller1.startScale(stream1, segmentsToSeal, newRangesToCreate).join();
 
         // Now stop the controller instance executing scale operation.
-        Futures.getAndHandleExceptions(controllerService1.scaleService(0), ExecutionException::new);
+        Futures.getAndHandleExceptions(controllerService.scaleService(0), ExecutionException::new);
         log.info("Successfully stopped one instance of controller service");
 
         // restart controller service
-        Futures.getAndHandleExceptions(controllerService1.scaleService(1), ExecutionException::new);
+        Futures.getAndHandleExceptions(controllerService.scaleService(1), ExecutionException::new);
         log.info("Successfully stopped one instance of controller service");
 
-        List<URI> conUris = controllerService1.getServiceDetails();
+        List<URI> controllerUris = controllerService.getServiceDetails();
         // Fetch all the RPC endpoints and construct the client URIs.
-        final List<String> uris = conUris.stream().filter(ISGRPC).map(URI::getAuthority)
+        final List<String> uris = controllerUris.stream().filter(ISGRPC).map(URI::getAuthority)
                 .collect(Collectors.toList());
 
-        controllerURIDirect = URI.create("tcp://" + String.join(",", uris));
+        controllerURIDirect = URI.create((Utils.TLS_AND_AUTH_ENABLED ? TLS : TCP) + String.join(",", uris));
         log.info("Controller Service direct URI: {}", controllerURIDirect);
 
         ClientConfig clientConf = Utils.buildClientConfig(controllerURIDirect);
@@ -147,7 +165,7 @@ public class ControllerFailoverTest extends AbstractSystemTest {
             Thread.sleep(30000);
         }
 
-        segmentsToSeal = Collections.singletonList(StreamSegmentNameUtils.computeSegmentId(1, 1));
+        segmentsToSeal = Collections.singletonList(NameUtils.computeSegmentId(1, 1));
 
         newRangesToCreate = new HashMap<>();
         newRangesToCreate.put(0.0, 0.5);
@@ -157,7 +175,7 @@ public class ControllerFailoverTest extends AbstractSystemTest {
 
         log.info("Checking whether scale operation succeeded by fetching current segments");
         StreamSegments streamSegments = controller2.getCurrentSegments(scope, stream).join();
-        log.info("Current segment count=", streamSegments.getSegments().size());
+        log.info("Current segment count= {}", streamSegments.getSegments().size());
         Assert.assertEquals(2, streamSegments.getSegments().size());
     }
 

@@ -1,11 +1,17 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.controller.store.stream.records;
 
@@ -22,6 +28,7 @@ import io.pravega.test.common.AssertExtensions;
 import org.junit.Test;
 
 import java.io.IOException;
+import java.time.Duration;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -49,7 +56,8 @@ public class ControllerMetadataRecordSerializerTest {
     @Test
     public void epochRecordTest() {
         List<StreamSegmentRecord> list = Lists.newArrayList(StreamSegmentRecord.newSegmentRecord(1, 0, 10L, 0.0, 1.0));
-        EpochRecord record = new EpochRecord(10, 0, ImmutableList.copyOf(list), 10L);
+        EpochRecord record = new EpochRecord(10, 0, ImmutableList.copyOf(list), 10L,
+                0L, 0L);
         assertEquals(EpochRecord.fromBytes(record.toBytes()), record);
     }
     
@@ -196,8 +204,78 @@ public class ControllerMetadataRecordSerializerTest {
         serialized = record.toBytes();
         deserialized = StreamConfigurationRecord.fromBytes(serialized);
         assertEquals(record, deserialized);
+
+        StreamConfiguration allWithTime = StreamConfiguration.builder()
+                                                             .scalingPolicy(ScalingPolicy.fixed(1))
+                                                             .retentionPolicy(RetentionPolicy.bySizeBytes(1L))
+                                                             .timestampAggregationTimeout(1000L)
+                                                             .build();
+
+        record = StreamConfigurationRecord.builder()
+                                          .streamConfiguration(allWithTime)
+                                          .streamName("a")
+                                          .scope("a")
+                                          .updating(true)
+                                          .build();
+        serialized = record.toBytes();
+        deserialized = StreamConfigurationRecord.fromBytes(serialized);
+        assertEquals(record, deserialized);
     }
+    
+    @Test
+    public void configurationRecordWithRetentionPolicyTest() throws IOException {
+        StreamConfiguration sizeBasedRetention = StreamConfiguration.builder()
+                                                                    .retentionPolicy(RetentionPolicy.bySizeBytes(1L))
+                                                                    .build();
+        StreamConfiguration timeBasedRetention = StreamConfiguration.builder()
+                                                                    .retentionPolicy(RetentionPolicy.byTime(Duration.ofMinutes(1)))
+                                                                    .build();
+        StreamConfiguration cbrSize = StreamConfiguration.builder()
+                                                         .retentionPolicy(RetentionPolicy.bySizeBytes(1L, 10L))
+                                                         .build();
+        StreamConfiguration cbrtime = StreamConfiguration.builder()
+                                                         .retentionPolicy(RetentionPolicy.byTime(Duration.ofMillis(1L), Duration.ofMillis(10L)))
+                                                         .build();
 
+        StreamConfigurationRecord record = StreamConfigurationRecord.builder()
+                                                                    .streamConfiguration(sizeBasedRetention)
+                                                                    .streamName("a")
+                                                                    .scope("a")
+                                                                    .updating(true)
+                                                                    .build();
+        byte[] serialized = record.toBytes();
+        StreamConfigurationRecord deserialized = StreamConfigurationRecord.fromBytes(serialized);
+        assertEquals(record, deserialized);
 
+        record = StreamConfigurationRecord.builder()
+                                          .streamConfiguration(timeBasedRetention)
+                                          .streamName("a")
+                                          .scope("a")
+                                          .updating(true)
+                                          .build();
+        serialized = record.toBytes();
+        deserialized = StreamConfigurationRecord.fromBytes(serialized);
+        assertEquals(record, deserialized);
+
+        record = StreamConfigurationRecord.builder()
+                                          .streamConfiguration(cbrSize)
+                                          .streamName("a")
+                                          .scope("a")
+                                          .updating(true)
+                                          .build();
+        serialized = record.toBytes();
+        deserialized = StreamConfigurationRecord.fromBytes(serialized);
+        assertEquals(record, deserialized);
+        
+        record = StreamConfigurationRecord.builder()
+                                          .streamConfiguration(cbrtime)
+                                          .streamName("a")
+                                          .scope("a")
+                                          .updating(true)
+                                          .build();
+        serialized = record.toBytes();
+        deserialized = StreamConfigurationRecord.fromBytes(serialized);
+        assertEquals(record, deserialized);
+    }
 }
 

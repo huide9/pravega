@@ -1,11 +1,17 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.segmentstore.server.containers;
 
@@ -214,6 +220,26 @@ public class StreamSegmentContainerMetadata implements UpdateableContainerMetada
         Preconditions.checkState(this.epoch.compareAndSet(Long.MIN_VALUE, value), "epoch has already been set.");
     }
 
+
+    /**
+     * Setting container epoch. To be used in cases of restore phase of Pravega Backup-Restore process.
+     * @param value epoch value to override.
+     */
+    public void setContainerEpochAfterRestore(long value) {
+        Preconditions.checkArgument(value > 0, "epoch must be a non-negative number");
+        this.epoch.set(value);
+    }
+
+    /**
+     * Setting the restored operation sequence number.
+     * To be used in cases of restore phase of Pravega Backup-Restore process.
+     * @param value operation sequence number to override
+     */
+    public void setOperationSequenceNumberAfterRestore(long value) {
+        Preconditions.checkArgument(value > 0, "Operation sequence number must be a non-negative number");
+        this.sequenceNumber.set(value);
+    }
+
     //endregion
 
     //region EvictableMetadata Implementation
@@ -285,7 +311,7 @@ public class StreamSegmentContainerMetadata implements UpdateableContainerMetada
     }
 
     /**
-     * Determines whether the Segment with given metadata can be evicted, based on the the given Sequence Number Threshold.
+     * Determines whether the Segment with given metadata can be evicted, based on the given Sequence Number Threshold.
      * A Segment will not be chosen for eviction if {@link SegmentMetadata#isPinned()} is true.
      *
      * @param metadata             The Metadata for the Segment that is considered for eviction.

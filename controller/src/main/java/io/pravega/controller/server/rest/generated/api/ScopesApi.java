@@ -99,6 +99,23 @@ public class ScopesApi  {
         return delegate.createStream(scopeName,createStreamRequest,securityContext);
     }
     @DELETE
+    @Path("/{scopeName}/readergroups/{readerGroupName}")
+    
+    
+    @io.swagger.annotations.ApiOperation(value = "", notes = "Delete a reader group", response = void.class, tags={ "ReaderGroups", })
+    @io.swagger.annotations.ApiResponses(value = { 
+        @io.swagger.annotations.ApiResponse(code = 204, message = "Successfully deleted the reader group", response = void.class),
+        
+        @io.swagger.annotations.ApiResponse(code = 404, message = "Scope or reader group with given name not found", response = void.class),
+        
+        @io.swagger.annotations.ApiResponse(code = 500, message = "Internal server error while deleting a reader", response = void.class) })
+    public Response deleteReaderGroup(@ApiParam(value = "Scope name",required=true) @PathParam("scopeName") String scopeName
+,@ApiParam(value = "Reader group name",required=true) @PathParam("readerGroupName") String readerGroupName
+,@Context SecurityContext securityContext)
+    throws NotFoundException {
+        return delegate.deleteReaderGroup(scopeName,readerGroupName,securityContext);
+    }
+    @DELETE
     @Path("/{scopeName}")
     
     
@@ -245,10 +262,11 @@ public class ScopesApi  {
         
         @io.swagger.annotations.ApiResponse(code = 500, message = "Internal server error while fetching the list of streams for the given scope", response = StreamsList.class) })
     public Response listStreams(@ApiParam(value = "Scope name",required=true) @PathParam("scopeName") String scopeName
-,@ApiParam(value = "Optional flag whether to display system created streams. If not specified only user created streams will be returned") @QueryParam("showInternalStreams") String showInternalStreams
+,@ApiParam(value = "Filter options", allowableValues="showInternalStreams, tag") @QueryParam("filter_type") String filterType
+,@ApiParam(value = "value to be passed. must match the type passed with it.") @QueryParam("filter_value") String filterValue
 ,@Context SecurityContext securityContext)
     throws NotFoundException {
-        return delegate.listStreams(scopeName,showInternalStreams,securityContext);
+        return delegate.listStreams(scopeName,filterType,filterValue,securityContext);
     }
     @PUT
     @Path("/{scopeName}/streams/{streamName}")

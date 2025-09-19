@@ -1,28 +1,33 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.controller.task;
 
 import io.pravega.client.stream.ScalingPolicy;
 import io.pravega.client.stream.StreamConfiguration;
 import io.pravega.common.concurrent.ExecutorServiceHelpers;
-import io.pravega.common.tracing.RequestTracker;
 import io.pravega.controller.mocks.SegmentHelperMock;
 import io.pravega.controller.server.SegmentHelper;
-import io.pravega.controller.server.rpc.auth.AuthHelper;
+import io.pravega.controller.server.security.auth.GrpcAuthHelper;
+import io.pravega.controller.store.VersionedMetadata;
 import io.pravega.controller.store.host.HostControllerStore;
 import io.pravega.controller.store.host.HostStoreFactory;
 import io.pravega.controller.store.host.impl.HostMonitorConfigImpl;
+import io.pravega.controller.store.stream.State;
 import io.pravega.controller.store.stream.StreamMetadataStore;
 import io.pravega.controller.store.stream.StreamStoreFactory;
-import io.pravega.controller.store.stream.VersionedMetadata;
-import io.pravega.controller.store.stream.State;
 import io.pravega.controller.store.stream.records.EpochTransitionRecord;
 import io.pravega.controller.store.task.LockFailedException;
 import io.pravega.controller.store.task.Resource;
@@ -46,7 +51,6 @@ import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.stream.Collectors;
 import lombok.Cleanup;
@@ -73,7 +77,8 @@ import static org.junit.Assert.assertTrue;
 public abstract class TaskTest {
     private static final String HOSTNAME = "host-1234";
     private static final String SCOPE = "scope";
-    protected final ScheduledExecutorService executor = Executors.newScheduledThreadPool(10);
+
+    protected final ScheduledExecutorService executor = ExecutorServiceHelpers.newScheduledThreadPool(10, "test");
     protected CuratorFramework cli;
 
     private final String stream1 = "stream1";
@@ -90,8 +95,7 @@ public abstract class TaskTest {
 
     private StreamMetadataTasks streamMetadataTasks;
     private SegmentHelper segmentHelperMock;
-    private final RequestTracker requestTracker = new RequestTracker(true);
-    
+
     abstract StreamMetadataStore getStream();
 
     @Before
@@ -105,8 +109,9 @@ public abstract class TaskTest {
         taskMetadataStore = TaskStoreFactory.createZKStore(cli, executor);
 
         segmentHelperMock = SegmentHelperMock.getSegmentHelperMock();
-        streamMetadataTasks = new StreamMetadataTasks(streamStore, StreamStoreFactory.createInMemoryBucketStore(), taskMetadataStore, segmentHelperMock,
-                executor, HOSTNAME, AuthHelper.getDisabledAuthHelper(), requestTracker);
+        streamMetadataTasks = new StreamMetadataTasks(streamStore, StreamStoreFactory.createInMemoryBucketStore(), 
+                taskMetadataStore, segmentHelperMock,
+                executor, HOSTNAME, GrpcAuthHelper.getDisabledAuthHelper());
 
         final String stream2 = "stream2";
         final ScalingPolicy policy1 = ScalingPolicy.fixed(2);
@@ -115,7 +120,7 @@ public abstract class TaskTest {
         final StreamConfiguration configuration2 = StreamConfiguration.builder().scalingPolicy(policy2).build();
 
         // region createStream
-        streamStore.createScope(SCOPE).join();
+        streamStore.createScope(SCOPE, null, executor).join();
         long start = System.currentTimeMillis();
         streamStore.createStream(SCOPE, stream1, configuration1, start, null, executor).join();
         streamStore.setState(SCOPE, stream1, State.ACTIVE, null, executor).join();
@@ -167,17 +172,18 @@ public abstract class TaskTest {
         ExecutorServiceHelpers.shutdown(executor);
     }
 
-    @Test
+    @Test(timeout = 30000)
     public void testMethods() throws InterruptedException, ExecutionException {
-        CreateStreamStatus.Status status = streamMetadataTasks.createStream(SCOPE, stream1, configuration1, System.currentTimeMillis()).join();
+        CreateStreamStatus.Status status = streamMetadataTasks.createStream(SCOPE, stream1, configuration1, 
+                System.currentTimeMillis(), 0L).join();
         assertEquals(CreateStreamStatus.Status.STREAM_EXISTS, status);
-        streamStore.createScope(SCOPE);
+        streamStore.createScope(SCOPE, null, executor);
         CreateStreamStatus.Status result = streamMetadataTasks.createStream(SCOPE, "dummy", configuration1,
-                System.currentTimeMillis()).join();
+                System.currentTimeMillis(), 0L).join();
         assertEquals(result, CreateStreamStatus.Status.SUCCESS);
     }
 
-    @Test
+    @Test(timeout = 30000)
     public void testTaskSweeper() throws ExecutionException, InterruptedException {
         final String deadHost = "deadHost";
         final String deadThreadId = UUID.randomUUID().toString();
@@ -187,7 +193,8 @@ public abstract class TaskTest {
 
         final Resource resource = new Resource(scope, stream);
         final long timestamp = System.currentTimeMillis();
-        final TaskData taskData = new TaskData("createStream", "1.0", new Serializable[]{scope, stream, configuration, timestamp});
+        final TaskData taskData = new TaskData("createStream", "1.0",
+                new Serializable[]{scope, stream, configuration, timestamp, 0L});
 
         for (int i = 0; i < 5; i++) {
             final TaggedResource taggedResource = new TaggedResource(UUID.randomUUID().toString(), resource);
@@ -213,6 +220,32 @@ public abstract class TaskTest {
     }
 
     @Test(timeout = 10000)
+    public void testZkLock() {
+        final String oldHost = "oldHost";
+        final String newHost = "newHost";
+        final String newHost1 = "newHost1";
+        final String oldThreadId = UUID.randomUUID().toString();
+        final String newThreadId = UUID.randomUUID().toString();
+        final String scope = SCOPE;
+        final String stream = "testStream";
+        final StreamConfiguration config1 = StreamConfiguration.builder().scalingPolicy(policy1).build();
+        final Resource resource1 = new Resource(scope, stream1);
+        final long timestamp1 = System.currentTimeMillis();
+        final TaskData taskData1 = new TaskData("createStream", "1.0",
+                new Serializable[]{scope, stream, config1, timestamp1, 0L});
+
+        for (int i = 0; i < 5; i++) {
+            final TaggedResource taggedResource = new TaggedResource(UUID.randomUUID().toString(), resource1);
+            taskMetadataStore.putChild(oldHost, taggedResource).join();
+        }
+        taskMetadataStore.lock(resource1, taskData1, oldHost, oldThreadId, null, null).join();
+        taskMetadataStore.lock(resource1, taskData1, newHost, newThreadId, newHost1, oldThreadId).join();
+        Optional<TaskData> testData = Optional.of(new TaskData("createStream", "1.0",
+                new Serializable[]{scope, stream, config1, timestamp1, 0L}));
+        Assert.assertEquals(testData, taskMetadataStore.getTask(resource1, newHost1, oldThreadId).join());
+    }
+
+    @Test(timeout = 10000)
     public void testStreamTaskSweeping() throws Exception {
         final String stream = "testPartialCreationStream";
         final String deadHost = "deadHost";
@@ -227,18 +260,20 @@ public abstract class TaskTest {
 
         // Create objects.
         @Cleanup
-        StreamMetadataTasks mockStreamTasks = new StreamMetadataTasks(streamStore, StreamStoreFactory.createInMemoryBucketStore(), taskMetadataStore, segmentHelperMock,
-                executor, deadHost, AuthHelper.getDisabledAuthHelper(), requestTracker);
+        StreamMetadataTasks mockStreamTasks = new StreamMetadataTasks(streamStore, StreamStoreFactory.createInMemoryBucketStore(),
+                taskMetadataStore, segmentHelperMock,
+                executor, deadHost, GrpcAuthHelper.getDisabledAuthHelper());
         mockStreamTasks.setCreateIndexOnlyMode();
         TaskSweeper sweeper = new TaskSweeper(taskMetadataStore, HOSTNAME, executor, streamMetadataTasks);
 
         // Create stream test.
-        completePartialTask(mockStreamTasks.createStream(SCOPE, stream, configuration1, System.currentTimeMillis()),
+        // this will create 2 new streams -> stream + mark stream
+        completePartialTask(mockStreamTasks.createStream(SCOPE, stream, configuration1, System.currentTimeMillis(), 0L),
                 deadHost, sweeper);
         Assert.assertEquals(initialSegments, streamStore.getActiveSegments(SCOPE, stream, null, executor).join().size());
 
-        Map<String, StreamConfiguration> streams = streamStore.listStreamsInScope(SCOPE).join();
-        assertEquals(3, streams.size());
+        Map<String, StreamConfiguration> streams = streamStore.listStreamsInScope(SCOPE, null, executor).join();
+        assertEquals(4, streams.size());
         assertEquals(configuration1, streams.get(stream));
     }
 
@@ -249,7 +284,7 @@ public abstract class TaskTest {
         assertFalse(child.isPresent());
     }
 
-    @Test
+    @Test(timeout = 30000)
     public void parallelTaskSweeperTest() throws InterruptedException, ExecutionException {
         final String deadHost = "deadHost";
         final String deadThreadId1 = UUID.randomUUID().toString();
@@ -264,11 +299,13 @@ public abstract class TaskTest {
 
         final Resource resource1 = new Resource(scope, stream1);
         final long timestamp1 = System.currentTimeMillis();
-        final TaskData taskData1 = new TaskData("createStream", "1.0", new Serializable[]{scope, stream1, config1, timestamp1});
+        final TaskData taskData1 = new TaskData("createStream", "1.0", 
+                new Serializable[]{scope, stream1, config1, timestamp1, 0L});
 
         final Resource resource2 = new Resource(scope, stream2);
         final long timestamp2 = System.currentTimeMillis();
-        final TaskData taskData2 = new TaskData("createStream", "1.0", new Serializable[]{scope, stream2, config2, timestamp2});
+        final TaskData taskData2 = new TaskData("createStream", "1.0", 
+                new Serializable[]{scope, stream2, config2, timestamp2, 0L});
 
         for (int i = 0; i < 5; i++) {
             final TaggedResource taggedResource = new TaggedResource(UUID.randomUUID().toString(), resource1);
@@ -311,7 +348,7 @@ public abstract class TaskTest {
         assertEquals(config2, config);
     }
 
-    @Test
+    @Test(timeout = 30000)
     public void testLocking() throws Exception {
         @Cleanup
         TestTasks testTasks = new TestTasks(taskMetadataStore, executor, HOSTNAME);

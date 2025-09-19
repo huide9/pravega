@@ -1,11 +1,17 @@
 /**
- * Copyright (c) 2018 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.client.byteStream;
 
@@ -14,6 +20,7 @@ import io.pravega.client.stream.EventStreamWriter;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.nio.ByteBuffer;
+import java.util.concurrent.CompletableFuture;
 
 /**
  * Allows for writing raw bytes directly to a segment. This is intended as low level building block
@@ -82,12 +89,30 @@ public abstract class ByteStreamWriter extends OutputStream {
     public abstract void flush() throws IOException;
 
     /**
+     * The future will complete successfully when all data which was passed to
+     * the write prior to calling this method has been persisted, and will complete exceptionally if that
+     * is not possible such as for example if the segment is sealed.
+     *
+     * @see java.io.OutputStream#flush()
+     * @return The future related to last write
+     * @throws IOException If for any reason the flush fails including if the stream is sealed.
+     */
+    public abstract CompletableFuture<Void> flushAsync() throws IOException;
+
+
+    /**
      * Closes the writer similar to {@link #close()} but also seals it so that no future writes can
      * ever be made.
      * 
      * @throws IOException If for any reason the flush fails including if the stream is sealed.
      */
     public abstract void closeAndSeal() throws IOException;
+
+    /**
+     * This makes a synchronous RPC call to the server to obtain the current head of the stream.
+     * @return The current head offset
+     */
+    public abstract long fetchHeadOffset();
 
     /**
      * This makes a synchronous RPC call to the server to obtain the total number of bytes written
@@ -97,5 +122,11 @@ public abstract class ByteStreamWriter extends OutputStream {
      * @return The tail offset
      */
     public abstract long fetchTailOffset();
+
+    /**
+     * This makes a synchronous RPC call to the server to truncate the segment at the provided offset.
+     * @param offset The truncation offset.
+     */
+    public abstract void truncateDataBefore(long offset);
     
 }

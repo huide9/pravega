@@ -1,15 +1,20 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.test.integration;
 
-import com.google.common.util.concurrent.ThreadFactoryBuilder;
 import io.pravega.client.ClientConfig;
 import io.pravega.client.EventStreamClientFactory;
 import io.pravega.client.admin.ReaderGroupManager;
@@ -29,6 +34,7 @@ import io.pravega.common.concurrent.ExecutorServiceHelpers;
 import io.pravega.common.concurrent.Futures;
 import io.pravega.segmentstore.contracts.StreamSegmentStore;
 import io.pravega.segmentstore.contracts.tables.TableStore;
+import io.pravega.segmentstore.server.host.handler.IndexAppendProcessor;
 import io.pravega.segmentstore.server.host.handler.PravegaConnectionListener;
 import io.pravega.segmentstore.server.store.ServiceBuilder;
 import io.pravega.segmentstore.server.store.ServiceBuilderConfig;
@@ -45,7 +51,6 @@ import java.util.TreeSet;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import lombok.Cleanup;
 import lombok.extern.slf4j.Slf4j;
@@ -120,6 +125,7 @@ public class MultiReadersEndToEndTest {
         EventStreamClientFactory clientFactory = EventStreamClientFactory.withScope(SETUP_UTILS.getScope(), ClientConfig.builder()
                                                                                                   .controllerURI(SETUP_UTILS.getControllerUri()).build());
         streamNames.stream().forEach(stream -> {
+            @Cleanup
             EventStreamWriter<Integer> eventWriter = clientFactory.createEventWriter(
                     stream, new IntegerSerializer(), EventWriterConfig.builder().build());
             for (Integer i = 0; i < NUM_TEST_EVENTS; i++) {
@@ -151,8 +157,8 @@ public class MultiReadersEndToEndTest {
                                               final String readerGroupName, final int numSegments) {
         ConcurrentLinkedQueue<Integer> read = new ConcurrentLinkedQueue<>();
         @Cleanup("shutdownNow")
-        final ExecutorService executorService = Executors.newFixedThreadPool(
-                numParallelReaders, new ThreadFactoryBuilder().setNameFormat("testreader-pool-%d").build());
+        final ExecutorService executorService = ExecutorServiceHelpers.newScheduledThreadPool(
+                numParallelReaders, "testreader-pool");
         List<Future<?>> futures = new ArrayList<>();
         for (int i = 0; i < numParallelReaders; i++) {
             futures.add(executorService.submit(() -> {
@@ -188,15 +194,18 @@ public class MultiReadersEndToEndTest {
     private void runTestUsingMock(final Set<String> streamNames, final int numParallelReaders, final int numSegments)
             throws Exception {
         int servicePort = TestUtils.getAvailableListenPort();
+        @Cleanup
         ServiceBuilder serviceBuilder = ServiceBuilder.newInMemoryBuilder(ServiceBuilderConfig.getDefaultConfig());
         serviceBuilder.initialize();
         StreamSegmentStore store = serviceBuilder.createStreamSegmentService();
         TableStore tableStore = serviceBuilder.createTableStoreService();
         @Cleanup
-        PravegaConnectionListener server = new PravegaConnectionListener(false, servicePort, store, tableStore);
+        PravegaConnectionListener server = new PravegaConnectionListener(false, servicePort, store, tableStore,
+                serviceBuilder.getLowPriorityExecutor(), new IndexAppendProcessor(serviceBuilder.getLowPriorityExecutor(), store));
         server.startListening();
         @Cleanup
         MockStreamManager streamManager = new MockStreamManager("scope", "localhost", servicePort);
+        @Cleanup
         MockClientFactory clientFactory = streamManager.getClientFactory();
         streamManager.createScope("scope");
         streamNames.stream().forEach(stream -> {
@@ -205,6 +214,7 @@ public class MultiReadersEndToEndTest {
                                        StreamConfiguration.builder()
                                        .scalingPolicy(ScalingPolicy.fixed(numSegments))
                                        .build());
+            @Cleanup
             EventStreamWriter<Integer> eventWriter = clientFactory.createEventWriter(stream,
                                                                                      new IntegerSerializer(),
                                                                                      EventWriterConfig.builder()

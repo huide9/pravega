@@ -1,11 +1,17 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.common.cluster.zkImpl;
 
@@ -35,6 +41,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.Executor;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 
 import static io.pravega.common.cluster.ClusterListener.EventType.ERROR;
@@ -48,6 +55,7 @@ import static io.pravega.common.cluster.ClusterListener.EventType.HOST_REMOVED;
  * - Ephemeral Node is valid until a session timeout, default session timeout is 60 seconds.
  * System property "curator-default-session-timeout" can be used to change it.
  */
+@SuppressWarnings("deprecation")
 @Slf4j
 public class ClusterZKImpl implements Cluster {
 
@@ -58,6 +66,8 @@ public class ClusterZKImpl implements Cluster {
 
     private final CuratorFramework client;
 
+    private final AtomicBoolean isZKConnected = new AtomicBoolean(false);
+
     private final Map<Host, PersistentNode> entryMap = new HashMap<>(INIT_SIZE);
     private Optional<PathChildrenCache> cache = Optional.empty();
 
@@ -67,6 +77,10 @@ public class ClusterZKImpl implements Cluster {
         if (client.getState().equals(CuratorFrameworkState.LATENT)) {
             client.start();
         }
+        this.isZKConnected.set(client.getZookeeperClient().isConnected());
+        //Listen for any zookeeper connection state changes
+        client.getConnectionStateListenable().addListener(
+                (curatorClient, newState) -> this.isZKConnected.set(newState.isConnected()));
     }
 
     /**
@@ -101,6 +115,11 @@ public class ClusterZKImpl implements Cluster {
         Preconditions.checkNotNull(node, "Host is not present in cluster.");
         entryMap.remove(host);
         close(node);
+    }
+
+    @Override
+    public boolean isHealthy() {
+        return isZKConnected.get();
     }
 
     /**

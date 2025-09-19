@@ -1,18 +1,27 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.shared.protocol.netty;
 
+import com.google.common.collect.ImmutableList;
 import io.netty.buffer.ByteBuf;
-import io.netty.buffer.ByteBufInputStream;
 import io.netty.buffer.Unpooled;
+import io.pravega.common.io.ByteBufferOutputStream;
 import io.pravega.shared.protocol.netty.WireCommands.Event;
+import io.pravega.test.common.AssertExtensions;
+import io.pravega.test.common.LeakDetectorTestSuite;
 import java.io.ByteArrayOutputStream;
 import java.io.DataOutput;
 import java.io.DataOutputStream;
@@ -21,20 +30,27 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.AbstractMap.SimpleImmutableEntry;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Function;
+import java.util.function.Supplier;
 import lombok.Data;
+import lombok.ToString;
 import org.junit.Test;
 
 import static io.netty.buffer.Unpooled.wrappedBuffer;
 import static io.pravega.test.common.AssertExtensions.assertThrows;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 
-public class WireCommandsTest {
+public class WireCommandsTest extends LeakDetectorTestSuite {
 
     private final UUID uuid = UUID.randomUUID();
     private final String testString1 = "testString1";
@@ -69,11 +85,23 @@ public class WireCommandsTest {
     @Test
     public void testAppendBlock() throws IOException {
         testCommand(new WireCommands.AppendBlock(uuid));
+
+        // Test that it correctly implements ReleasableCommand.
+        testReleasableCommand(
+                () -> new WireCommands.AppendBlock(uuid, buf),
+                WireCommands.AppendBlock::readFrom,
+                ab -> ab.getData().refCnt());
     }
 
     @Test
     public void testAppendBlockEnd() throws IOException {
         testCommand(new WireCommands.AppendBlockEnd(uuid, i, buf, i, i, l));
+
+        // Test that it correctly implements ReleasableCommand.
+        testReleasableCommand(
+                () -> new WireCommands.AppendBlockEnd(uuid, i, buf, i, i, l),
+                WireCommands.AppendBlockEnd::readFrom,
+                abe -> abe.getData().refCnt());
     }
 
     @Data
@@ -114,6 +142,12 @@ public class WireCommandsTest {
         ConditionalAppendV7 commandV7 = new ConditionalAppendV7(uuid, l, l, new Event(buf));
         commandV7.writeFields(new DataOutputStream(bout));
         testCommandFromByteArray(bout.toByteArray(), new WireCommands.ConditionalAppend(uuid, l, l, new Event(buf), -1));
+
+        // Test that it correctly implements ReleasableCommand.
+        testReleasableCommand(
+                () -> new WireCommands.ConditionalAppend(uuid, l, l, new Event(buf), -1),
+                WireCommands.ConditionalAppend::readFrom,
+                ce -> ce.getEvent().getData().refCnt());
     }
 
     @Test
@@ -125,20 +159,32 @@ public class WireCommandsTest {
 
         // Invalid length scenario.
         assertThrows("Read with invalid buffer length.",
-                     () -> WireCommands.ConditionalAppend.readFrom(new ByteBufInputStream(wrappedBuffer(bytes)), 4),
-                     t -> t instanceof InvalidMessageException);
+                () -> WireCommands.ConditionalAppend.readFrom(new EnhancedByteBufInputStream(wrappedBuffer(bytes)), 4),
+                t -> t instanceof InvalidMessageException);
         // Invalid buffer data.
         assertThrows("Read with invalid data.",
-                     () -> WireCommands.ConditionalAppend.readFrom(new ByteBufInputStream(buf), buf.capacity()),
-                     t -> t instanceof EOFException);
+                () -> WireCommands.ConditionalAppend.readFrom(new EnhancedByteBufInputStream(buf), buf.capacity()),
+                t -> t instanceof EOFException);
         assertThrows("Unsupported operation",
-                     () -> cmd.process(mock(RequestProcessor.class)),
-                     t -> t instanceof UnsupportedOperationException);
+                () -> cmd.process(mock(RequestProcessor.class)),
+                t -> t instanceof UnsupportedOperationException);
     }
 
     @Test
-    public void testAuthTokenCheckFalied() throws IOException {
-        testCommand(new WireCommands.AuthTokenCheckFailed(l, ""));
+    public void testPartialEvent() throws IOException {
+        testCommand(new WireCommands.PartialEvent(buf));
+
+        // Test that it correctly implements ReleasableCommand.
+        testReleasableCommand(
+                () -> new WireCommands.PartialEvent(buf),
+                WireCommands.PartialEvent::readFrom,
+                pe -> pe.getData().refCnt());
+    }
+
+    @Test
+    public void testAuthTokenCheckFailed() throws IOException {
+        testCommand(new WireCommands.AuthTokenCheckFailed(l, "",
+                WireCommands.AuthTokenCheckFailed.ErrorCode.TOKEN_CHECK_FAILED));
         AtomicReference<Boolean> authTokenCheckFailedCalled = new AtomicReference<>(false);
         ReplyProcessor rp = new FailingReplyProcessor() {
             @Override
@@ -157,8 +203,15 @@ public class WireCommandsTest {
             }
         };
 
-        new WireCommands.AuthTokenCheckFailed(0, "").process(rp);
+        new WireCommands.AuthTokenCheckFailed(0, "",
+                WireCommands.AuthTokenCheckFailed.ErrorCode.TOKEN_CHECK_FAILED).process(rp);
         assertTrue("Process should call the corresponding API", authTokenCheckFailedCalled.get());
+
+        assertFalse(new WireCommands.AuthTokenCheckFailed(0, "",
+                WireCommands.AuthTokenCheckFailed.ErrorCode.TOKEN_CHECK_FAILED).isTokenExpired());
+
+        assertTrue(new WireCommands.AuthTokenCheckFailed(0, "",
+                WireCommands.AuthTokenCheckFailed.ErrorCode.TOKEN_EXPIRED).isTokenExpired());
     }
 
     /*
@@ -180,6 +233,40 @@ public class WireCommandsTest {
             out.writeLong(eventNumber);
         }
     }
+    
+    @Data
+    public static final class DataAppendedV3 implements WireCommand {
+        final WireCommandType type = WireCommandType.DATA_APPENDED;
+        final UUID writerId;
+        final long eventNumber;
+        final long previousEventNumber;
+
+        @Override
+        public void writeFields(DataOutput out) throws IOException {
+            out.writeLong(writerId.getMostSignificantBits());
+            out.writeLong(writerId.getLeastSignificantBits());
+            out.writeLong(eventNumber);
+            out.writeLong(previousEventNumber);
+        }
+    }
+    
+    @Data
+    public static final class DataAppendedV4 implements WireCommand {
+        final WireCommandType type = WireCommandType.DATA_APPENDED;
+        final long requestId;
+        final UUID writerId;
+        final long eventNumber;
+        final long previousEventNumber;
+
+        @Override
+        public void writeFields(DataOutput out) throws IOException {
+            out.writeLong(writerId.getMostSignificantBits());
+            out.writeLong(writerId.getLeastSignificantBits());
+            out.writeLong(eventNumber);
+            out.writeLong(previousEventNumber);
+            out.writeLong(requestId);
+        }
+    }
 
     @Test
     public void testDataAppended() throws IOException {
@@ -187,11 +274,21 @@ public class WireCommandsTest {
         ByteArrayOutputStream bout = new ByteArrayOutputStream();
         DataAppendedV2 commandV2 = new DataAppendedV2(uuid, l);
         commandV2.writeFields(new DataOutputStream(bout));
-        testCommandFromByteArray(bout.toByteArray(), new WireCommands.DataAppended(-1L, uuid, l, -1));
+        testCommandFromByteArray(bout.toByteArray(), new WireCommands.DataAppended(-1L, uuid, l, -1, -1));
 
+        bout = new ByteArrayOutputStream();
+        DataAppendedV3 commandV3 = new DataAppendedV3(uuid, l, 2);
+        commandV3.writeFields(new DataOutputStream(bout));
+        testCommandFromByteArray(bout.toByteArray(), new WireCommands.DataAppended(-1L, uuid, l, 2L, -1));
+        
+        bout = new ByteArrayOutputStream();
+        DataAppendedV4 commandV4 = new DataAppendedV4(4, uuid, l, 3);
+        commandV4.writeFields(new DataOutputStream(bout));
+        testCommandFromByteArray(bout.toByteArray(), new WireCommands.DataAppended(4L, uuid, l, 3L, -1));
+        
         // Test that we are able to encode and decode the current response
         // to append data correctly.
-        testCommand(new WireCommands.DataAppended(l, uuid, l, Long.MIN_VALUE));
+        testCommand(new WireCommands.DataAppended(1, uuid, l, Long.MIN_VALUE, -l));
     }
 
     /*
@@ -399,7 +496,50 @@ public class WireCommandsTest {
         ByteArrayOutputStream bout = new ByteArrayOutputStream();
         InvalidEventNumberV5 commandV5 = new InvalidEventNumberV5(uuid, i);
         commandV5.writeFields(new DataOutputStream(bout));
-        testCommandFromByteArray(bout.toByteArray(), new WireCommands.InvalidEventNumber(uuid, i, ""));
+        testCommandFromByteArray(bout.toByteArray(), new WireCommands.InvalidEventNumber(uuid, i, "", b));
+    }
+
+    @Data
+    public static final class InvalidEventNumberV15 implements Reply, WireCommand {
+        final WireCommandType type = WireCommandType.INVALID_EVENT_NUMBER;
+        final UUID writerId;
+        final long eventNumber;
+        final String serverStackTrace;
+
+        @Override
+        public void process(ReplyProcessor cp) {}
+
+        @Override
+        public void writeFields(DataOutput out) throws IOException {
+            out.writeLong(writerId.getMostSignificantBits());
+            out.writeLong(writerId.getLeastSignificantBits());
+            out.writeLong(eventNumber);
+            out.writeUTF(serverStackTrace);
+        }
+
+        @Override
+        public String toString() {
+            return "Invalid event number: " + eventNumber + " for writer: " + writerId;
+        }
+
+        @Override
+        public boolean isFailure() {
+            return true;
+        }
+
+        @Override
+        public long getRequestId() {
+            return eventNumber;
+        }
+    }
+
+    @Test
+    public void testCompatibilityInvalidEventNumberV15() throws IOException {
+        // Test that we are able to decode a message with a previous version
+        ByteArrayOutputStream bout = new ByteArrayOutputStream();
+        InvalidEventNumberV15 commandV5 = new InvalidEventNumberV15(uuid, i, "");
+        commandV5.writeFields(new DataOutputStream(bout));
+        testCommandFromByteArray(bout.toByteArray(), new WireCommands.InvalidEventNumber(uuid, i, "", b));
     }
 
     @Data
@@ -458,20 +598,48 @@ public class WireCommandsTest {
     }
 
     @Test
+    public void testFlushToStorage() throws IOException {
+        testCommand(new WireCommands.FlushToStorage(i, "", l));
+    }
+
+    @Test
+    public void testStorageFlushed() throws IOException {
+        testCommand(new WireCommands.StorageFlushed(l));
+    }
+
+    @Test
+    public void testListStorageChunks() throws IOException {
+        testCommand(new WireCommands.ListStorageChunks(testString1, "", l));
+    }
+
+    @Test
+    public void testStorageChunksListed() throws IOException {
+        List<WireCommands.ChunkInfo> chunks = Collections.singletonList(new WireCommands.ChunkInfo(l, l, l, testString1, false));
+        testCommand(new WireCommands.StorageChunksListed(l, chunks));
+    }
+
+    @Test
     public void testReadSegment() throws IOException {
         testCommand(new WireCommands.ReadSegment(testString1, l, i, "", l));
     }
 
     @Test
     public void testSegmentRead() throws IOException {
-        testCommand(new WireCommands.SegmentRead(testString1, l, true, false, buffer, l));
+        testCommand(new WireCommands.SegmentRead(testString1, l, true, false, buf, l));
+
+        // Test that it correctly implements ReleasableCommand.
+        testReleasableCommand(
+                () -> new WireCommands.SegmentRead(testString1, l, true, false, buf, l),
+                WireCommands.SegmentRead::readFrom,
+                sr -> sr.getData().refCnt());
+
     }
-    
+
     @Test
     public void testUpdateSegmentAttribute() throws IOException {
         testCommand(new WireCommands.UpdateSegmentAttribute(l, testString1, uuid, l, l, ""));
     }
-    
+
     @Test
     public void testSegmentAttributeUpdated() throws IOException {
         testCommand(new WireCommands.SegmentAttributeUpdated(l, true));
@@ -500,12 +668,22 @@ public class WireCommandsTest {
 
     @Test
     public void testCreateSegment() throws IOException {
-        testCommand(new WireCommands.CreateSegment(l, testString1, b, i, ""));
+        testCommand(new WireCommands.CreateSegment(l, testString1, b, i, "", 1024L));
+    }
+
+    @Test
+    public void testGetTableSegmentInfo() throws IOException {
+        testCommand(new WireCommands.GetTableSegmentInfo(l, testString1, ""));
+    }
+
+    @Test
+    public void testTableSegmentInfo() throws IOException {
+        testCommand(new WireCommands.TableSegmentInfo(l, testString1, l + 1, l + 2, 3, 4));
     }
 
     @Test
     public void testCreateTableSegment() throws IOException {
-        testCommand(new WireCommands.CreateTableSegment(l, testString1, ""));
+        testCommand(new WireCommands.CreateTableSegment(l, testString1, true, 16, "", 1024L));
     }
 
     @Test
@@ -514,28 +692,41 @@ public class WireCommandsTest {
     }
 
     @Test
+    public void testCreateTransientSegment() throws IOException {
+        RequestProcessor rp = mock(RequestProcessor.class);
+        WireCommands.CreateTransientSegment cmd = new WireCommands.CreateTransientSegment(l, new UUID(0, 0), testString1, "");
+        cmd.process(rp);
+        verify(rp, times(1)).createTransientSegment(cmd);
+        testCommand(cmd);
+    }
+
+    @Test
+    public void testMergeSegmentsBatch() throws IOException {
+        List<String> txnSegmentIds = ImmutableList.of("txn1seg0", "txn2seg0");
+        String streamSegmentId = "seg0";
+        testCommand(new WireCommands.MergeSegmentsBatch(l, streamSegmentId, txnSegmentIds, ""));
+    }
+
+    @Test
+    public void testSegmentsBatchMerged() throws IOException {
+        List<String> txnSegmentIds = ImmutableList.of("txn1seg0", "txn2seg0");
+        String streamSegmentId = "seg0";
+        testCommand(new WireCommands.SegmentsBatchMerged(l, streamSegmentId, txnSegmentIds, ImmutableList.of(10L, 11L)));
+    }
+
+    @Test
     public void testMergeSegments() throws IOException {
         testCommand(new WireCommands.MergeSegments(l, testString1, testString2, ""));
     }
 
     @Test
-    public void testMergeTableSegments() throws IOException {
-        testCommand(new WireCommands.MergeTableSegments(l, testString1, testString2, ""));
-    }
-
-    @Test
     public void testSegmentsMerged() throws IOException {
-        testCommand(new WireCommands.SegmentsMerged(l, testString1, testString2));
+        testCommand(new WireCommands.SegmentsMerged(l, testString1, testString2, -l));
     }
 
     @Test
     public void testSealSegment() throws IOException {
         testCommand(new WireCommands.SealSegment(l, testString1, ""));
-    }
-
-    @Test
-    public void testSealTableSegment() throws IOException {
-        testCommand(new WireCommands.SealTableSegment(l, testString1, ""));
     }
 
     @Test
@@ -613,7 +804,7 @@ public class WireCommandsTest {
 
     @Test
     public void testInvalidEventNumber() throws IOException {
-        testCommand(new WireCommands.InvalidEventNumber(uuid, i, "SomeException"));
+        testCommand(new WireCommands.InvalidEventNumber(uuid, i, "SomeException", l));
     }
 
     @Test
@@ -628,7 +819,17 @@ public class WireCommandsTest {
                 new SimpleImmutableEntry<>(new WireCommands.TableKey(buf, l), new WireCommands.TableValue(buf)),
                 new SimpleImmutableEntry<>(WireCommands.TableKey.EMPTY, WireCommands.TableValue.EMPTY),
                 new SimpleImmutableEntry<>(new WireCommands.TableKey(buf, l), WireCommands.TableValue.EMPTY));
-        testCommand(new WireCommands.UpdateTableEntries(l, testString1, "", new WireCommands.TableEntries(entries)));
+        testCommand(new WireCommands.UpdateTableEntries(l, testString1, "", new WireCommands.TableEntries(entries), 0L));
+
+        // Each Key and Value will retain the buffer once. We do not retain anything for the empty Table Key/Value.
+        int refCntIncrement = entries.stream()
+                .mapToInt(e -> (e.getKey() == WireCommands.TableKey.EMPTY ? 0 : 1) + (e.getValue() == WireCommands.TableValue.EMPTY ? 0 : 1))
+                .sum();
+        testReleasableCommand(
+                () -> new WireCommands.UpdateTableEntries(l, testString1, "", new WireCommands.TableEntries(entries), 0L),
+                WireCommands.UpdateTableEntries::readFrom,
+                ce -> ce.tableEntries.getEntries().get(0).getValue().getData().refCnt(),
+                refCntIncrement);
     }
 
     @Test
@@ -639,7 +840,13 @@ public class WireCommandsTest {
     @Test
     public void testRemoveTableKeys() throws IOException {
         testCommand(new WireCommands.RemoveTableKeys(l, testString1, "", Arrays.asList(new WireCommands.TableKey(buf, 1L),
-                                                                                       new WireCommands.TableKey(buf, 2L))));
+                new WireCommands.TableKey(buf, 2L)), 0L));
+        testReleasableCommand(
+                () -> new WireCommands.RemoveTableKeys(l, testString1, "", Arrays.asList(new WireCommands.TableKey(buf, 1L),
+                        new WireCommands.TableKey(buf, 2L)), 0L),
+                WireCommands.RemoveTableKeys::readFrom,
+                ce -> ce.getKeys().get(0).getData().refCnt(),
+                2);
     }
 
     @Test
@@ -648,9 +855,27 @@ public class WireCommandsTest {
     }
 
     @Test
+    public void testLocateOffset() throws IOException {
+        WireCommands.LocateOffset cmd = new WireCommands.LocateOffset(l, testString1, 10, "");
+        testCommand(cmd);
+    }
+
+    @Test
+    public void testOffsetLocated() throws IOException {
+        WireCommands.OffsetLocated cmd = new WireCommands.OffsetLocated(l, testString1, 10);
+        testCommand(cmd);
+    }
+
+    @Test
     public void testReadTable() throws IOException {
         testCommand(new WireCommands.ReadTable(l, testString1, "", Arrays.asList(new WireCommands.TableKey(buf, 1L),
-                                                                                 new WireCommands.TableKey(buf, 2L))));
+                new WireCommands.TableKey(buf, 2L))));
+        testReleasableCommand(
+                () -> new WireCommands.ReadTable(l, testString1, "", Arrays.asList(new WireCommands.TableKey(buf, 1L),
+                        new WireCommands.TableKey(buf, 2L))),
+                WireCommands.ReadTable::readFrom,
+                ce -> ce.getKeys().get(0).getData().refCnt(),
+                2);
     }
 
     @Test
@@ -661,6 +886,12 @@ public class WireCommandsTest {
         );
 
         testCommand(new WireCommands.TableRead(l, testString1, new WireCommands.TableEntries(entries)));
+
+        testReleasableCommand(
+                () -> new WireCommands.TableRead(l, testString1, new WireCommands.TableEntries(entries)),
+                WireCommands.TableRead::readFrom,
+                ce -> ce.entries.getEntries().get(0).getKey().getData().refCnt(),
+                4);
     }
 
     @Test
@@ -678,19 +909,31 @@ public class WireCommandsTest {
     }
 
     @Test
-    public void testGetTableKeys() throws IOException {
-        WireCommands.ReadTableKeys cmd = new WireCommands.ReadTableKeys(l, testString1, "", 100, buf);
-        testCommand(cmd);
-        cmd = new WireCommands.ReadTableKeys(l, testString1, "", 100, wrappedBuffer(new byte[0]));
-        testCommand(cmd);
+    public void testTableIterators() throws IOException {
+        testTableIterators(args -> new WireCommands.ReadTableKeys(l, testString1, "", 100, args));
+        testTableIterators(args -> new WireCommands.ReadTableEntries(l, testString1, "", 100, args));
     }
 
-    @Test
-    public void testGetTableEntries() throws IOException {
-        WireCommands.ReadTableEntries cmd = new WireCommands.ReadTableEntries(l, testString1, "", 10, buf);
+    private <T extends WireCommand> void testTableIterators(Function<WireCommands.TableIteratorArgs, T> createWireCommand) throws IOException {
+        // Continuation Token.
+        ByteBuf buf2 = buf.copy().setInt(0, Integer.MAX_VALUE);
+        WireCommands.TableIteratorArgs args = new WireCommands.TableIteratorArgs(buf, Unpooled.EMPTY_BUFFER, Unpooled.EMPTY_BUFFER, Unpooled.EMPTY_BUFFER);
+        T cmd = createWireCommand.apply(args);
         testCommand(cmd);
-        cmd = new WireCommands.ReadTableEntries(l, testString1, "", 10, wrappedBuffer(new byte[0]));
+
+        // From/To.
+        args = new WireCommands.TableIteratorArgs(Unpooled.EMPTY_BUFFER, Unpooled.EMPTY_BUFFER, buf, buf2);
+        cmd = createWireCommand.apply(args);
         testCommand(cmd);
+
+        // Test that we are able to read fields from an older version.
+        ByteBuf buf3 = buf.copy().setInt(0, Integer.MAX_VALUE - 1);
+        args = new WireCommands.TableIteratorArgs(buf, Unpooled.EMPTY_BUFFER, buf2, buf3);
+        cmd = createWireCommand.apply(args);
+        ByteBufferOutputStream bout = new ByteBufferOutputStream();
+        cmd.writeFields(new DataOutputStream(bout));
+        T cmd2 = createWireCommand.apply(new WireCommands.TableIteratorArgs(buf, Unpooled.EMPTY_BUFFER, Unpooled.EMPTY_BUFFER, Unpooled.EMPTY_BUFFER));
+        testCommandFromByteArray(bout.getData().slice(0, bout.size() - 2 * Integer.BYTES - buf2.readableBytes() - buf3.readableBytes()).getCopy(), cmd2);
     }
 
     @Test
@@ -700,6 +943,11 @@ public class WireCommandsTest {
         testCommand(cmd);
         cmd = new WireCommands.TableKeysRead(l, testString1, keys, wrappedBuffer(new byte[0]));
         testCommand(cmd);
+        testReleasableCommand(
+                () -> new WireCommands.TableKeysRead(l, testString1, keys, buf),
+                WireCommands.TableKeysRead::readFrom,
+                ce -> ce.keys.get(0).getData().refCnt(),
+                keys.size());
     }
 
     @Test
@@ -714,21 +962,161 @@ public class WireCommandsTest {
         testCommand(cmd);
         cmd = new WireCommands.TableEntriesRead(l, testString1, tableEntries, wrappedBuffer(new byte[0]));
         testCommand(cmd);
+        testReleasableCommand(
+                () -> new WireCommands.TableEntriesRead(l, testString1, tableEntries, buf),
+                WireCommands.TableEntriesRead::readFrom,
+                ce -> ce.getEntries().getEntries().get(0).getKey().getData().refCnt(),
+                2 * entries.size());
     }
 
+    @Test
+    public void testReadTableEntriesDelta() throws IOException {
+        WireCommands.ReadTableEntriesDelta cmd = new WireCommands.ReadTableEntriesDelta(l, testString1, "", 1L, 100);
+        testCommand(cmd);
+    }
 
+    @Test
+    public void testTableEntriesDeltaRead() throws IOException {
+        List<Map.Entry<WireCommands.TableKey, WireCommands.TableValue>> entries = Arrays.asList(
+                new SimpleImmutableEntry<>(new WireCommands.TableKey(buf, l), new WireCommands.TableValue(buf)),
+                new SimpleImmutableEntry<>(new WireCommands.TableKey(buf, l + 1), new WireCommands.TableValue(buf)));
+        WireCommands.TableEntries tableEntries = new WireCommands.TableEntries(entries);
+
+        WireCommands.TableEntriesDeltaRead cmd = new WireCommands.TableEntriesDeltaRead(
+                l, testString1, tableEntries, false, false, WireCommands.TableKey.NO_VERSION);
+        testCommand(cmd);
+    }
+
+    @Test
+    public void testConditionalBlockEnd() throws IOException {
+        testCommand(new WireCommands.ConditionalBlockEnd(uuid, l, l, buf, l));
+
+        // Test that it correctly implements ReleasableCommand.
+        testReleasableCommand(
+                () -> new WireCommands.ConditionalBlockEnd(uuid, l, l, buf, -1),
+                WireCommands.ConditionalBlockEnd::readFrom,
+                ce -> ce.getData().refCnt());
+    }
+
+    @Test
+    public void testMergeSegmentsWithAttributes() throws IOException {
+        List<WireCommands.ConditionalAttributeUpdate> attributeUpdates = Arrays.asList(
+                new WireCommands.ConditionalAttributeUpdate(UUID.randomUUID(), WireCommands.ConditionalAttributeUpdate.REPLACE, 0, Long.MIN_VALUE),
+                new WireCommands.ConditionalAttributeUpdate(UUID.randomUUID(), WireCommands.ConditionalAttributeUpdate.REPLACE_IF_EQUALS, 0, Long.MIN_VALUE));
+        WireCommands.MergeSegments conditionalMergeSegments = new WireCommands.MergeSegments(l, testString1, testString2,
+                "", attributeUpdates);
+        testCommand(conditionalMergeSegments);
+        // Check the size of the ConditionalAttributeUpdate.
+        assertEquals(attributeUpdates.get(0).size(), 4 * Long.BYTES + 1);
+    }
+
+    @Data
+    public static final class MergeSegmentsV5 implements Request, WireCommand {
+        final WireCommandType type = WireCommandType.MERGE_SEGMENTS;
+        final long requestId;
+        final String target;
+        final String source;
+        @ToString.Exclude
+        final String delegationToken;
+
+        public MergeSegmentsV5(long requestId, String target, String source, String delegationToken) {
+            this.requestId = requestId;
+            this.target = target;
+            this.source = source;
+            this.delegationToken = delegationToken;
+        }
+
+        @Override
+        public void process(RequestProcessor cp) {}
+
+        @Override
+        public void writeFields(DataOutput out) throws IOException {
+            out.writeLong(requestId);
+            out.writeUTF(target);
+            out.writeUTF(source);
+            out.writeUTF(delegationToken == null ? "" : delegationToken);
+        }
+    }
+
+    @Test
+    public void testCompatibilityMergeSegmentsV5() throws IOException {
+        // Test that we are able to decode a message with a previous version
+        ByteArrayOutputStream bout = new ByteArrayOutputStream();
+        MergeSegmentsV5 commandV5 = new MergeSegmentsV5(l, testString1, testString2, "");
+        commandV5.writeFields(new DataOutputStream(bout));
+        testCommandFromByteArray(bout.toByteArray(), new WireCommands.MergeSegments(l, testString1, testString2, "", Collections.emptyList()));
+    }
+
+    @Test
+    public void testErrorMessage() throws IOException {
+        for (WireCommands.ErrorMessage.ErrorCode code : WireCommands.ErrorMessage.ErrorCode.values()) {
+            Class<? extends Throwable> exceptionType = code.getExceptionType();
+            WireCommands.ErrorMessage cmd  = new WireCommands.ErrorMessage(1, "segment", testString1, code);
+            testCommand(cmd);
+            assertEquals(cmd.getErrorCode().getExceptionType(), exceptionType);
+            assertEquals(WireCommands.ErrorMessage.ErrorCode.valueOf(exceptionType), code);
+
+            RuntimeException exception = cmd.getThrowableException();
+            AssertExtensions.assertThrows(exceptionType, () -> {
+                throw exception;
+            });
+        }
+    }
+
+    private <T extends WireCommands.ReleasableCommand> void testReleasableCommand(
+            Supplier<T> fromBuf, WireCommands.Constructor fromStream, Function<T, Integer> getRefCnt) throws IOException {
+        testReleasableCommand(fromBuf, fromStream, getRefCnt, 1);
+    }
+
+    @SuppressWarnings("unchecked")
+    private <T extends WireCommands.ReleasableCommand> void testReleasableCommand(
+            Supplier<T> fromBuf, WireCommands.Constructor fromStream, Function<T, Integer> getRefCnt, int refCntIncrement) throws IOException {
+        // If we pass in the buffer ourselves, there should be no need to release.
+        final int originalRefCnt = buf.refCnt();
+        int expectedRefCnt = originalRefCnt;
+        T command = fromBuf.get();
+        assertTrue(command.isReleased());
+        command.release();
+        assertEquals(originalRefCnt, buf.refCnt());
+        assertTrue(command.isReleased());
+        command.release(); // Do this again. The second time should have no effect.
+        assertEquals(originalRefCnt, buf.refCnt());
+
+        // Deserialize the command.
+        ByteArrayOutputStream bout = new ByteArrayOutputStream();
+        command.writeFields(new DataOutputStream(bout));
+        ByteBuf buffer = Unpooled.wrappedBuffer(bout.toByteArray());
+        T command2 = (T) fromStream.readFrom(new EnhancedByteBufInputStream(buffer), bout.size());
+        expectedRefCnt += refCntIncrement;
+        assertEquals(expectedRefCnt, (int) getRefCnt.apply(command2));
+        assertEquals(expectedRefCnt, buffer.refCnt());
+
+        // Release the underlying buffer.
+        buffer.release();
+        expectedRefCnt--;
+        assertEquals(expectedRefCnt, (int) getRefCnt.apply(command2));
+        assertEquals(expectedRefCnt, buffer.refCnt());
+
+        // Release the command.
+        command2.release();
+        expectedRefCnt -= refCntIncrement;
+        assertEquals(0, (int) getRefCnt.apply(command2));
+        assertEquals(0, buffer.refCnt());
+        command2.release(); // Do this again. The second time should have no effect.
+        assertEquals(0, buffer.refCnt());
+    }
 
     private void testCommand(WireCommand command) throws IOException {
         ByteArrayOutputStream bout = new ByteArrayOutputStream();
         command.writeFields(new DataOutputStream(bout));
         byte[] array = bout.toByteArray();
-        WireCommand read = command.getType().readFrom(new ByteBufInputStream(Unpooled.wrappedBuffer(array)),
+        WireCommand read = command.getType().readFrom(new EnhancedByteBufInputStream(Unpooled.wrappedBuffer(array)),
                                                       array.length);
         assertEquals(command, read);
     }
 
     private void testCommandFromByteArray(byte[] bytes, WireCommand compatibleCommand) throws IOException {
-        WireCommand read = compatibleCommand.getType().readFrom(new ByteBufInputStream(Unpooled.wrappedBuffer(bytes)),
+        WireCommand read = compatibleCommand.getType().readFrom(new EnhancedByteBufInputStream(Unpooled.wrappedBuffer(bytes)),
                 bytes.length);
         assertEquals(compatibleCommand, read);
     }

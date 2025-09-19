@@ -1,46 +1,49 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.controller.store.stream;
 
 import io.pravega.common.concurrent.ExecutorServiceHelpers;
+import io.pravega.controller.store.ZKStoreHelper;
 import io.pravega.test.common.TestingServerStarter;
+import java.io.IOException;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.Map;
+import java.util.concurrent.ScheduledExecutorService;
 import org.apache.curator.framework.CuratorFramework;
 import org.apache.curator.framework.CuratorFrameworkFactory;
 import org.apache.curator.retry.RetryNTimes;
 import org.apache.curator.test.TestingServer;
 import org.junit.After;
 import org.junit.Before;
-import org.junit.Rule;
 import org.junit.Test;
-import org.junit.rules.Timeout;
-
-import java.io.IOException;
-import java.util.Arrays;
-import java.util.Collections;
-import java.util.Map;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.spy;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 
 public class ZkOrderedStoreTest {
-    //Ensure each test completes within 30 seconds.
-    @Rule
-    public Timeout globalTimeout = new Timeout(30, TimeUnit.SECONDS);
 
     private TestingServer zkServer;
     private CuratorFramework cli;
-    private final ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor();
+    private final ScheduledExecutorService executor = ExecutorServiceHelpers.newScheduledThreadPool(1, "test");
     private ZKStoreHelper zkStoreHelper;
 
     @Before
@@ -58,7 +61,7 @@ public class ZkOrderedStoreTest {
         zkServer.close();
     }
 
-    @Test
+    @Test(timeout = 30000)
     public void testStore() {
         String test = "test";
         String scope = "test";
@@ -67,25 +70,25 @@ public class ZkOrderedStoreTest {
         ZkOrderedStore store = new ZkOrderedStore(test, zkStoreHelper, executor, 1);
         
         // add 5 entities
-        long position1 = store.addEntity(scope, stream, test + 1).join();
+        long position1 = store.addEntity(scope, stream, test + 1, 0L).join();
         assertEquals(0L, position1);
         // verify that set 0 is not sealed
         assertFalse(store.isSealed(scope, stream, 0).join());
         
-        long position2 = store.addEntity(scope, stream, test + 2).join();
+        long position2 = store.addEntity(scope, stream, test + 2, 0L).join();
         assertEquals(1L, position2);
         // verify that set 0 is still not sealed
         assertFalse(store.isSealed(scope, stream, 0).join());
 
-        long position3 = store.addEntity(scope, stream, test + 3).join();
+        long position3 = store.addEntity(scope, stream, test + 3, 0L).join();
         assertEquals(ZkOrderedStore.Position.toLong(1, 0), position3);
         // verify that set 0 is sealed
         assertTrue(store.isSealed(scope, stream, 0).join());
 
-        long position4 = store.addEntity(scope, stream, test + 4).join();
+        long position4 = store.addEntity(scope, stream, test + 4, 0L).join();
         assertEquals(ZkOrderedStore.Position.toLong(1, 1), position4);
         
-        long position5 = store.addEntity(scope, stream, test + 5).join();
+        long position5 = store.addEntity(scope, stream, test + 5, 0L).join();
         assertEquals(ZkOrderedStore.Position.toLong(2, 0), position5);
         // verify that set 1 is sealed
         assertTrue(store.isSealed(scope, stream, 1).join());
@@ -130,5 +133,19 @@ public class ZkOrderedStoreTest {
         store.removeEntities(scope, stream, Collections.singletonList(position5)).join();
         // verify that collection 2 is not deleted as it is not sealed
         assertFalse(store.isDeleted(scope, stream, 2).join());
+    }
+
+    @Test(timeout = 30000)
+    public void testSync() {
+        String test = "test";
+        String scope = "test";
+        String stream = "test";
+        ZKStoreHelper zkStoreHelper = spy(this.zkStoreHelper);
+        ZkOrderedStore store = new ZkOrderedStore(test, zkStoreHelper, executor, 1);
+        
+        store.addEntity(scope, stream, test + 1, 0L).join();
+        store.getEntitiesWithPosition(scope, stream).join();
+        
+        verify(zkStoreHelper, times(1)).sync(any());
     }
 }

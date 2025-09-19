@@ -1,40 +1,53 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.test.integration;
 
 import io.pravega.client.ClientConfig;
 import io.pravega.client.admin.StreamManager;
 import io.pravega.client.admin.impl.StreamManagerImpl;
-import io.pravega.client.netty.impl.ConnectionFactory;
-import io.pravega.client.netty.impl.ConnectionFactoryImpl;
+import io.pravega.client.connection.impl.ConnectionPool;
+import io.pravega.client.connection.impl.ConnectionPoolImpl;
+import io.pravega.client.connection.impl.SocketConnectionFactoryImpl;
+import io.pravega.client.control.impl.Controller;
+import io.pravega.client.stream.ScalingPolicy;
+import io.pravega.client.stream.Stream;
+import io.pravega.client.stream.StreamConfiguration;
+import io.pravega.client.stream.TransactionInfo;
+import io.pravega.client.stream.impl.TxnSegments;
 import io.pravega.common.concurrent.Futures;
-import io.pravega.segmentstore.contracts.tables.TableStore;
-import io.pravega.test.common.TestingServerStarter;
-import io.pravega.test.integration.demo.ControllerWrapper;
 import io.pravega.segmentstore.contracts.StreamSegmentStore;
+import io.pravega.segmentstore.contracts.tables.TableStore;
+import io.pravega.segmentstore.server.host.handler.IndexAppendProcessor;
 import io.pravega.segmentstore.server.host.handler.PravegaConnectionListener;
 import io.pravega.segmentstore.server.store.ServiceBuilder;
 import io.pravega.segmentstore.server.store.ServiceBuilderConfig;
-import io.pravega.client.stream.ScalingPolicy;
-import io.pravega.client.stream.StreamConfiguration;
-import io.pravega.client.stream.impl.Controller;
 import io.pravega.test.common.TestUtils;
+import io.pravega.test.common.TestingServerStarter;
+import io.pravega.test.integration.utils.ControllerWrapper;
 import lombok.Cleanup;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.curator.test.TestingServer;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
-
-import static org.junit.Assert.assertFalse;
+import java.util.List;
+import static io.pravega.test.common.AssertExtensions.assertEventuallyEquals;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertEquals;
 
 /**
  * Controller stream metadata tests.
@@ -47,6 +60,7 @@ public class ControllerStreamMetadataTest {
     private PravegaConnectionListener server = null;
     private ControllerWrapper controllerWrapper = null;
     private Controller controller = null;
+    private ServiceBuilder serviceBuilder;
     private StreamConfiguration streamConfiguration = null;
 
     @Before
@@ -61,12 +75,13 @@ public class ControllerStreamMetadataTest {
             this.zkTestServer = new TestingServerStarter().start();
 
             // 2. Start Pravega service.
-            ServiceBuilder serviceBuilder = ServiceBuilder.newInMemoryBuilder(ServiceBuilderConfig.getDefaultConfig());
+            serviceBuilder = ServiceBuilder.newInMemoryBuilder(ServiceBuilderConfig.getDefaultConfig());
             serviceBuilder.initialize();
             StreamSegmentStore store = serviceBuilder.createStreamSegmentService();
             TableStore tableStore = serviceBuilder.createTableStoreService();
 
-            this.server = new PravegaConnectionListener(false, servicePort, store, tableStore);
+            this.server = new PravegaConnectionListener(false, servicePort, store, tableStore, serviceBuilder.getLowPriorityExecutor(),
+                    new IndexAppendProcessor(serviceBuilder.getLowPriorityExecutor(), store));
             this.server.startListening();
 
             // 3. Start controller
@@ -93,6 +108,10 @@ public class ControllerStreamMetadataTest {
             if (this.server != null) {
                 this.server.close();
                 this.server = null;
+            }
+            if (this.serviceBuilder != null) {
+                this.serviceBuilder.close();
+                this.serviceBuilder = null;
             }
             if (this.zkTestServer != null) {
                 this.zkTestServer.close();
@@ -158,10 +177,12 @@ public class ControllerStreamMetadataTest {
 
     @Test(timeout = 10000)
     public void streamManagerImpltest() {
+        ClientConfig config = ClientConfig.builder().build();
         @Cleanup
-        ConnectionFactory cf = new ConnectionFactoryImpl(ClientConfig.builder().build());
+        ConnectionPool cp = new ConnectionPoolImpl(config, new SocketConnectionFactoryImpl(config));
+        
         @Cleanup
-        StreamManager streamManager = new StreamManagerImpl(controller, cf);
+        StreamManager streamManager = new StreamManagerImpl(controller, cp);
 
         // Create and delete scope
         assertTrue(streamManager.createScope(SCOPE));
@@ -174,5 +195,35 @@ public class ControllerStreamMetadataTest {
 
         // Delete twice
         assertFalse(streamManager.deleteScope(SCOPE));
+    }
+
+    @Test
+    public void testListCompletedTxns() throws Exception {
+        // Create test scope. This operation should succeed.
+        assertTrue(controller.createScope(SCOPE).join());
+
+        assertTrue(controller.createStream(SCOPE, STREAM, streamConfiguration).join());
+
+        TxnSegments txnSegments = controller.createTransaction(Stream.of(SCOPE, STREAM), 15000L).join();
+        TxnSegments txnSegments2 = controller.createTransaction(Stream.of(SCOPE, STREAM), 15000L).join();
+
+        List<TransactionInfo> listUUID = controller.listCompletedTransactions(Stream.of(SCOPE, STREAM)).join();
+        assertEquals(0, listUUID.size());
+
+        controller.commitTransaction(Stream.of(SCOPE, STREAM), "", 0L, txnSegments.getTxnId());
+        controller.abortTransaction(Stream.of(SCOPE, STREAM), txnSegments2.getTxnId());
+
+        assertEventuallyEquals(2, () -> controller.listCompletedTransactions(Stream.of(SCOPE, STREAM)).join().size(), 10000);
+        assertEquals(txnSegments.getTxnId(), controller.listCompletedTransactions(Stream.of(SCOPE, STREAM)).join().get(0).getTransactionId());
+        assertEquals(txnSegments2.getTxnId(), controller.listCompletedTransactions(Stream.of(SCOPE, STREAM)).join().get(1).getTransactionId());
+
+        for (int i = 0; i < 300; i++) {
+            txnSegments = controller.createTransaction(Stream.of(SCOPE, STREAM), 15000L).join();
+            txnSegments2 = controller.createTransaction(Stream.of(SCOPE, STREAM), 15000L).join();
+            controller.commitTransaction(Stream.of(SCOPE, STREAM), "", 0L, txnSegments.getTxnId());
+            controller.abortTransaction(Stream.of(SCOPE, STREAM), txnSegments2.getTxnId());
+        }
+
+        assertEquals(500, controller.listCompletedTransactions(Stream.of(SCOPE, STREAM)).join().size());
     }
 }

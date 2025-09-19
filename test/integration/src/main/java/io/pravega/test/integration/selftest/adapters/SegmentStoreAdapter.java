@@ -1,11 +1,17 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.test.integration.selftest.adapters;
 
@@ -14,13 +20,21 @@ import io.pravega.common.Exceptions;
 import io.pravega.common.TimeoutTimer;
 import io.pravega.common.concurrent.ExecutorServiceHelpers;
 import io.pravega.common.concurrent.Futures;
-import io.pravega.common.util.ArrayView;
+import io.pravega.common.io.FileHelpers;
 import io.pravega.common.util.AsyncIterator;
+import io.pravega.common.util.BufferView;
+import io.pravega.segmentstore.contracts.AttributeId;
+import io.pravega.segmentstore.contracts.AttributeUpdate;
+import io.pravega.segmentstore.contracts.AttributeUpdateCollection;
+import io.pravega.segmentstore.contracts.AttributeUpdateType;
+import io.pravega.segmentstore.contracts.Attributes;
 import io.pravega.segmentstore.contracts.SegmentProperties;
+import io.pravega.segmentstore.contracts.SegmentType;
 import io.pravega.segmentstore.contracts.StreamSegmentMergedException;
 import io.pravega.segmentstore.contracts.StreamSegmentNotExistsException;
 import io.pravega.segmentstore.contracts.StreamSegmentSealedException;
 import io.pravega.segmentstore.contracts.StreamSegmentStore;
+import io.pravega.segmentstore.contracts.tables.IteratorArgs;
 import io.pravega.segmentstore.contracts.tables.TableEntry;
 import io.pravega.segmentstore.contracts.tables.TableKey;
 import io.pravega.segmentstore.contracts.tables.TableStore;
@@ -28,21 +42,22 @@ import io.pravega.segmentstore.server.store.ServiceBuilder;
 import io.pravega.segmentstore.server.store.ServiceBuilderConfig;
 import io.pravega.segmentstore.storage.Storage;
 import io.pravega.segmentstore.storage.StorageFactory;
+import io.pravega.segmentstore.storage.chunklayer.ChunkedSegmentStorageConfig;
 import io.pravega.segmentstore.storage.impl.bookkeeper.BookKeeperConfig;
 import io.pravega.segmentstore.storage.impl.bookkeeper.BookKeeperLogFactory;
-import io.pravega.segmentstore.storage.impl.rocksdb.RocksDBCacheFactory;
-import io.pravega.segmentstore.storage.impl.rocksdb.RocksDBConfig;
 import io.pravega.segmentstore.storage.mocks.InMemoryDurableDataLogFactory;
-import io.pravega.segmentstore.storage.mocks.InMemoryStorageFactory;
+import io.pravega.shared.NameUtils;
 import io.pravega.shared.metrics.MetricsConfig;
 import io.pravega.shared.metrics.MetricsProvider;
 import io.pravega.shared.metrics.StatsProvider;
-import io.pravega.shared.segment.StreamSegmentNameUtils;
+import io.pravega.shared.protocol.netty.ByteBufWrapper;
+import io.pravega.storage.filesystem.FileSystemSimpleStorageFactory;
+import io.pravega.storage.filesystem.FileSystemStorageConfig;
 import io.pravega.test.integration.selftest.Event;
 import io.pravega.test.integration.selftest.TestConfig;
+import java.io.File;
 import java.time.Duration;
 import java.util.AbstractMap;
-import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
@@ -66,11 +81,13 @@ import org.apache.curator.retry.ExponentialBackoffRetry;
 class SegmentStoreAdapter extends StoreAdapter {
     //region Members
 
+    private static final long EVENT_SEQ_NO_PREFIX = 1L;
+    private static final long EVENT_RK_PREFIX = 2L;
     private final ScheduledExecutorService testExecutor;
     private final TestConfig config;
     private final ServiceBuilderConfig builderConfig;
     private final ServiceBuilder serviceBuilder;
-    private final AtomicReference<Storage> storage;
+    private final AtomicReference<SingletonStorageFactory> storageFactory;
     private final AtomicReference<ScheduledExecutorService> storeExecutor;
     private final Thread stopBookKeeperProcess;
     private Process bookKeeperService;
@@ -94,16 +111,17 @@ class SegmentStoreAdapter extends StoreAdapter {
     SegmentStoreAdapter(TestConfig testConfig, ServiceBuilderConfig builderConfig, ScheduledExecutorService testExecutor) {
         this.config = Preconditions.checkNotNull(testConfig, "testConfig");
         this.builderConfig = Preconditions.checkNotNull(builderConfig, "builderConfig");
-        this.storage = new AtomicReference<>();
+        this.storageFactory = new AtomicReference<>();
         this.storeExecutor = new AtomicReference<>();
         this.testExecutor = Preconditions.checkNotNull(testExecutor, "testExecutor");
         this.serviceBuilder = attachDataLogFactory(ServiceBuilder
                 .newInMemoryBuilder(builderConfig)
-                .withCacheFactory(setup -> new RocksDBCacheFactory(setup.getConfig(RocksDBConfig::builder)))
                 .withStorageFactory(setup -> {
                     // We use the Segment Store Executor for the real storage.
-                    SingletonStorageFactory factory = new SingletonStorageFactory(setup.getStorageExecutor());
-                    this.storage.set(factory.createStorageAdapter());
+                    SingletonStorageFactory factory = new SingletonStorageFactory(config.getStorageDir(),
+                            setup.getStorageExecutor(),
+                            testConfig.isChunkedSegmentStorageEnabled());
+                    this.storageFactory.set(factory);
 
                     // A bit hack-ish, but we need to get a hold of the Store Executor, so we can request snapshots for it.
                     this.storeExecutor.set(setup.getCoreExecutor());
@@ -173,6 +191,11 @@ class SegmentStoreAdapter extends StoreAdapter {
             this.statsProvider = null;
         }
 
+        SingletonStorageFactory storageFactory = this.storageFactory.getAndSet(null);
+        if (storageFactory != null) {
+            storageFactory.close();
+        }
+
         Runtime.getRuntime().removeShutdownHook(this.stopBookKeeperProcess);
     }
 
@@ -183,22 +206,24 @@ class SegmentStoreAdapter extends StoreAdapter {
     @Override
     public CompletableFuture<Void> append(String streamName, Event event, Duration timeout) {
         ensureRunning();
-        ArrayView s = event.getSerialization();
-        byte[] payload = s.arrayOffset() == 0 ? s.array() : Arrays.copyOfRange(s.array(), s.arrayOffset(), s.getLength());
-        return this.streamSegmentStore.append(streamName, payload, null, timeout)
-                                      .exceptionally(ex -> attemptReconcile(ex, streamName, timeout));
+        val au = AttributeUpdateCollection.from(
+                new AttributeUpdate(Attributes.EVENT_COUNT, AttributeUpdateType.Replace, 1),
+                new AttributeUpdate(AttributeId.uuid(EVENT_SEQ_NO_PREFIX, event.getOwnerId()), AttributeUpdateType.Replace, event.getSequence()),
+                new AttributeUpdate(AttributeId.uuid(EVENT_RK_PREFIX, event.getOwnerId()), AttributeUpdateType.Replace, event.getRoutingKey()));
+        return Futures.toVoid(this.streamSegmentStore.append(streamName, new ByteBufWrapper(event.getWriteBuffer()), au, timeout)
+                                                     .exceptionally(ex -> attemptReconcile(ex, streamName, timeout)));
     }
 
     @Override
     public StoreReader createReader() {
         ensureRunning();
-        return new SegmentStoreReader(this.config, this.streamSegmentStore, this.storage.get(), this.testExecutor);
+        return new SegmentStoreReader(this.config, this.streamSegmentStore, this.storageFactory.get().createStorageAdapter(), this.testExecutor);
     }
 
     @Override
     public CompletableFuture<Void> createStream(String streamName, Duration timeout) {
         ensureRunning();
-        return this.streamSegmentStore.createStreamSegment(streamName, null, timeout);
+        return this.streamSegmentStore.createStreamSegment(streamName, SegmentType.STREAM_SEGMENT, null, timeout);
     }
 
     @Override
@@ -207,9 +232,9 @@ class SegmentStoreAdapter extends StoreAdapter {
 
         // Generate a transaction name. This need not be the same as what the Client would do, but we need a unique
         // name for the new segment. In mergeTransaction, we need a way to extract the original Segment's name out of this
-        // txnName, so best if we use the StreamSegmentNameUtils class.
-        String txnName = StreamSegmentNameUtils.getTransactionNameFromId(parentStream, UUID.randomUUID());
-        return this.streamSegmentStore.createStreamSegment(txnName, null, timeout)
+        // txnName, so best if we use the NameUtils class.
+        String txnName = NameUtils.getTransactionNameFromId(parentStream, UUID.randomUUID());
+        return this.streamSegmentStore.createStreamSegment(txnName, SegmentType.STREAM_SEGMENT, null, timeout)
                                       .thenApply(v -> txnName);
     }
 
@@ -217,7 +242,7 @@ class SegmentStoreAdapter extends StoreAdapter {
     public CompletableFuture<Void> mergeTransaction(String transactionName, Duration timeout) {
         ensureRunning();
         TimeoutTimer timer = new TimeoutTimer(timeout);
-        String parentSegment = StreamSegmentNameUtils.getParentStreamSegmentName(transactionName);
+        String parentSegment = NameUtils.getParentStreamSegmentName(transactionName);
         return Futures.toVoid(this.streamSegmentStore.mergeStreamSegment(parentSegment, transactionName, timer.getRemaining()));
     }
 
@@ -247,7 +272,8 @@ class SegmentStoreAdapter extends StoreAdapter {
     @Override
     public CompletableFuture<Void> createTable(String tableName, Duration timeout) {
         ensureRunning();
-        return this.tableStore.createSegment(tableName, timeout);
+        val type = SegmentType.builder().tableSegment();
+        return this.tableStore.createSegment(tableName, type.build(), timeout);
     }
 
     @Override
@@ -257,17 +283,17 @@ class SegmentStoreAdapter extends StoreAdapter {
     }
 
     @Override
-    public CompletableFuture<Long> updateTableEntry(String tableName, ArrayView key, ArrayView value, Long compareVersion, Duration timeout) {
+    public CompletableFuture<Long> updateTableEntry(String tableName, BufferView key, BufferView value, Long compareVersion, Duration timeout) {
         ensureRunning();
         TableEntry e = compareVersion == null || compareVersion == TableKey.NO_VERSION
                 ? TableEntry.unversioned(key, value)
                 : TableEntry.versioned(key, value, compareVersion);
         return this.tableStore.put(tableName, Collections.singletonList(e), timeout)
-                              .thenApply(versions -> versions.get(0));
+                .thenApply(versions -> versions.get(0));
     }
 
     @Override
-    public CompletableFuture<Void> removeTableEntry(String tableName, ArrayView key, Long compareVersion, Duration timeout) {
+    public CompletableFuture<Void> removeTableEntry(String tableName, BufferView key, Long compareVersion, Duration timeout) {
         ensureRunning();
         TableKey e = compareVersion == null || compareVersion == TableKey.NO_VERSION
                 ? TableKey.unversioned(key)
@@ -276,7 +302,7 @@ class SegmentStoreAdapter extends StoreAdapter {
     }
 
     @Override
-    public CompletableFuture<List<ArrayView>> getTableEntries(String tableName, List<ArrayView> keys, Duration timeout) {
+    public CompletableFuture<List<BufferView>> getTableEntries(String tableName, List<BufferView> keys, Duration timeout) {
         ensureRunning();
         return this.tableStore
                 .get(tableName, keys, timeout)
@@ -284,18 +310,18 @@ class SegmentStoreAdapter extends StoreAdapter {
     }
 
     @Override
-    public CompletableFuture<AsyncIterator<List<Map.Entry<ArrayView, ArrayView>>>> iterateTableEntries(String tableName, Duration timeout) {
+    public CompletableFuture<AsyncIterator<List<Map.Entry<BufferView, BufferView>>>> iterateTableEntries(String tableName, Duration timeout) {
         ensureRunning();
         return this.tableStore
-                .entryIterator(tableName, null, timeout)
+                .entryIterator(tableName, IteratorArgs.builder().fetchTimeout(timeout).build())
                 .thenApply(iterator -> () ->
                         iterator.getNext().thenApply(item -> {
                             if (item == null) {
                                 return null;
                             } else {
                                 return item.getEntries().stream()
-                                           .map(e -> new AbstractMap.SimpleImmutableEntry<>(e.getKey().getKey(), e.getValue()))
-                                           .collect(Collectors.<Map.Entry<ArrayView, ArrayView>>toList());
+                                        .map(e -> new AbstractMap.SimpleImmutableEntry<>(e.getKey().getKey(), e.getValue()))
+                                        .collect(Collectors.<Map.Entry<BufferView, BufferView>>toList());
                             }
                         }));
     }
@@ -328,7 +354,7 @@ class SegmentStoreAdapter extends StoreAdapter {
     }
 
     @SneakyThrows
-    private Void attemptReconcile(Throwable ex, String segmentName, Duration timeout) {
+    private Long attemptReconcile(Throwable ex, String segmentName, Duration timeout) {
         ex = Exceptions.unwrap(ex);
         boolean reconciled = false;
         if (isPossibleEndOfSegment(ex)) {
@@ -359,16 +385,27 @@ class SegmentStoreAdapter extends StoreAdapter {
         return this.streamSegmentStore;
     }
 
+    TableStore getTableStore() {
+        return this.tableStore;
+    }
+
     //endregion
 
     //region SingletonStorageFactory
 
     private static class SingletonStorageFactory implements StorageFactory, AutoCloseable {
+        private final String storageDir;
         private final AtomicBoolean closed;
         private final Storage storage;
 
-        SingletonStorageFactory(ScheduledExecutorService executor) {
-            this.storage = new InMemoryStorageFactory(executor).createStorageAdapter();
+        SingletonStorageFactory(String storageDir, ScheduledExecutorService executor, boolean isChunkedSegmentStoreEnabled) {
+            this.storageDir = storageDir;
+            if (isChunkedSegmentStoreEnabled) {
+                this.storage = new FileSystemSimpleStorageFactory(ChunkedSegmentStorageConfig.DEFAULT_CONFIG, FileSystemStorageConfig.builder().with(FileSystemStorageConfig.ROOT, storageDir).build(),
+                        executor).createStorageAdapter();
+            } else {
+                throw new UnsupportedOperationException("Rolling storage is deprecated." );
+            }
             this.storage.initialize(1);
             this.closed = new AtomicBoolean();
         }
@@ -383,6 +420,7 @@ class SegmentStoreAdapter extends StoreAdapter {
         public void close() {
             if (!this.closed.get()) {
                 this.storage.close();
+                FileHelpers.deleteFileOrDirectory(new File(this.storageDir));
                 this.closed.set(true);
             }
         }

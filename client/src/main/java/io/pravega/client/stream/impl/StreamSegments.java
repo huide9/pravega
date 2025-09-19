@@ -1,20 +1,24 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.client.stream.impl;
 
 import com.google.common.base.Preconditions;
+import io.pravega.client.control.impl.SegmentCollection;
 import io.pravega.client.segment.impl.Segment;
 import io.pravega.common.hash.HashHelper;
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.Collections;
 import java.util.Comparator;
 import java.util.Iterator;
 import java.util.List;
@@ -23,68 +27,35 @@ import java.util.Map.Entry;
 import java.util.NavigableMap;
 import java.util.TreeMap;
 import lombok.EqualsAndHashCode;
-import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
 
 /**
  * The segments that within a stream at a particular point in time.
  */
-@EqualsAndHashCode
+@EqualsAndHashCode(callSuper = true)
 @Slf4j
-public class StreamSegments {
-    private static final HashHelper HASHER = HashHelper.seededWith("EventRouter");
-    
-    /**
-     * Maps the upper end of a range to the corresponding segment. The range in the value is the
-     * range of keyspace the segment has been assigned. The range in the value is NOT the same as
-     * the difference between two keys. The keys correspond to the range that the client
-     * should route to, where as the one in the value is the range the segment it assigned. These
-     * may be different if a client still has a preceding segment in its map. In which case a
-     * segment's keys may not contain the full assigned range.
-     */
-    private final NavigableMap<Double, SegmentWithRange> segments;
-    @Getter
-    private final String delegationToken;
+public class StreamSegments extends SegmentCollection {
+    private static final HashHelper HASHER = HashHelper.seededWith("EventRouter");  // DO NOT change this string.
 
     /**
      * Creates a new instance of the StreamSegments class.
      *
      * @param segments Segments of a stream, keyed by the largest key in their key range.
      *                 i.e. If there are two segments split evenly, the first should have a value of 0.5 and the second 1.0.
-     * @param delegationToken Delegation token to access the segments in the segmentstore
      */
-    public StreamSegments(NavigableMap<Double, SegmentWithRange> segments, String delegationToken) {
-        this.segments = Collections.unmodifiableNavigableMap(segments);
-        this.delegationToken = delegationToken;
-        verifySegments();
+    public StreamSegments(NavigableMap<Double, SegmentWithRange> segments) {
+        super(segments);
     }
 
-    private void verifySegments() {
-        if (!segments.isEmpty()) {
-            Preconditions.checkArgument(segments.firstKey() > 0.0, "Nonsense value for segment.");
-            Preconditions.checkArgument(segments.lastKey() >= 1.0, "Last segment missing.");
-            Preconditions.checkArgument(segments.lastKey() < 1.00001, "Segments should only go up to 1.0");
-        }
-    }
-    
-    public Segment getSegmentForKey(String key) {
-        return getSegmentForKey(HASHER.hashToRange(key));
+    @Override
+    protected double hashToRange(String key) {
+        return HASHER.hashToRange(key);
     }
 
-    public Segment getSegmentForKey(double key) {
-        Preconditions.checkArgument(key >= 0.0);
-        Preconditions.checkArgument(key <= 1.0);
-        return segments.ceilingEntry(key).getValue().getSegment();
+    public int getNumberOfSegments() {
+        return segments.size();
     }
 
-    public Collection<Segment> getSegments() {
-        ArrayList<Segment> result = new ArrayList<>(segments.size());
-        for (SegmentWithRange seg : segments.values()) {
-            result.add(seg.getSegment());
-        }
-        return result;
-    }
-    
     public StreamSegments withReplacementRange(Segment segment, StreamSegmentsWithPredecessors replacementRanges) {
         SegmentWithRange replacedSegment = findReplacedSegment(segment);
         verifyReplacementRange(replacedSegment, replacementRanges);
@@ -92,7 +63,7 @@ public class StreamSegments {
         Map<Long, List<SegmentWithRange>> replacedRanges = replacementRanges.getReplacementRanges();
         List<SegmentWithRange> replacements = replacedRanges.get(segment.getSegmentId());
         Preconditions.checkNotNull(replacements, "Empty set of replacements for: {}", segment.getSegmentId());
-        replacements.sort(Comparator.comparingDouble(SegmentWithRange::getHigh).reversed());
+        replacements.sort(Comparator.comparingDouble((SegmentWithRange s) -> s.getRange().getHigh()).reversed());
         verifyContinuous(replacements);
         for (Entry<Double, SegmentWithRange> existingEntry : segments.descendingMap().entrySet()) { // iterate from the highest key.
             final SegmentWithRange existingSegment = existingEntry.getValue();
@@ -101,8 +72,8 @@ public class StreamSegments {
                 // ensuring that newer writes to the successor(s) happen only for the replaced segment's range.
                 for (SegmentWithRange segmentWithRange : replacements) {
                     Double lowerBound = segments.lowerKey(existingEntry.getKey()); // Used to skip over items not in the clients view yet.
-                    if (lowerBound == null || segmentWithRange.getHigh() >= lowerBound) { 
-                        result.put(Math.min(segmentWithRange.getHigh(), existingEntry.getKey()), segmentWithRange);
+                    if (lowerBound == null || segmentWithRange.getRange().getHigh() >= lowerBound) { 
+                        result.put(Math.min(segmentWithRange.getRange().getHigh(), existingEntry.getKey()), segmentWithRange);
                     }
                 }
             } else {
@@ -111,12 +82,12 @@ public class StreamSegments {
             }
         }
         removeDuplicates(result);
-        return new StreamSegments(result, delegationToken);
+        return new StreamSegments(result);
     }
     
     /**
      * This combines consecutive entries in the map that refer to the same segment.
-     * This happens following a merge because the preceeding segments are replaced one at a time.
+     * This happens following a merge because the preceding segments are replaced one at a time.
      */
     private void removeDuplicates(NavigableMap<Double, SegmentWithRange> result) {
         Segment last = null;
@@ -149,11 +120,11 @@ public class StreamSegments {
         Preconditions.checkArgument(replacements != null, "Replacement segments did not contain replacements for segment being replaced");
         if (replacementRanges.size() == 1) {
             //Simple split
-            Preconditions.checkArgument(replacedSegment.getHigh() == getUpperBound(replacements));
-            Preconditions.checkArgument(replacedSegment.getLow() == getLowerBound(replacements));
+            Preconditions.checkArgument(replacedSegment.getRange().getHigh() == getUpperBound(replacements));
+            Preconditions.checkArgument(replacedSegment.getRange().getLow() == getLowerBound(replacements));
         } else {
-            Preconditions.checkArgument(replacedSegment.getHigh() <= getUpperBound(replacements));
-            Preconditions.checkArgument(replacedSegment.getLow() >= getLowerBound(replacements));
+            Preconditions.checkArgument(replacedSegment.getRange().getHigh() <= getUpperBound(replacements));
+            Preconditions.checkArgument(replacedSegment.getRange().getLow() >= getLowerBound(replacements));
         }
         for (Entry<Long, List<SegmentWithRange>> ranges : replacementRanges.entrySet()) {
             Entry<Double, SegmentWithRange> upperReplacedSegment = segments.floorEntry(getUpperBound(ranges.getValue()));
@@ -166,17 +137,17 @@ public class StreamSegments {
     }
     
     private void verifyContinuous(List<SegmentWithRange> newSegments) {
-        double previous = newSegments.get(0).getHigh();
+        double previous = newSegments.get(0).getRange().getHigh();
         for (SegmentWithRange s : newSegments) {
-            Preconditions.checkArgument(previous == s.getHigh(), "Replacement segments were not continious: {}", newSegments);
-            previous = s.getLow();
+            Preconditions.checkArgument(previous == s.getRange().getHigh(), "Replacement segments were not continious: {}", newSegments);
+            previous = s.getRange().getLow();
         }
     }
 
     private double getLowerBound(List<SegmentWithRange> values) {
         double lowerReplacementRange = 1;
         for (SegmentWithRange range : values) {
-            lowerReplacementRange = Math.min(lowerReplacementRange, range.getLow());
+            lowerReplacementRange = Math.min(lowerReplacementRange, range.getRange().getLow());
         }
         return lowerReplacementRange;
     }
@@ -184,13 +155,8 @@ public class StreamSegments {
     private double getUpperBound(List<SegmentWithRange> value) {
         double upperReplacementRange = 0;
         for (SegmentWithRange range : value) {
-            upperReplacementRange = Math.max(upperReplacementRange, range.getHigh());
+            upperReplacementRange = Math.max(upperReplacementRange, range.getRange().getHigh());
         }
         return upperReplacementRange;
-    }
-
-    @Override
-    public String toString() {
-        return "StreamSegments:" + segments.toString();
     }
 }

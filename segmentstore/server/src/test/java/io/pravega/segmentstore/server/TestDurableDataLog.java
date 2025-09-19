@@ -1,21 +1,31 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.segmentstore.server;
 
 import com.google.common.base.Preconditions;
-import io.pravega.common.util.ArrayView;
 import io.pravega.common.util.CloseableIterator;
+import io.pravega.common.util.CompositeArrayView;
+import io.pravega.segmentstore.storage.DataLogInitializationException;
 import io.pravega.segmentstore.storage.DurableDataLog;
 import io.pravega.segmentstore.storage.DurableDataLogException;
 import io.pravega.segmentstore.storage.LogAddress;
 import io.pravega.segmentstore.storage.QueueStats;
+import io.pravega.segmentstore.storage.ReadOnlyLogMetadata;
+import io.pravega.segmentstore.storage.ThrottleSourceListener;
+import io.pravega.segmentstore.storage.WriteSettings;
 import io.pravega.segmentstore.storage.mocks.InMemoryDurableDataLogFactory;
 import io.pravega.test.common.ErrorInjector;
 import java.time.Duration;
@@ -80,7 +90,7 @@ public class TestDurableDataLog implements DurableDataLog {
     }
 
     @Override
-    public CompletableFuture<LogAddress> append(ArrayView data, Duration timeout) {
+    public CompletableFuture<LogAddress> append(CompositeArrayView data, Duration timeout) {
         ErrorInjector.throwSyncExceptionIfNeeded(this.appendSyncErrorInjector);
         return ErrorInjector.throwAsyncExceptionIfNeeded(this.appendAsyncErrorInjector,
                 () -> this.wrappedLog.append(data, timeout));
@@ -105,8 +115,13 @@ public class TestDurableDataLog implements DurableDataLog {
     }
 
     @Override
-    public int getMaxAppendLength() {
-        return this.wrappedLog.getMaxAppendLength();
+    public WriteSettings getWriteSettings() {
+        return this.wrappedLog.getWriteSettings();
+    }
+
+    @Override
+    public ReadOnlyLogMetadata loadMetadata() throws DataLogInitializationException {
+        throw new DataLogInitializationException("Unsupported Operation");
     }
 
     @Override
@@ -115,8 +130,18 @@ public class TestDurableDataLog implements DurableDataLog {
     }
 
     @Override
+    public void overrideEpoch(long epoch) throws DurableDataLogException {
+        throw new DataLogInitializationException("Unsupported Operation");
+    }
+
+    @Override
     public QueueStats getQueueStatistics() {
         return this.wrappedLog.getQueueStatistics();
+    }
+
+    @Override
+    public void registerQueueStateChangeListener(ThrottleSourceListener listener) {
+        this.wrappedLog.registerQueueStateChangeListener(listener);
     }
 
     //endregion

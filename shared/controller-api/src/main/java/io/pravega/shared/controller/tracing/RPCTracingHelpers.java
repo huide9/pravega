@@ -1,14 +1,21 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.shared.controller.tracing;
 
+import com.google.common.annotations.VisibleForTesting;
 import io.grpc.CallOptions;
 import io.grpc.Channel;
 import io.grpc.ClientCall;
@@ -47,6 +54,12 @@ public final class RPCTracingHelpers {
 
     public static ServerInterceptor getServerInterceptor(RequestTracker requestTracker) {
         return new TaggingServerInterceptor(requestTracker);
+    }
+
+    @VisibleForTesting
+    static String toSanitizedString(Metadata headers) {
+        return headers == null ? "null" :
+                headers.toString().replaceAll("authorization=.*(?=,)|authorization=.*(?=\\))", "authorization=xxxxx");
     }
 
     /**
@@ -107,7 +120,7 @@ public final class RPCTracingHelpers {
                         requestTag.getRequestDescriptor());
             } else {
                 log.debug("No tags provided for call {} in headers: {}.", call.getMethodDescriptor().getFullMethodName(),
-                        headers);
+                        toSanitizedString(headers));
             }
 
             return next.startCall(new ForwardingServerCall.SimpleForwardingServerCall<ReqT, RespT>(call) {

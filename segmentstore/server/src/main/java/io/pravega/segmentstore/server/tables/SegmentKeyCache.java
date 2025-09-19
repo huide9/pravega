@@ -1,31 +1,41 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.segmentstore.server.tables;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import io.pravega.common.hash.HashHelper;
-import io.pravega.common.util.BitConverter;
+import io.pravega.common.util.ArrayView;
+import io.pravega.common.util.BufferView;
+import io.pravega.common.util.ByteArraySegment;
 import io.pravega.segmentstore.contracts.tables.TableAttributes;
 import io.pravega.segmentstore.server.CacheManager;
-import io.pravega.segmentstore.storage.Cache;
+import io.pravega.segmentstore.storage.cache.CacheStorage;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.UUID;
-import java.util.stream.Collectors;
 import javax.annotation.concurrent.GuardedBy;
 import javax.annotation.concurrent.ThreadSafe;
-import lombok.AccessLevel;
 import lombok.Getter;
 import lombok.RequiredArgsConstructor;
+import lombok.Setter;
+import lombok.extern.slf4j.Slf4j;
 import lombok.val;
 
 /**
@@ -41,21 +51,25 @@ import lombok.val;
  *
  * The cache is separated in this manner because the Tail Section is optimized to bear the brunt of all Index Modifications
  * to a Table Segment; all updates and removals will end up modifying this section directly, so it is important that it
- * provides an easily modifiable data structure. The Index Section is designed for less frequent updates but is can handle
- * a larger amount of data being cached (since it is backed by the process-wide {@link Cache}). The Tail Section, while
+ * provides an easily modifiable data structure. The Index Section is designed for less frequent updates but it can handle
+ * a larger amount of data being cached (since it is backed by the process-wide {@link CacheStorage}). The Tail Section, while
  * dynamic, is not expected to grow too large due to the Table Segment being continuously indexed in the background, which
  * causes the Last Indexed Offset to be updated frequently.
  */
 @ThreadSafe
 @RequiredArgsConstructor
+@Slf4j
 class SegmentKeyCache {
     //region Members
+    private static final int HASH_GROUP_COUNT = 1024;
     private static final HashHelper HASH = HashHelper.seededWith(SegmentKeyCache.class.getName());
     private static final int VALUE_SERIALIZATION_LENGTH = Long.BYTES; // CacheBucketOffset serializes to a Long.
 
     @Getter
     private final long segmentId;
-    private final Cache cache;
+    private final CacheStorage cacheStorage;
+    @Setter
+    private volatile boolean essentialCacheOnly;
     @GuardedBy("this")
     private long lastIndexedOffset;
     @GuardedBy("this")
@@ -72,22 +86,11 @@ class SegmentKeyCache {
     /**
      * Generates a {@link CacheManager.CacheStatus} containing the current state of the Cache for this Segment.
      *
-     * @return A new {@link CacheManager.CacheStatus} instance..
+     * @return A new {@link CacheManager.CacheStatus} instance.
      */
     synchronized CacheManager.CacheStatus getCacheStatus() {
-        int minGen = 0;
-        int maxGen = 0;
-        long size = 0;
-        for (CacheEntry e : this.cacheEntries.values()) {
-            if (e != null) {
-                int g = e.getGeneration();
-                minGen = Math.min(minGen, g);
-                maxGen = Math.max(maxGen, g);
-                size += e.getSize();
-            }
-        }
-
-        return new CacheManager.CacheStatus(size, minGen, maxGen);
+        return CacheManager.CacheStatus.fromGenerations(
+                this.cacheEntries.values().stream().filter(Objects::nonNull).map(CacheEntry::getGeneration).iterator());
     }
 
     /**
@@ -96,27 +99,22 @@ class SegmentKeyCache {
      * ({@link ContainerKeyCache}) needs to execute the actual cache eviction.
      *
      * @param oldestGeneration The oldest permissible generation.
-     * @return An {@link EvictionResult} instance containing the number of bytes evicted and the {@link Cache.Key} for
-     * each Cache Entry that needs eviction.
+     * @return A List of {@link CacheEntry} instances representing the evicted entries.
      */
-    synchronized EvictionResult evictBefore(int oldestGeneration) {
+    synchronized List<CacheEntry> evictBefore(int oldestGeneration) {
         // Remove those entries that have a generation below the oldest permissible one.
-        long sizeRemoved = 0;
-        ArrayList<Short> removedGroups = new ArrayList<>();
+        ArrayList<CacheEntry> removedEntries = new ArrayList<>();
         for (val e : this.cacheEntries.entrySet()) {
             CacheEntry entry = e.getValue();
             if (entry.getGeneration() < oldestGeneration
                     && entry.getHighestOffset() < this.lastIndexedOffset) {
-                removedGroups.add(e.getKey());
-                sizeRemoved += entry.getSize();
+                removedEntries.add(entry);
             }
         }
 
         // Clear the expired cache entries.
-        removedGroups.forEach(this.cacheEntries::remove);
-
-        // Remove from the Cache. It's ok to do this outside of the lock as the cache is thread safe.
-        return new EvictionResult(sizeRemoved, removedGroups.stream().map(CacheKey::new).collect(Collectors.toList()));
+        removedEntries.forEach(e -> this.cacheEntries.remove(e.hashGroup));
+        return removedEntries;
     }
 
     /**
@@ -124,8 +122,11 @@ class SegmentKeyCache {
      *
      * @return See {@link #evictBefore}
      */
-    EvictionResult evictAll() {
-        return evictBefore(Integer.MAX_VALUE);
+    synchronized List<CacheEntry> evictAll() {
+        // Remove those entries that have a generation below the oldest permissible one.
+        val entries = new ArrayList<>(this.cacheEntries.values());
+        this.cacheEntries.clear();
+        return entries;
     }
 
     //endregion
@@ -171,6 +172,24 @@ class SegmentKeyCache {
     }
 
     /**
+     * Updates the tail cache with the given data, which represents a pre-index result of the tail section of the Segment.
+     *
+     * @param keyOffsets A Map of KeyHashes to {@link CacheBucketOffset} instances that represents the latest values (including
+     *                   deletions) for all the pre-indexed keys).
+     * @param generation The current Cache Generation (from the Cache Manager).
+     */
+    synchronized void includeTailCache(Map<UUID, CacheBucketOffset> keyOffsets, int generation) {
+        for (val e : keyOffsets.entrySet()) {
+            CacheBucketOffset offset = e.getValue();
+            CacheBucketOffset existingOffset = get(e.getKey(), generation);
+            if (existingOffset == null || offset.getSegmentOffset() > existingOffset.getSegmentOffset()) {
+                // We have no previous entry, or we do and the current offset is higher, so it prevails.
+                this.tailOffsets.put(e.getKey(), offset);
+            }
+        }
+    }
+
+    /**
      * Updates the contents of a Cache Entry associated with the given Segment Id and KeyHash. This method cannot be
      * used to remove values.
      *
@@ -190,7 +209,7 @@ class SegmentKeyCache {
         synchronized (this) {
             CacheBucketOffset tailOffset = this.tailOffsets.get(keyHash);
             if (tailOffset != null && tailOffset.getSegmentOffset() >= segmentOffset) {
-                // There already exists an higher offset for this Key Hash. No need to do more.
+                // There already exists a higher offset for this Key Hash. No need to do more.
                 return tailOffset.getSegmentOffset();
             }
 
@@ -198,8 +217,19 @@ class SegmentKeyCache {
         }
 
         // Update the cache entry directly.
-        entry.update(keyHash, segmentOffset, generation);
+        if (!entry.update(keyHash, segmentOffset, generation)) {
+            evictEntry(entry);
+
+        }
         return segmentOffset;
+    }
+
+    private void evictEntry(CacheEntry entry) {
+        synchronized (this) {
+            this.cacheEntries.remove(entry.hashGroup);
+        }
+
+        entry.evict(); // This need not be invoked while holding the lock (it has its own synchronization).
     }
 
     /**
@@ -257,11 +287,19 @@ class SegmentKeyCache {
             }
         }
 
-        candidates.forEach(mc -> mc.cacheEntry.update(mc.keyHash, mc.offset.encode(), cacheGeneration));
+        candidates.forEach(mc -> commitMigrationCandidate(mc, cacheGeneration));
         synchronized (this) {
             // Finally, remove tail hashes, but ONLY if they haven't changed - it's possible that since we released the lock
             // above a newer value was recorded; we shouldn't be removing it then. We use Map.remove(Key, Value) for this.
             candidates.forEach(c -> this.tailOffsets.remove(c.keyHash, c.offset));
+        }
+    }
+
+    private void commitMigrationCandidate(MigrationCandidate mc, int cacheGeneration) {
+        if (!mc.commit(cacheGeneration)) {
+            // If we were unable to commit a migration candidate, we should evict it. It likely is in an inconsistent state.
+            // This is safe to do since any data in this entry can be reloaded from the index.
+            evictEntry(mc.cacheEntry);
         }
     }
 
@@ -286,6 +324,16 @@ class SegmentKeyCache {
         return new HashMap<>(this.tailOffsets);
     }
 
+    /**
+     * Gets a number representing the expected change in number of entries to the index once all the tail cache entries
+     * are included in it.
+     *
+     * @return The tail entry update count delta.
+     */
+    synchronized int getTailEntryCountDelta() {
+        return this.tailOffsets.values().stream().mapToInt(o -> o.isRemoval() ? -1 : 1).sum();
+    }
+
     @Override
     public synchronized String toString() {
         return String.format("LIO = %s, Entries = %s, Backpointers = %s, BucketOffsets = %s.",
@@ -293,7 +341,7 @@ class SegmentKeyCache {
     }
 
     private short getHashGroup(UUID keyHash) {
-        return (short) HASH.hashToBucket(keyHash, Short.MAX_VALUE);
+        return (short) HASH.hashToBucket(keyHash, HASH_GROUP_COUNT);
     }
 
     //endregion
@@ -301,26 +349,11 @@ class SegmentKeyCache {
     //region Helper Classes
 
     /**
-     * Represents a result from a call to {@link #evictBefore} or {@link #evictAll}.
-     */
-    @RequiredArgsConstructor(access = AccessLevel.PRIVATE)
-    @Getter
-    static class EvictionResult {
-        /**
-         * The number of bytes evicted.
-         */
-        private final long size;
-        /**
-         * A list of {@link CacheKey} instances denoting Cache Entries have been unregistered and need to be evicted.
-         */
-        private final List<CacheKey> keys;
-    }
-
-    /**
      * Represents a candidate for Migration from the Tail Cache to the Index Cache.
      */
     @RequiredArgsConstructor
-    private static class MigrationCandidate {
+    @VisibleForTesting
+    static class MigrationCandidate {
         /**
          * Key Hash to migrate.
          */
@@ -333,50 +366,26 @@ class SegmentKeyCache {
          * Offset in Segment.
          */
         final CacheBucketOffset offset;
+
+        /**
+         * Commits this {@link MigrationCandidate} into the base {@link CacheEntry}.
+         *
+         * @param cacheGeneration The current Cache Generation.
+         * @return True if the commit was a success; false otherwise (if the cache entry has been evicted in the meantime).
+         */
+        boolean commit(int cacheGeneration) {
+            try {
+                return this.cacheEntry.update(this.keyHash, this.offset.encode(), cacheGeneration);
+            } catch (CacheEntryEvictedException ex) {
+                // Nothing to do here. A concurrent eviction has removed this entry so there isn't much more we can do.
+                return false;
+            }
+        }
     }
 
     //endregion
 
-    //region CacheKey and CacheEntry
-
-    /**
-     * A key to access data in the Cache. A CacheKey is uniquely identified by a {SegmentId, KeyHashGroup} pair. Since
-     * KeyHashes are too large to use as in-memory references for long, they are re-hashed into KeyHashGroups which are
-     * simpler to manage.
-     */
-    @RequiredArgsConstructor(access = AccessLevel.PRIVATE)
-    class CacheKey extends Cache.Key {
-        private static final int SERIALIZATION_LENGTH = Long.BYTES + Short.BYTES;
-        private final short keyHashGroup;
-
-        @Override
-        public byte[] serialize() {
-            byte[] result = new byte[SERIALIZATION_LENGTH];
-            BitConverter.writeLong(result, 0, SegmentKeyCache.this.segmentId);
-            BitConverter.writeShort(result, Long.BYTES, this.keyHashGroup);
-            return result;
-        }
-
-        @Override
-        public int hashCode() {
-            return this.keyHashGroup; // KeyHashGroup is already a hash.
-        }
-
-        @Override
-        public boolean equals(Object obj) {
-            if (!(obj instanceof SegmentKeyCache.CacheKey)) {
-                return false;
-            }
-
-            SegmentKeyCache.CacheKey other = (SegmentKeyCache.CacheKey) obj;
-            return this.keyHashGroup == other.keyHashGroup
-                    && this.getSegmentId() == other.getSegmentId();
-        }
-
-        private long getSegmentId() {
-            return segmentId;
-        }
-    }
+    //region CacheEntry
 
     /**
      * An entry in the Cache to which one or more CacheValues are mapped.
@@ -384,44 +393,37 @@ class SegmentKeyCache {
      * Each CacheEntry will contain a collection of {KeyHash, CacheValue} pairs, with the property that all KeyHashes in
      * a CacheEntry will have the same KeyHashGroup.
      */
-    private class CacheEntry {
+    class CacheEntry {
         private static final int HEADER_LENGTH = Integer.BYTES;
         private static final int HASH_LENGTH = KeyHasher.HASH_SIZE_BYTES;
         private static final int ENTRY_LENGTH = HEADER_LENGTH + HASH_LENGTH + VALUE_SERIALIZATION_LENGTH;
+        private static final int INITIAL_ADDRESS = -1;
+        private static final int EVICTED_ADDRESS = -2;
         private final short hashGroup;
+        private volatile int generation;
+        private volatile long highestOffset;
         @GuardedBy("this")
-        private int generation;
-        @GuardedBy("this")
-        private int size;
-        @GuardedBy("this")
-        private long highestOffset;
+        private int cacheAddress;
 
-        CacheEntry(short hashGroup, int currentGeneration) {
+        private CacheEntry(short hashGroup, int currentGeneration) {
             this.hashGroup = hashGroup;
             this.generation = currentGeneration;
-            this.size = 0;
             this.highestOffset = 0;
+            this.cacheAddress = INITIAL_ADDRESS;
         }
 
         /**
          * Gets a value representing the current Generation of this Cache Entry. This value is updated every time the
          * data behind this entry is modified or accessed.
          */
-        synchronized int getGeneration() {
+        int getGeneration() {
             return this.generation;
-        }
-
-        /**
-         * Gets a value representing the size, in bytes, of the data behind this Cache Entry.
-         */
-        synchronized int getSize() {
-            return this.size;
         }
 
         /**
          * Gets a value representing the Highest offset that is stored in any CacheValues in this CacheEntry.
          */
-        synchronized long getHighestOffset() {
+        long getHighestOffset() {
             return this.highestOffset;
         }
 
@@ -434,16 +436,13 @@ class SegmentKeyCache {
          * @return See {@link ContainerKeyCache#get} return doc.
          */
         Long get(UUID keyHash, int currentGeneration) {
-            byte[] data = SegmentKeyCache.this.cache.get(new CacheKey(this.hashGroup));
+            ArrayView data = getFromCache();
             int offset = locate(keyHash, data);
             if (offset >= 0) {
                 // Found it.
-                synchronized (this) {
-                    // Update Entry's generation.
-                    this.generation = currentGeneration;
-                }
-
-                return deserializeCacheValue(data, offset);
+                // Update Entry's generation.
+                this.generation = currentGeneration;
+                return data.getLong(offset);
             }
 
             // Nothing found.
@@ -458,39 +457,100 @@ class SegmentKeyCache {
          * @param segmentOffset     See {@link ContainerKeyCache#includeExistingKey} segmentOffset.
          * @param currentGeneration The current Cache Generation (from the Cache Manager).
          */
-        synchronized void update(UUID keyHash, long segmentOffset, int currentGeneration) {
-            CacheKey key = new CacheKey(this.hashGroup);
-            byte[] entryData = SegmentKeyCache.this.cache.get(key);
+        synchronized boolean update(UUID keyHash, long segmentOffset, int currentGeneration) {
+            ArrayView entryData = getFromCache();
             int entryOffset = locate(keyHash, entryData);
             if (entryOffset < 0) {
                 // No match. Need to create a new array, copy any existing data and add new Cache Value.
                 if (entryData == null) {
-                    entryData = new byte[ENTRY_LENGTH];
+                    entryData = new ByteArraySegment(new byte[ENTRY_LENGTH]);
                     entryOffset = HEADER_LENGTH;
                 } else {
-                    byte[] newData;
-                    newData = new byte[entryData.length + HASH_LENGTH + VALUE_SERIALIZATION_LENGTH];
-                    System.arraycopy(entryData, 0, newData, 0, entryData.length);
-                    entryOffset = entryData.length;
+                    ByteArraySegment newData = new ByteArraySegment(new byte[entryData.getLength() + HASH_LENGTH + VALUE_SERIALIZATION_LENGTH]);
+                    newData.copyFrom(entryData, 0, entryData.getLength());
+                    entryOffset = entryData.getLength();
                     entryData = newData;
                 }
 
                 // Increment the count.
-                int count = BitConverter.readInt(entryData, 0);
-                BitConverter.writeInt(entryData, 0, count + 1);
+                entryData.setInt(0, entryData.getInt(0) + 1);
 
                 // Write the Key Hash at the latest offset.
-                entryOffset += serializeHash(entryData, entryOffset, keyHash);
+                serializeHash(entryData, entryOffset, keyHash);
+                entryOffset += HASH_LENGTH;
             }
 
             // Update the value.
-            serializeCacheValue(segmentOffset, entryData, entryOffset);
+            entryData.setLong(entryOffset, segmentOffset);
 
             // Update the cache and stats.
-            SegmentKeyCache.this.cache.insert(key, entryData);
-            this.size = entryData.length;
-            this.generation = currentGeneration;
-            this.highestOffset = Math.max(this.highestOffset, segmentOffset);
+            try {
+                storeInCache(entryData);
+                this.generation = currentGeneration;
+                this.highestOffset = Math.max(this.highestOffset, segmentOffset);
+            } catch (CacheEntryEvictedException cex) {
+                // Pass-through exception. If this is the case, the entry has already been evicted so not more we can do.
+                throw cex;
+            } catch (CacheDisabledException cex) {
+                log.debug("SegmentKeyCache[{}]: Not updating cache for {} due to non-essential cache entries disabled.", segmentId, this);
+                return false;
+            } catch (Throwable ex) {
+                // There is nothing we can do here. Invoke the general handler to remove this from the cache.
+                log.warn("SegmentKeyCache[{}]: Cache Entry update failed for {}.", segmentId, this, ex);
+                return false;
+            }
+
+            return true;
+        }
+
+        /**
+         * Removes the contents of this entry from the cache, if anything was stored there in the first place. Invoking
+         * this method will cause {@link #storeInCache} to throw an {@link IllegalStateException} going forward.
+         *
+         * @return True if there was anything evicted, false otherwise.
+         */
+        synchronized boolean evict() {
+            int address = this.cacheAddress;
+            this.cacheAddress = EVICTED_ADDRESS;
+            if (address >= 0) {
+                SegmentKeyCache.this.cacheStorage.delete(address);
+                return true;
+            }
+
+            return false;
+        }
+
+        private synchronized ArrayView getFromCache() {
+            BufferView data = null;
+            if (this.cacheAddress >= 0) {
+                data = SegmentKeyCache.this.cacheStorage.get(this.cacheAddress);
+            }
+            return data == null ? null : new ByteArraySegment(data.getCopy());
+        }
+
+        @GuardedBy("this")
+        private void storeInCache(ArrayView data) {
+            if (this.cacheAddress == EVICTED_ADDRESS) {
+                throw new CacheEntryEvictedException();
+            }
+
+            if (SegmentKeyCache.this.essentialCacheOnly) {
+                // All our entries are considered "non-essential" (they can all be regenerated from persisted data).
+                // If we shouldn't insert these, and if we need to update an existing one, we need to remove it so that
+                // we don't serve stale data to upstream code.
+                if (this.cacheAddress >= 0) {
+                    SegmentKeyCache.this.cacheStorage.delete(this.cacheAddress);
+                    this.cacheAddress = EVICTED_ADDRESS;
+                }
+
+                throw new CacheDisabledException(); // This is handled upstream.
+            }
+
+            if (this.cacheAddress >= 0) {
+                this.cacheAddress = SegmentKeyCache.this.cacheStorage.replace(this.cacheAddress, data);
+            } else {
+                this.cacheAddress = SegmentKeyCache.this.cacheStorage.insert(data);
+            }
         }
 
         /**
@@ -500,22 +560,15 @@ class SegmentKeyCache {
          * @param data    The array to look into.
          * @return The offset of the CacheValue associated with the KeyHash, or -1 if not found.
          */
-        private int locate(UUID keyHash, byte[] data) {
-            if (data != null && data.length > 0) {
-                int count = BitConverter.readInt(data, 0);
+        private int locate(UUID keyHash, ArrayView data) {
+            if (data != null && data.getLength() > 0) {
+                final int count = data.getInt(0);
                 int offset = Integer.BYTES;
-                byte[] keyHashArray = new byte[HASH_LENGTH];
-                serializeHash(keyHashArray, 0, keyHash);
+
                 for (int i = 0; i < count; i++) {
                     // Check if the sought key matches the key at this index.
-                    boolean match = true;
-                    for (int j = 0; j < HASH_LENGTH; j++) {
-                        if (keyHashArray[j] != data[offset + j]) {
-                            match = false;
-                            break;
-                        }
-                    }
-
+                    boolean match = keyHash.getMostSignificantBits() == data.getLong(offset)
+                            && keyHash.getLeastSignificantBits() == data.getLong(offset + Long.BYTES);
                     if (match) {
                         return offset + HASH_LENGTH; // We return the offset of the value, not the key.
                     }
@@ -528,18 +581,26 @@ class SegmentKeyCache {
             return -1;
         }
 
-        private long deserializeCacheValue(byte[] input, int inputOffset) {
-            return BitConverter.readLong(input, inputOffset);
+        private void serializeHash(ArrayView target, int targetOffset, UUID hash) {
+            target.setLong(targetOffset, hash.getMostSignificantBits());
+            target.setLong(targetOffset + Long.BYTES, hash.getLeastSignificantBits());
         }
 
-        private void serializeCacheValue(long value, byte[] target, int targetOffset) {
-            BitConverter.writeLong(target, targetOffset, value);
+        @Override
+        public String toString() {
+            return String.format("Key = %s", this.hashGroup);
         }
+    }
 
-        private int serializeHash(byte[] target, int targetOffset, UUID hash) {
-            BitConverter.writeLong(target, targetOffset, hash.getMostSignificantBits());
-            BitConverter.writeLong(target, targetOffset + Long.BYTES, hash.getLeastSignificantBits());
-            return 2 * Long.BYTES;
+    private static class CacheEntryEvictedException extends IllegalStateException {
+        CacheEntryEvictedException() {
+            super("CacheEntry evicted.");
+        }
+    }
+
+    private static class CacheDisabledException extends IllegalStateException {
+        CacheDisabledException() {
+            super("Cache disabled for non-essential data.");
         }
     }
 

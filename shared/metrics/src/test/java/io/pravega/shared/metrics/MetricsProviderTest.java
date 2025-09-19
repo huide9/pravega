@@ -1,20 +1,29 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.shared.metrics;
 
 import io.pravega.common.Timer;
+import io.pravega.test.common.SerializedClassRunner;
 import java.util.concurrent.atomic.AtomicInteger;
 import lombok.extern.slf4j.Slf4j;
+import org.junit.After;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
+import org.junit.runner.RunWith;
 
 import static org.junit.Assert.assertEquals;
 
@@ -22,6 +31,7 @@ import static org.junit.Assert.assertEquals;
  * Test for Stats provider.
  */
 @Slf4j
+@RunWith(SerializedClassRunner.class)
 public class MetricsProviderTest {
 
     private final StatsLogger statsLogger = MetricsProvider.createStatsLogger("testStatsLogger");
@@ -33,6 +43,11 @@ public class MetricsProviderTest {
                                                 .with(MetricsConfig.ENABLE_STATISTICS, true)
                                                 .build());
         MetricsProvider.getMetricsProvider().startWithoutExporting();
+    }
+
+    @After
+    public void tearDown() {
+        MetricsProvider.getMetricsProvider().close();
     }
 
     /**
@@ -104,6 +119,9 @@ public class MetricsProviderTest {
             dynamicLogger.incCounterValue("dynamicCounterNoTag", i);
             assertEquals(sum, (int) MetricRegistryUtils.getCounter("dynamicCounterNoTag").count());
         }
+
+        dynamicLogger.updateCounterValue("dynamicCounterNoTag", 100);
+        assertEquals(100, (int) MetricRegistryUtils.getCounter("dynamicCounterNoTag").count());
         dynamicLogger.freezeCounter("dynamicCounterNoTag");
         assertEquals(null, MetricRegistryUtils.getCounter("dynamicCounterNoTag"));
 
@@ -116,6 +134,9 @@ public class MetricsProviderTest {
             assertEquals(2 * sum, (int) MetricRegistryUtils.getCounter("dynamicCounter", "hostname", "1.1.1.1").count());
             assertEquals(3 * sum, (int) MetricRegistryUtils.getCounter("dynamicCounter", "hostname", "2.2.2.2").count());
         }
+        dynamicLogger.updateCounterValue("dynamicCounter", 200, "hostname", "1.1.1.1");
+        assertEquals(200, (int) MetricRegistryUtils.getCounter("dynamicCounter", "hostname", "1.1.1.1").count());
+
         dynamicLogger.freezeCounter("dynamicCounter", "hostname", "1.1.1.1");
         dynamicLogger.freezeCounter("dynamicCounter", "hostname", "2.2.2.2");
 
@@ -166,6 +187,10 @@ public class MetricsProviderTest {
             assertEquals(3 * sum, (long) MetricRegistryUtils.getMeter("dynamicMeter", "container", "2").totalAmount());
         }
 
+        dynamicLogger.freezeMeter("dynamicMeter", "container", "1");
+        dynamicLogger.freezeMeter("dynamicMeter", "container", "2");
+        assertEquals(null, MetricRegistryUtils.getMeter("dynamicMeter", "container", "1"));
+        assertEquals(null, MetricRegistryUtils.getMeter("dynamicMeter", "container", "2"));
     }
 
     /**

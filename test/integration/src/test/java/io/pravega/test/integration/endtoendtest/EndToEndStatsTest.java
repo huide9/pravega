@@ -1,12 +1,12 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries.
- * <p>
+ * Copyright Pravega Authors.
+ *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
- * <p>
- * http://www.apache.org/licenses/LICENSE-2.0
- * <p>
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -18,26 +18,30 @@ package io.pravega.test.integration.endtoendtest;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.Meter;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
-import io.pravega.client.ClientFactory;
+import io.pravega.client.ClientConfig;
+import io.pravega.client.EventStreamClientFactory;
 import io.pravega.client.stream.EventStreamWriter;
 import io.pravega.client.stream.EventWriterConfig;
 import io.pravega.client.stream.ScalingPolicy;
 import io.pravega.client.stream.StreamConfiguration;
 import io.pravega.client.stream.Transaction;
+import io.pravega.client.stream.TransactionalEventStreamWriter;
 import io.pravega.client.stream.impl.ClientFactoryImpl;
-import io.pravega.client.stream.impl.Controller;
+import io.pravega.client.control.impl.Controller;
 import io.pravega.client.stream.impl.JavaSerializer;
 import io.pravega.segmentstore.contracts.StreamSegmentStore;
 import io.pravega.segmentstore.contracts.tables.TableStore;
+import io.pravega.segmentstore.server.host.handler.IndexAppendProcessor;
 import io.pravega.segmentstore.server.host.handler.PravegaConnectionListener;
 import io.pravega.segmentstore.server.host.stat.SegmentStatsRecorder;
 import io.pravega.segmentstore.server.host.stat.TableSegmentStatsRecorder;
 import io.pravega.segmentstore.server.store.ServiceBuilder;
 import io.pravega.segmentstore.server.store.ServiceBuilderConfig;
-import io.pravega.shared.segment.StreamSegmentNameUtils;
+import io.pravega.shared.NameUtils;
+import io.pravega.test.common.SecurityConfigDefaults;
 import io.pravega.test.common.TestUtils;
 import io.pravega.test.common.TestingServerStarter;
-import io.pravega.test.integration.demo.ControllerWrapper;
+import io.pravega.test.integration.utils.ControllerWrapper;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -79,8 +83,10 @@ public class EndToEndStatsTest {
 
         statsRecorder = new TestStatsRecorder();
 
-        server = new PravegaConnectionListener(false, "localhost", servicePort, store, tableStore,
-                statsRecorder, TableSegmentStatsRecorder.noOp(), null, null, null, true);
+        server = new PravegaConnectionListener(false, false, "localhost", servicePort, store, tableStore,
+                statsRecorder, TableSegmentStatsRecorder.noOp(), null, null, null, true,
+                serviceBuilder.getLowPriorityExecutor(), SecurityConfigDefaults.TLS_PROTOCOL_VERSION,
+                new IndexAppendProcessor(serviceBuilder.getLowPriorityExecutor(), store));
         server.startListening();
 
         controllerWrapper = new ControllerWrapper(zkTestServer.getConnectString(),
@@ -107,24 +113,28 @@ public class EndToEndStatsTest {
                 .scalingPolicy(ScalingPolicy.fixed(1))
                 .build();
         Controller controller = controllerWrapper.getController();
-        controllerWrapper.getControllerService().createScope("test").get();
+        controllerWrapper.getControllerService().createScope("test", 0L).get();
         controller.createStream("test", "test", config).get();
         @Cleanup
-        ClientFactory clientFactory = new ClientFactoryImpl("test", controller);
+        EventStreamClientFactory clientFactory = new ClientFactoryImpl("test", controller, ClientConfig.builder().build());
 
+        EventWriterConfig writerConfig = EventWriterConfig.builder().transactionTimeoutTime(10000).build();
         @Cleanup
-        EventStreamWriter<String> test = clientFactory.createEventWriter("test", new JavaSerializer<>(),
-                EventWriterConfig.builder().transactionTimeoutTime(10000).build());
+        EventStreamWriter<String> eventWriter = clientFactory.createEventWriter("test", new JavaSerializer<>(),
+                writerConfig);
+        @Cleanup
+        TransactionalEventStreamWriter<String> txnWriter = clientFactory.createTransactionalEventWriter("test", new JavaSerializer<>(),
+                writerConfig);
 
-        String[] tags = segmentTags(StreamSegmentNameUtils.getQualifiedStreamSegmentName("test", "test", 0L));
+        String[] tags = segmentTags(NameUtils.getQualifiedStreamSegmentName("test", "test", 0L));
 
         for (int i = 0; i < 10; i++) {
-            test.writeEvent("test").get();
+            eventWriter.writeEvent("test").get();
         }
         assertEventuallyEquals(10, () -> (int) (statsRecorder.getRegistry().counter(SEGMENT_WRITE_EVENTS, tags).count()), 2000);
         assertEventuallyEquals(190, () -> (int) (statsRecorder.getRegistry().counter(SEGMENT_WRITE_BYTES, tags).count()), 100);
 
-        Transaction<String> transaction = test.beginTxn();
+        Transaction<String> transaction = txnWriter.beginTxn();
         for (int i = 0; i < 10; i++) {
             transaction.writeEvent("0", "txntest1");
         }
@@ -168,7 +178,7 @@ public class EndToEndStatsTest {
 
         @Override
         public void recordAppend(String streamSegmentName, long dataLength, int numOfEvents, Duration elapsed) {
-            if (!StreamSegmentNameUtils.isTransactionSegment(streamSegmentName)) {
+            if (!NameUtils.isTransactionSegment(streamSegmentName)) {
                 Counter eventCounter = registry.counter(SEGMENT_WRITE_EVENTS, segmentTags(streamSegmentName));
                 Counter byteCounter = registry.counter(SEGMENT_WRITE_BYTES, segmentTags(streamSegmentName));
                 references.add(eventCounter);

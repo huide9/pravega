@@ -1,29 +1,43 @@
 /**
- * Copyright (c) 2019 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.shared;
 
 import com.google.common.base.Preconditions;
-
+import com.google.common.base.Strings;
 import java.net.InetAddress;
 import java.net.UnknownHostException;
 
 public final class MetricsTags {
+
+    //The default key to lookup hostname system property or env var.
+    public static final String DEFAULT_HOSTNAME_KEY = "HOSTNAME";
 
     // Metric Tag Names
     public static final String TAG_CONTAINER = "container";
     public static final String TAG_HOST = "host";
     public static final String TAG_SCOPE = "scope";
     public static final String TAG_STREAM = "stream";
+    public static final String TAG_READER_GROUP = "readergroup";
     public static final String TAG_SEGMENT = "segment";
     public static final String TAG_TRANSACTION = "transaction";
     public static final String TAG_EPOCH = "epoch";
+    public static final String TAG_CLASS = "class";
+    public static final String TAG_EXCEPTION = "exception";
+    public static final String TAG_THROTTLER = "throttler";
+    public static final String TAG_EVENT_PROCESSOR = "eventprocessor";
 
     private static final String TRANSACTION_DELIMITER = "#transaction.";
     private static final String EPOCH_DELIMITER = ".#epoch.";
@@ -50,6 +64,16 @@ public final class MetricsTags {
     }
 
     /**
+     * Generate a throttler tag (string array) on the input throttler to be associated with a metric.
+     * @param containerId container id.
+     * @param throttler throttler name.
+     * @return string array as the throttler tag of metric.
+     */
+    public static String[] throttlerTag(int containerId, String throttler) {
+        return new String[] {TAG_CONTAINER, String.valueOf(containerId), TAG_THROTTLER, throttler};
+    }
+
+    /**
      * Generate a host tag (string array) on the input hostname to be associated with a metric.
      * @param hostname hostname of the metric.
      * @return string array as the host tag of metric.
@@ -69,14 +93,24 @@ public final class MetricsTags {
     }
 
     /**
-     * Generate transaction tags (string array) on the input scope, stream and transactionId to be associated with a metric.
+     * Generate reader group tags (string array) on the input scope and reader group name to be associated with a metric.
      * @param scope scope of the stream.
-     * @param stream stream name.
-     * @param transactionId transaction id.
-     * @return string array as transaction tag of metric.
+     * @param rgName Reader Group name.
+     * @return string array as the reader group tag of metric.
      */
-    public static String[] transactionTags(String scope, String stream, String transactionId) {
-        return new String[] {TAG_SCOPE, scope, TAG_STREAM, stream, TAG_TRANSACTION, transactionId};
+    public static String[] readerGroupTags(String scope, String rgName) {
+        return new String[] {TAG_SCOPE, scope, TAG_READER_GROUP, rgName};
+    }
+
+    /**
+     * Generate EventProcessor tags (String array) given the event processor name and container id.
+     *
+     * @param containerId         Container id for this EventProcessor.
+     * @param eventProcessorName  Name of the EventProcessor.
+     * @return                    String array with the EventProcessor tags.
+     */
+    public static String[] eventProcessorTag(int containerId, String eventProcessorName) {
+        return new String[] {TAG_CONTAINER, String.valueOf(containerId), TAG_EVENT_PROCESSOR, eventProcessorName};
     }
 
     /**
@@ -97,7 +131,7 @@ public final class MetricsTags {
         }
 
         String segmentBaseName = getSegmentBaseName(qualifiedSegmentName);
-        String[] tokens = segmentBaseName.split("[/]");
+        String[] tokens = segmentBaseName.split("/");
         int segmentIdIndex = tokens.length == 2 ? 1 : 2;
         if (tokens[segmentIdIndex].contains(EPOCH_DELIMITER)) {
             String[] segmentIdTokens = tokens[segmentIdIndex].split(EPOCH_DELIMITER);
@@ -134,16 +168,65 @@ public final class MetricsTags {
     }
 
     /**
-     * Create host tag based on the local host.
+     * Returns the Segment tag directly using the Segment name passed as input.
+     *
+     * @param segmentName Name of the Segment to generate Segment tags for.
+     * @return Segment tags directly using input Segment name.
+     */
+    public static String[] segmentTagDirect(String segmentName) {
+        return new String[] {TAG_SEGMENT, String.valueOf(segmentName)};
+    }
+
+    /**
+     * Create host tag based on the system property, env var or local host config.
+     * @param hostnameKey the lookup key for hostname system property or env var.
      * @return host tag.
      */
-    public static String[] createHostTag() {
+    public static String[] createHostTag(String hostnameKey) {
         String[] hostTag = {MetricsTags.TAG_HOST, null};
+
+        //Always take system property if it's defined.
+        hostTag[1] = System.getProperty(hostnameKey);
+        if (!Strings.isNullOrEmpty(hostTag[1])) {
+            return hostTag;
+        }
+
+        //Then take env variable if it's defined.
+        hostTag[1] = System.getenv(hostnameKey);
+        if (!Strings.isNullOrEmpty(hostTag[1])) {
+            return hostTag;
+        }
+
+        //Finally use the resolved hostname based on localhost config.
         try {
             hostTag[1] = InetAddress.getLocalHost().getHostName();
         } catch (UnknownHostException e) {
             hostTag[1] = "unknown";
         }
         return hostTag;
+    }
+
+    /**
+     * Generate an Exception tag (string array) on the input class name.
+     *
+     * @param loggingClassName   The name of the class that recorded the exception.
+     * @param exceptionClassName The name of the exception class that was recorded. May be null.
+     * @return A String array containing the necessary tags.
+     */
+    public static String[] exceptionTag(String loggingClassName, String exceptionClassName) {
+        String[] result = new String[]{TAG_CLASS, getSimpleClassName(loggingClassName), TAG_EXCEPTION, "none"};
+        if (exceptionClassName != null) {
+            result[3] = getSimpleClassName(exceptionClassName);
+        }
+        return result;
+    }
+
+    private static String getSimpleClassName(String name) {
+        int lastSeparator = name.lastIndexOf(".");
+        if (lastSeparator < 0 || lastSeparator >= name.length() - 1) {
+            return name;
+        } else {
+            return name.substring(lastSeparator + 1);
+        }
     }
 }

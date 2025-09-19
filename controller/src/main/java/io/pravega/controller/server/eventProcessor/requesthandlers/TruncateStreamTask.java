@@ -1,23 +1,32 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.controller.server.eventProcessor.requesthandlers;
 
 import com.google.common.base.Preconditions;
+import io.pravega.common.Timer;
 import io.pravega.common.concurrent.Futures;
 import io.pravega.common.tracing.TagLogger;
+import io.pravega.controller.metrics.StreamMetrics;
 import io.pravega.controller.store.stream.OperationContext;
 import io.pravega.controller.store.stream.StreamMetadataStore;
-import io.pravega.controller.store.stream.VersionedMetadata;
+import io.pravega.controller.store.VersionedMetadata;
 import io.pravega.controller.store.stream.State;
 import io.pravega.controller.store.stream.records.StreamTruncationRecord;
 import io.pravega.controller.task.Stream.StreamMetadataTasks;
+import io.pravega.shared.NameUtils;
 import io.pravega.shared.controller.event.TruncateStreamEvent;
 import io.pravega.shared.metrics.DynamicLogger;
 import io.pravega.shared.metrics.MetricsProvider;
@@ -56,26 +65,40 @@ public class TruncateStreamTask implements StreamTask<TruncateStreamEvent> {
 
     @Override
     public CompletableFuture<Void> execute(final TruncateStreamEvent request) {
-        final OperationContext context = streamMetadataStore.createContext(request.getScope(), request.getStream());
 
+        Timer timer = new Timer();
         String scope = request.getScope();
         String stream = request.getStream();
         long requestId = request.getRequestId();
+        final OperationContext context = streamMetadataStore.createStreamContext(scope, stream, requestId);
 
         return streamMetadataStore.getVersionedState(scope, stream, context, executor)
-                .thenCompose(versionedState -> streamMetadataStore.getTruncationRecord(scope, stream, context, executor)
-                        .thenCompose(versionedMetadata -> {
-                            if (!versionedMetadata.getObject().isUpdating()) {
-                                if (versionedState.getObject().equals(State.TRUNCATING)) {
-                                    return Futures.toVoid(streamMetadataStore.updateVersionedState(scope, stream, State.ACTIVE,
-                                            versionedState, context, executor));
+                .thenCompose(versionedState -> {
+                    if (versionedState.getObject().equals(State.SEALED)) {
+                        // truncation should not be allowed since the stream is in SEALED state
+                        // hence, we need to complete the truncation by updating the metadata
+                        // and then throw an exception
+                        return streamMetadataStore.getTruncationRecord(scope, stream, context, executor)
+                                .thenCompose(versionedMetadata -> streamMetadataStore.completeTruncation(scope, stream, versionedMetadata, context, executor)
+                                        .thenAccept(v -> {
+                                            throw new UnsupportedOperationException("Cannot truncate a sealed stream: " + NameUtils.getScopedStreamName(scope, stream));
+                                        }));
+                    }
+                    return streamMetadataStore.getTruncationRecord(scope, stream, context, executor)
+                            .thenCompose(versionedMetadata -> {
+                                if (!versionedMetadata.getObject().isUpdating()) {
+                                    if (versionedState.getObject().equals(State.TRUNCATING)) {
+                                        return Futures.toVoid(streamMetadataStore.updateVersionedState(scope, stream, State.ACTIVE,
+                                                versionedState, context, executor));
+                                    } else {
+                                        return CompletableFuture.completedFuture(null);
+                                    }
                                 } else {
-                                    throw new TaskExceptions.StartException("Truncate Stream not started yet.");
+                                    return processTruncate(scope, stream, versionedMetadata, versionedState, context, requestId)
+                                            .thenAccept(v -> StreamMetrics.getInstance().controllerEventProcessorTruncateStreamEvent(timer.getElapsed()));
                                 }
-                            } else {
-                                return processTruncate(scope, stream, versionedMetadata, versionedState, context, requestId);
-                            }
-                        }));
+                            });
+                });
     }
 
     private CompletableFuture<Void> processTruncate(String scope, String stream, VersionedMetadata<StreamTruncationRecord> versionedTruncationRecord,

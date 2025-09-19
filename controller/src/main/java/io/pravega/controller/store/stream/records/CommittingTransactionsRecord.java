@@ -1,11 +1,17 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.controller.store.stream.records;
 
@@ -26,7 +32,6 @@ import java.io.IOException;
 import java.util.Optional;
 import java.util.UUID;
 
-@Data
 /**
  * This class is the metadata to capture the currently processing transaction commit work. This captures the list of
  * transactions that current round of processing will attempt to commit. If the processing fails and retries, it will
@@ -34,9 +39,14 @@ import java.util.UUID;
  * This also includes optional "active epoch" field which is set if the commits have to be rolled over because they are
  * over an older epoch.
  */
+@Data
 public class CommittingTransactionsRecord {
     public static final CommitTransactionsRecordSerializer SERIALIZER = new CommitTransactionsRecordSerializer();
-    public static final CommittingTransactionsRecord EMPTY = CommittingTransactionsRecord.builder().epoch(Integer.MIN_VALUE).transactionsToCommit(ImmutableList.of()).activeEpoch(Optional.empty()).build();
+    public static final CommittingTransactionsRecord EMPTY = CommittingTransactionsRecord.builder()
+                                                                                         .epoch(Integer.MIN_VALUE)
+                                                                                         .transactionsToCommit(ImmutableList.of())
+                                                                                         .activeEpoch(Optional.empty())
+                                                                                         .build();
     /**
      * Epoch from which transactions are committed.
      */
@@ -81,6 +91,16 @@ public class CommittingTransactionsRecord {
         return SERIALIZER.serialize(this).getCopy();
     }
 
+    @Override
+    public String toString() {
+        String record = String.format("%s = %s", "epoch", epoch) + "\n" +
+                String.format("%s = %s", "transactionsToCommit", transactionsToCommit) + "\n";
+        if (activeEpoch.isPresent()) {
+            record = record + String.format("%s = %s", "activeEpoch", activeEpoch.get());
+        }
+        return record;
+    }
+
     public CommittingTransactionsRecord createRollingTxnRecord(int activeEpoch) {
         Preconditions.checkState(!this.activeEpoch.isPresent());
         return new CommittingTransactionsRecord(this.epoch, this.transactionsToCommit, activeEpoch);
@@ -89,12 +109,12 @@ public class CommittingTransactionsRecord {
     public boolean isRollingTxnRecord() {
         return activeEpoch.isPresent();
     }
-    
+
     public int getCurrentEpoch() {
         Preconditions.checkState(activeEpoch.isPresent());
         return activeEpoch.get();
     }
-    
+
     public int getNewTxnEpoch() {
         Preconditions.checkState(activeEpoch.isPresent());
         return activeEpoch.get() + 1;
@@ -104,7 +124,7 @@ public class CommittingTransactionsRecord {
         Preconditions.checkState(activeEpoch.isPresent());
         return activeEpoch.get() + 2;
     }
-    
+
     private static class CommitTransactionsRecordSerializer
             extends VersionedSerializer.WithBuilder<CommittingTransactionsRecord, CommittingTransactionsRecordBuilder> {
         @Override
@@ -119,7 +139,7 @@ public class CommittingTransactionsRecord {
 
         private void read00(RevisionDataInput revisionDataInput, CommittingTransactionsRecordBuilder builder)
                 throws IOException {
-            ImmutableList.Builder<UUID> listBuilder = ImmutableList.builder(); 
+            ImmutableList.Builder<UUID> listBuilder = ImmutableList.builder();
             builder.epoch(revisionDataInput.readInt());
 
             revisionDataInput.readCollection(RevisionDataInput::readUUID, listBuilder);

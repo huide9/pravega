@@ -1,25 +1,30 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.common.util;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
-import lombok.Data;
-
-import javax.annotation.concurrent.GuardedBy;
+import io.pravega.common.concurrent.FutureSupplier;
 import java.util.ArrayDeque;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
-import java.util.function.Supplier;
+import javax.annotation.concurrent.GuardedBy;
+import lombok.Data;
 
 /**
  * Resource pool class implements functionality for creating and maintaining a pool of reusable resources. 
@@ -53,15 +58,15 @@ public class ResourcePool<T> {
     private final int maxIdle;
 
     private final Listener listener;
-    private final Supplier<CompletableFuture<T>> tSupplier;
+    private final FutureSupplier<T> tSupplier;
     private final Consumer<T> tDestroyer;
 
-    public ResourcePool(Supplier<CompletableFuture<T>> tSupplier, Consumer<T> tDestroyer, int maxConcurrent, int maxIdle) {
+    public ResourcePool(FutureSupplier<T> tSupplier, Consumer<T> tDestroyer, int maxConcurrent, int maxIdle) {
         this(tSupplier, tDestroyer, maxConcurrent, maxIdle, null);
     }
 
     @VisibleForTesting
-    ResourcePool(Supplier<CompletableFuture<T>> tSupplier, Consumer<T> tDestroyer,
+    ResourcePool(FutureSupplier<T> tSupplier, Consumer<T> tDestroyer,
                  int maxConcurrent, int maxIdle, Listener listener) {
         Preconditions.checkNotNull(tSupplier);
         Preconditions.checkNotNull(tDestroyer);
@@ -171,7 +176,7 @@ public class ResourcePool<T> {
 
         if (waiting != null) {
             try {
-                tSupplier.get().whenComplete((t, e) -> {
+                tSupplier.getFuture().whenComplete((t, e) -> {
                     if (e != null) {
                         waiting.future.completeExceptionally(e);
                     } else {

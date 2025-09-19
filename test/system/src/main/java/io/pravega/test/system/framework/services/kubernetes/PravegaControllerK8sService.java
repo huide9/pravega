@@ -1,17 +1,24 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.test.system.framework.services.kubernetes;
 
 import com.google.common.collect.ImmutableMap;
 import io.pravega.common.concurrent.Futures;
 import io.pravega.test.system.framework.TestFrameworkException;
+import io.pravega.test.system.framework.Utils;
 import lombok.extern.slf4j.Slf4j;
 
 import java.net.URI;
@@ -32,16 +39,15 @@ public class PravegaControllerK8sService extends AbstractService {
         super(id);
         this.zkUri = zkUri;
         this.properties = properties;
-
     }
 
     @Override
     public void start(boolean wait) {
-        Futures.getAndHandleExceptions(deployPravegaUsingOperator(zkUri, DEFAULT_CONTROLLER_COUNT, DEFAULT_SEGMENTSTORE_COUNT, DEFAULT_BOOKIE_COUNT, properties),
-                                       t -> new TestFrameworkException(RequestFailed, "Failed to deploy pravega operator/pravega services", t));
+        Futures.getAndHandleExceptions(deployPravegaOnlyCluster(zkUri, DEFAULT_CONTROLLER_COUNT, DEFAULT_SEGMENTSTORE_COUNT, properties),
+                t -> new TestFrameworkException(RequestFailed, "Failed to deploy pravega operator/pravega services", t));
         if (wait) {
             Futures.getAndHandleExceptions(k8sClient.waitUntilPodIsRunning(NAMESPACE, "component", PRAVEGA_CONTROLLER_LABEL, DEFAULT_CONTROLLER_COUNT),
-                                           t -> new TestFrameworkException(RequestFailed, "Failed to deploy pravega-controller service, check the operator logs", t));
+                    t -> new TestFrameworkException(RequestFailed, "Failed to deploy pravega-controller service, check the operator logs", t));
         }
     }
 
@@ -76,12 +82,17 @@ public class PravegaControllerK8sService extends AbstractService {
     @Override
     public List<URI> getServiceDetails() {
         //fetch the URI.
-        return Futures.getAndHandleExceptions(k8sClient.getStatusOfPodWithLabel(NAMESPACE, "component", PRAVEGA_CONTROLLER_LABEL)
-                                                       .thenApply(statuses -> statuses.stream()
-                                                                                     .flatMap(s -> Stream.of(URI.create(TCP + s.getPodIP() + ":" + CONTROLLER_GRPC_PORT),
-                                                                                                             URI.create(TCP + s.getPodIP() + ":" + CONTROLLER_REST_PORT)))
-                                                                                     .collect(Collectors.toList())),
+        String prefix = Utils.TLS_AND_AUTH_ENABLED ? TLS : TCP;
+        String tlsCname = Utils.getTlsCommonName();
+        log.debug("Tls enabled status :{} auth enabled status :{} tls cname :{}", Utils.TLS_AND_AUTH_ENABLED, Utils.AUTH_ENABLED, tlsCname);
+
+        List<URI> uriList = Futures.getAndHandleExceptions(k8sClient.getStatusOfPodWithLabel(NAMESPACE, "component", PRAVEGA_CONTROLLER_LABEL)
+                       .thenApply(statuses -> statuses.stream()
+                  .flatMap(s -> Stream.of(URI.create(prefix + ((Utils.TLS_AND_AUTH_ENABLED) ? tlsCname : s.getPodIP()) + ":" + CONTROLLER_GRPC_PORT),
+                                          URI.create(prefix + ((Utils.TLS_AND_AUTH_ENABLED) ? tlsCname : s.getPodIP()) + ":" + CONTROLLER_REST_PORT)))
+                     .collect(Collectors.toList())),
                                               t -> new TestFrameworkException(RequestFailed, "Failed to fetch ServiceDetails for pravega-controller", t));
+        return uriList;
     }
 
     @Override
@@ -92,15 +103,15 @@ public class PravegaControllerK8sService extends AbstractService {
                         .thenCompose(o -> {
                            Map<String, Object> spec = (Map<String, Object>) (((Map<String, Object>) o).get("spec"));
                            Map<String, Object> pravegaSpec = (Map<String, Object>) spec.get("pravega");
-                           Map<String, Object> bookkeeperSpec = (Map<String, Object>) spec.get("bookkeeper");
 
                            int currentControllerCount = ((Double) pravegaSpec.get("controllerReplicas")).intValue();
                            int currentSegmentStoreCount = ((Double) pravegaSpec.get("segmentStoreReplicas")).intValue();
-                           int currentBookkeeperCount = ((Double) bookkeeperSpec.get("replicas")).intValue();
-                           log.debug("Current instance counts : Bookkeeper {} Controller {} SegmentStore {}.", currentBookkeeperCount,
+                           log.info("Current instance counts : Controller {} SegmentStore {}.",
                                      currentControllerCount, currentSegmentStoreCount);
                            if (currentControllerCount != newInstanceCount) {
-                               return deployPravegaUsingOperator(zkUri, newInstanceCount, currentSegmentStoreCount, currentBookkeeperCount, properties)
+                               final Map<String, Object> patchedSpec = buildPatchedPravegaClusterSpec("controllerReplicas", newInstanceCount, "pravega");
+
+                               return k8sClient.createAndUpdateCustomObject(CUSTOM_RESOURCE_GROUP_PRAVEGA, CUSTOM_RESOURCE_VERSION_PRAVEGA, NAMESPACE, CUSTOM_RESOURCE_PLURAL_PRAVEGA, patchedSpec)
                                        .thenCompose(v -> k8sClient.waitUntilPodIsRunning(NAMESPACE, "component", PRAVEGA_CONTROLLER_LABEL, newInstanceCount));
                            } else {
                                return CompletableFuture.completedFuture(null);

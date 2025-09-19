@@ -1,11 +1,17 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.storage.hdfs;
 
@@ -23,16 +29,23 @@ import lombok.extern.slf4j.Slf4j;
 public class HDFSStorageConfig {
     //region Config Names
 
-    public static final Property<String> URL = Property.named("hdfsUrl", "localhost:9000");
-    public static final Property<String> ROOT = Property.named("hdfsRoot", "");
-    public static final Property<Integer> REPLICATION = Property.named("replication", 3);
-    public static final Property<Integer> BLOCK_SIZE = Property.named("blockSize", 1024 * 1024);
-    public static final Property<Boolean> REPLACE_DATANODES_ON_FAILURE = Property.named("replaceDataNodesOnFailure", true);
+    public static final Property<String> URL = Property.named("connect.uri", "localhost:9000", "hdfsUrl");
+    public static final Property<String> ROOT = Property.named("root", "", "hdfsRoot");
+    public static final Property<String> IMPLEMENTATION = Property.named("fs.impl", org.apache.hadoop.hdfs.DistributedFileSystem.class.getName(), "hdfsImpl");
+    public static final Property<Integer> REPLICATION = Property.named("replication.factor", 3, "replication");
+    public static final Property<Integer> BLOCK_SIZE = Property.named("block.size", 1024 * 1024, "blockSize");
+    public static final Property<Boolean> REPLACE_DATANODES_ON_FAILURE = Property.named("replaceDataNodesOnFailure.enable", true, "replaceDataNodesOnFailure");
     private static final String COMPONENT_CODE = "hdfs";
 
     //endregion
 
     //region Members
+
+    /**
+     * The HDFS implementation to be utilized.
+     */
+    @Getter
+    private final String hdfsImpl;
 
     /**
      * HDFS host URL. This is generally in host:port format
@@ -77,6 +90,7 @@ public class HDFSStorageConfig {
      * @param properties The TypedProperties object to read Properties from.
      */
     private HDFSStorageConfig(TypedProperties properties) throws ConfigurationException {
+        this.hdfsImpl = properties.get(IMPLEMENTATION);
         this.hdfsHostURL = properties.get(URL);
         this.hdfsRoot = properties.get(ROOT);
         this.replication = (short) properties.getInt(REPLICATION);

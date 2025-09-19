@@ -1,11 +1,17 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.controller.server;
 
@@ -13,8 +19,6 @@ import com.google.common.annotations.VisibleForTesting;
 import io.pravega.controller.server.eventProcessor.ControllerEventProcessorConfig;
 import io.pravega.controller.server.eventProcessor.impl.ControllerEventProcessorConfigImpl;
 import io.pravega.controller.server.impl.ControllerServiceConfigImpl;
-import io.pravega.controller.server.rest.RESTServerConfig;
-import io.pravega.controller.server.rest.impl.RESTServerConfigImpl;
 import io.pravega.controller.server.rpc.grpc.GRPCServerConfig;
 import io.pravega.controller.store.client.StoreClientConfig;
 import io.pravega.controller.store.client.ZKClientConfig;
@@ -26,12 +30,12 @@ import io.pravega.controller.timeout.TimeoutServiceConfig;
 import io.pravega.controller.util.Config;
 import io.pravega.shared.metrics.MetricsProvider;
 import io.pravega.shared.metrics.StatsProvider;
-
+import io.pravega.shared.rest.impl.RESTServerConfigImpl;
+import io.pravega.shared.rest.RESTServerConfig;
 import java.lang.management.ManagementFactory;
 import java.lang.management.MemoryMXBean;
 import java.util.Optional;
 import java.util.function.BiConsumer;
-
 import lombok.extern.slf4j.Slf4j;
 
 /**
@@ -87,6 +91,7 @@ public class Main {
                     .host(Config.REST_SERVER_IP)
                     .port(Config.REST_SERVER_PORT)
                     .tlsEnabled(Config.TLS_ENABLED)
+                    .tlsProtocolVersion(Config.TLS_PROTOCOL_VERSION.toArray(new String[Config.TLS_PROTOCOL_VERSION.size()]))
                     .keyFilePath(Config.REST_KEYSTORE_FILE_PATH)
                     .keyFilePasswordPath(Config.REST_KEYSTORE_PASSWORD_FILE_PATH)
                     .build();
@@ -100,6 +105,8 @@ public class Main {
                     .eventProcessorConfig(Optional.of(eventProcessorConfig))
                     .grpcServerConfig(Optional.of(grpcServerConfig))
                     .restServerConfig(Optional.of(restServerConfig))
+                    .tlsEnabledForSegmentStore(Config.TLS_ENABLED_FOR_SEGMENT_STORE)
+                    .minBucketRedistributionIntervalInSeconds(Config.MIN_BUCKET_REDISTRIBUTION_INTERVAL_IN_SECONDS)
                     .build();
 
             setUncaughtExceptionHandler(Main::logUncaughtException);
@@ -136,9 +143,14 @@ public class Main {
     @VisibleForTesting
     static void onShutdown(ControllerServiceMain controllerServiceMain) {
         MemoryMXBean memoryMXBean = ManagementFactory.getMemoryMXBean();
+        boolean previousVerbose = memoryMXBean.isVerbose();
         memoryMXBean.setVerbose(true);
-        log.info("Shutdown hook memory usage dump: Heap memory usage: {}, non heap memory usage {}", memoryMXBean.getHeapMemoryUsage(),
-                memoryMXBean.getNonHeapMemoryUsage());
+        try {
+            log.info("Shutdown hook memory usage dump: Heap memory usage: {}, non heap memory usage {}", memoryMXBean.getHeapMemoryUsage(),
+                    memoryMXBean.getNonHeapMemoryUsage());
+        } finally {
+            memoryMXBean.setVerbose(previousVerbose);
+        }
 
         log.info("Controller service shutting down");
         try {

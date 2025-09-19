@@ -1,26 +1,41 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.segmentstore.server.logs;
 
+import com.google.common.collect.ImmutableMap;
 import io.pravega.common.util.ByteArraySegment;
+import io.pravega.segmentstore.contracts.AttributeId;
 import io.pravega.segmentstore.contracts.AttributeUpdate;
+import io.pravega.segmentstore.contracts.AttributeUpdateCollection;
+import io.pravega.segmentstore.contracts.ContainerException;
+import io.pravega.segmentstore.contracts.DynamicAttributeUpdate;
 import io.pravega.segmentstore.contracts.AttributeUpdateType;
 import io.pravega.segmentstore.contracts.Attributes;
 import io.pravega.segmentstore.contracts.BadAttributeUpdateException;
 import io.pravega.segmentstore.contracts.BadOffsetException;
+import io.pravega.segmentstore.contracts.DynamicAttributeValue;
+import io.pravega.segmentstore.contracts.SegmentType;
+import io.pravega.segmentstore.contracts.StreamSegmentException;
 import io.pravega.segmentstore.contracts.StreamSegmentInformation;
 import io.pravega.segmentstore.contracts.StreamSegmentMergedException;
 import io.pravega.segmentstore.contracts.StreamSegmentNotExistsException;
 import io.pravega.segmentstore.contracts.StreamSegmentNotSealedException;
 import io.pravega.segmentstore.contracts.StreamSegmentSealedException;
 import io.pravega.segmentstore.contracts.TooManyActiveSegmentsException;
+import io.pravega.segmentstore.contracts.tables.TableAttributes;
 import io.pravega.segmentstore.server.ContainerMetadata;
 import io.pravega.segmentstore.server.ManualTimer;
 import io.pravega.segmentstore.server.MetadataBuilder;
@@ -28,6 +43,7 @@ import io.pravega.segmentstore.server.SegmentMetadata;
 import io.pravega.segmentstore.server.SegmentMetadataComparer;
 import io.pravega.segmentstore.server.UpdateableContainerMetadata;
 import io.pravega.segmentstore.server.UpdateableSegmentMetadata;
+import io.pravega.segmentstore.server.containers.StreamSegmentContainerMetadata;
 import io.pravega.segmentstore.server.containers.StreamSegmentMetadata;
 import io.pravega.segmentstore.server.logs.operations.CheckpointOperationBase;
 import io.pravega.segmentstore.server.logs.operations.DeleteSegmentOperation;
@@ -42,18 +58,23 @@ import io.pravega.segmentstore.server.logs.operations.StreamSegmentSealOperation
 import io.pravega.segmentstore.server.logs.operations.StreamSegmentTruncateOperation;
 import io.pravega.segmentstore.server.logs.operations.UpdateAttributesOperation;
 import io.pravega.test.common.AssertExtensions;
+import io.pravega.test.common.TestUtils;
+
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
-import java.util.UUID;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BiFunction;
+import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
+
 import lombok.val;
 import org.junit.Assert;
 import org.junit.Before;
@@ -67,6 +88,9 @@ import org.junit.rules.Timeout;
 public class ContainerMetadataUpdateTransactionTests {
     private static final int CONTAINER_ID = 1234567;
     private static final String SEGMENT_NAME = "Segment_123";
+    private static final String TRANSIENT_SEGMENT_NAME = "scope/stream/transient#transient.00000000000000000000000000000000";
+    private static final long TRANSIENT_SEGMENT_ID = 456;
+    private static final int TRANSIENT_ATTRIBUTE_REMAINING = 2;
     private static final long SEGMENT_ID = 123;
     private static final String SEALED_SOURCE_NAME = "Segment_123#Source_Sealed";
     private static final long SEALED_SOURCE_ID = 567;
@@ -74,10 +98,11 @@ public class ContainerMetadataUpdateTransactionTests {
     private static final long NOTSEALED_SOURCE_ID = 890;
     private static final long SEALED_SOURCE_LENGTH = 12;
     private static final long SEGMENT_LENGTH = 1234567;
-    private static final byte[] DEFAULT_APPEND_DATA = "hello".getBytes();
+    private static final ByteArraySegment DEFAULT_APPEND_DATA = new ByteArraySegment("hello".getBytes());
     private static final AttributeUpdateType[] ATTRIBUTE_UPDATE_TYPES = new AttributeUpdateType[]{
             AttributeUpdateType.Replace, AttributeUpdateType.Accumulate};
     private static final Supplier<Long> NEXT_ATTRIBUTE_VALUE = System::nanoTime;
+    private static final SegmentType DEFAULT_TYPE = SegmentType.STREAM_SEGMENT;
     @Rule
     public Timeout globalTimeout = Timeout.seconds(30);
     private ManualTimer timeProvider;
@@ -188,7 +213,7 @@ public class ContainerMetadataUpdateTransactionTests {
         txn.preProcessOperation(appendOp);
         txn.acceptOperation(appendOp);
         Assert.assertEquals("acceptOperation did not update the transaction.",
-                SEGMENT_LENGTH + appendOp.getData().length, txn.getStreamSegmentMetadata(SEGMENT_ID).getLength());
+                SEGMENT_LENGTH + appendOp.getData().getLength(), txn.getStreamSegmentMetadata(SEGMENT_ID).getLength());
         Assert.assertEquals("acceptOperation updated the metadata.",
                 SEGMENT_LENGTH, metadata.getStreamSegmentMetadata(SEGMENT_ID).getLength());
     }
@@ -235,6 +260,14 @@ public class ContainerMetadataUpdateTransactionTests {
                 "preProcessOperations accepted an append with the wrong offset.",
                 () -> txn.preProcessOperation(badAppendOp),
                 ex -> ex instanceof BadOffsetException);
+
+        // Append #4 (wrong offset + wrong attribute). AS PER SEGMENT STORE CONTRACT, BadAttributeUpdateException takes precedence.
+        badAppendOp.getAttributeUpdates().add(new AttributeUpdate(AttributeId.randomUUID(), AttributeUpdateType.ReplaceIfEquals, 1, 1234));
+        AssertExtensions.assertThrows(
+                "preProcessOperations failed with wrong exception when append has both bad offset and bad attribute.",
+                () -> txn.preProcessOperation(badAppendOp),
+                ex -> ex instanceof BadAttributeUpdateException);
+
         AssertExtensions.assertThrows(
                 "acceptOperation accepted an append that was rejected during preProcessing.",
                 () -> txn.acceptOperation(badAppendOp),
@@ -247,6 +280,7 @@ public class ContainerMetadataUpdateTransactionTests {
     @Test
     public void testStreamSegmentAppendWithAttributes() throws Exception {
         testWithAttributes(attributeUpdates -> new StreamSegmentAppendOperation(SEGMENT_ID, DEFAULT_APPEND_DATA, attributeUpdates));
+        testWithAttributesByReference(attributeUpdates -> new StreamSegmentAppendOperation(SEGMENT_ID, DEFAULT_APPEND_DATA, attributeUpdates));
     }
 
     /**
@@ -254,7 +288,16 @@ public class ContainerMetadataUpdateTransactionTests {
      */
     @Test
     public void testStreamSegmentAppendWithBadAttributes() throws Exception {
-        testWithBadAttributes(attributeUpdates -> new StreamSegmentAppendOperation(SEGMENT_ID, DEFAULT_APPEND_DATA, attributeUpdates));
+        Consumer<Operation> checkAfterSuccess = op -> {
+            val a = (StreamSegmentAppendOperation) op;
+            Assert.assertEquals("Expected SegmentOffset to have been updated.", SEGMENT_LENGTH, a.getStreamSegmentOffset());
+        };
+        Consumer<Operation> checkAfterRejection = op -> {
+            val a = (StreamSegmentAppendOperation) op;
+            AssertExtensions.assertLessThan("Not expected SegmentOffset to have been updated.", 0, a.getStreamSegmentOffset());
+        };
+        testWithBadAttributes(attributeUpdates -> new StreamSegmentAppendOperation(SEGMENT_ID, DEFAULT_APPEND_DATA, attributeUpdates),
+                checkAfterSuccess, checkAfterRejection);
     }
 
     //endregion
@@ -267,6 +310,7 @@ public class ContainerMetadataUpdateTransactionTests {
     @Test
     public void testUpdateAttributes() throws Exception {
         testWithAttributes(attributeUpdates -> new UpdateAttributesOperation(SEGMENT_ID, attributeUpdates));
+        testWithAttributesByReference(attributeUpdates -> new UpdateAttributesOperation(SEGMENT_ID, attributeUpdates));
     }
 
     /**
@@ -277,24 +321,150 @@ public class ContainerMetadataUpdateTransactionTests {
         testWithBadAttributes(attributeUpdates -> new UpdateAttributesOperation(SEGMENT_ID, attributeUpdates));
     }
 
-    private void testWithAttributes(Function<Collection<AttributeUpdate>, Operation> createOperation) throws Exception {
-        final UUID attributeNoUpdate = UUID.randomUUID();
-        final UUID attributeAccumulate = UUID.randomUUID();
-        final UUID attributeReplace = UUID.randomUUID();
-        final UUID attributeReplaceIfGreater = UUID.randomUUID();
-        final UUID attributeReplaceIfEquals = UUID.randomUUID();
+    /**
+     * Tests the ability of the ContainerMetadataUpdateTransaction to reject UpdateAttributeOperations that attempt to
+     * modify immutable Attributes
+     */
+    @Test
+    public void testUpdateAttributesImmutable() {
+        final AttributeId immutableAttribute = Attributes.ATTRIBUTE_SEGMENT_TYPE;
+        Assert.assertTrue(Attributes.isUnmodifiable(immutableAttribute));
+
+        UpdateableContainerMetadata metadata = createMetadata();
+        val txn = createUpdateTransaction(metadata);
+        val coreUpdate = new UpdateAttributesOperation(SEGMENT_ID,
+                AttributeUpdateCollection.from(new AttributeUpdate(immutableAttribute, AttributeUpdateType.Replace, 1L)));
+        AssertExtensions.assertThrows(
+                "Immutable attribute update succeeded.",
+                () -> txn.preProcessOperation(coreUpdate),
+                ex -> ex instanceof MetadataUpdateException);
+    }
+
+    /**
+     * Tests the ability of the ContainerMetadataUpdateTransaction to handle UpdateAttributeOperations after the segment
+     * has been sealed.
+     */
+    @Test
+    public void testUpdateAttributesSealedSegment() throws Exception {
+        final AttributeId coreAttribute = Attributes.ATTRIBUTE_SEGMENT_ROOT_POINTER;
+        final AttributeId extAttribute = AttributeId.randomUUID();
+
+        UpdateableContainerMetadata metadata = createMetadata();
+        val txn = createUpdateTransaction(metadata);
+
+        // Seal the segment.
+        val sealOp = createSeal();
+        txn.preProcessOperation(sealOp);
+        txn.acceptOperation(sealOp);
+
+        // 1. Core attribute, but not internal.
+        val coreUpdate = new UpdateAttributesOperation(SEGMENT_ID,
+                AttributeUpdateCollection.from(new AttributeUpdate(coreAttribute, AttributeUpdateType.Replace, 1L)));
+        AssertExtensions.assertThrows(
+                "Non-internal update of core attribute succeeded.",
+                () -> txn.preProcessOperation(coreUpdate),
+                ex -> ex instanceof StreamSegmentSealedException);
+
+        // 2. Core attribute, internal update.
+        coreUpdate.setInternal(true);
+        txn.preProcessOperation(coreUpdate);
+        txn.acceptOperation(coreUpdate);
+        Assert.assertEquals("Core attribute was not updated.",
+                1L, (long) txn.getStreamSegmentMetadata(SEGMENT_ID).getAttributes().get(coreAttribute));
+
+        // 3. Extended attributes.
+        val extUpdate1 = new UpdateAttributesOperation(SEGMENT_ID,
+                AttributeUpdateCollection.from(new AttributeUpdate(extAttribute, AttributeUpdateType.Replace, 1L)));
+        extUpdate1.setInternal(true);
+        AssertExtensions.assertThrows(
+                "Extended attribute update succeeded.",
+                () -> txn.preProcessOperation(extUpdate1),
+                ex -> ex instanceof StreamSegmentSealedException);
+
+        val extUpdate2 = new UpdateAttributesOperation(SEGMENT_ID, AttributeUpdateCollection.from(
+                new AttributeUpdate(coreAttribute, AttributeUpdateType.Replace, 2L),
+                new AttributeUpdate(extAttribute, AttributeUpdateType.Replace, 3L)));
+        extUpdate1.setInternal(true);
+        AssertExtensions.assertThrows(
+                "Mixed attribute update succeeded.",
+                () -> txn.preProcessOperation(extUpdate2),
+                ex -> ex instanceof StreamSegmentSealedException);
+    }
+
+    /**
+     * Tests the ability to validate the type and lengths of Attribute Ids coming in via appends or update attributes,
+     * in accordance with the Segment's declared attribute id length.
+     */
+    @Test
+    public void testAttributeIdLengthValidation() throws Exception {
+        final AttributeId coreAttribute = Attributes.ATTRIBUTE_SEGMENT_ROOT_POINTER;
+        final AttributeId extAttributeUUID = AttributeId.randomUUID();
+        final AttributeId extAttributeShort1 = AttributeId.random(AttributeId.UUID.ATTRIBUTE_ID_LENGTH);
+        final AttributeId extAttributeShort2 = AttributeId.random(AttributeId.UUID.ATTRIBUTE_ID_LENGTH);
+        final AttributeId extAttributeLong1 = AttributeId.random(AttributeId.Variable.MAX_LENGTH);
+
+        Function<AttributeId, UpdateAttributesOperation> createOp = id -> new UpdateAttributesOperation(SEGMENT_ID,
+                AttributeUpdateCollection.from(new AttributeUpdate(id, AttributeUpdateType.Replace, 1L)));
+
+        val metadata = createMetadata();
+        val sm = metadata.getStreamSegmentMetadata(SEGMENT_ID);
+
+        // 1. All UUIDs
+        val txn1 = createUpdateTransaction(metadata);
+        txn1.preProcessOperation(createOp.apply(coreAttribute)); // Core attributes must always be allowed.
+        txn1.preProcessOperation(createOp.apply(extAttributeUUID)); // Extended UUID attribute should be allowed in this case.
+        AssertExtensions.assertThrows(
+                "Variable-Length accepted when no length declared",
+                () -> txn1.preProcessOperation(createOp.apply(extAttributeShort1)),
+                ex -> ex instanceof AttributeIdLengthMismatchException);
+
+        // 2. Declare UUID, try Variable length.
+        sm.updateAttributes(Collections.singletonMap(Attributes.ATTRIBUTE_ID_LENGTH, 0L));
+        sm.refreshDerivedProperties();
+        val txn2 = createUpdateTransaction(metadata);
+        txn2.preProcessOperation(createOp.apply(coreAttribute)); // Core attributes must always be allowed.
+        txn2.preProcessOperation(createOp.apply(extAttributeUUID)); // Extended UUID attribute should be allowed in this case.
+        AssertExtensions.assertThrows(
+                "Variable-Length accepted when length declared to be 0 (UUID).",
+                () -> txn2.preProcessOperation(createOp.apply(extAttributeShort1)),
+                ex -> ex instanceof AttributeIdLengthMismatchException);
+
+        // 3. Variable Lengths declared
+        sm.updateAttributes(Collections.singletonMap(Attributes.ATTRIBUTE_ID_LENGTH, (long) extAttributeShort1.byteCount()));
+        sm.refreshDerivedProperties();
+        val txn3 = createUpdateTransaction(metadata);
+        txn3.preProcessOperation(createOp.apply(coreAttribute)); // Core attributes must always be allowed.
+        txn3.preProcessOperation(createOp.apply(extAttributeShort1));
+        txn3.preProcessOperation(createOp.apply(extAttributeShort2));
+        AssertExtensions.assertThrows(
+                "UUID accepted when length declared to be Variable.",
+                () -> txn3.preProcessOperation(createOp.apply(extAttributeUUID)),
+                ex -> ex instanceof AttributeIdLengthMismatchException);
+        AssertExtensions.assertThrows(
+                "Wrong-length accepted when length declared to be Variable.",
+                () -> txn3.preProcessOperation(createOp.apply(extAttributeLong1)),
+                ex -> ex instanceof AttributeIdLengthMismatchException);
+    }
+
+    private void testWithAttributes(Function<AttributeUpdateCollection, Operation> createOperation) throws Exception {
+        final AttributeId attributeNoUpdate = AttributeId.randomUUID();
+        final AttributeId attributeAccumulate = AttributeId.randomUUID();
+        final AttributeId attributeReplace = AttributeId.randomUUID();
+        final AttributeId attributeReplaceIfGreater = AttributeId.randomUUID();
+        final AttributeId attributeReplaceIfEquals = AttributeId.randomUUID();
 
         UpdateableContainerMetadata metadata = createMetadata();
         val txn = createUpdateTransaction(metadata);
 
         // Update #1.
-        Collection<AttributeUpdate> attributeUpdates = new ArrayList<>();
+        AttributeUpdateCollection attributeUpdates = new AttributeUpdateCollection();
         attributeUpdates.add(new AttributeUpdate(attributeNoUpdate, AttributeUpdateType.None, 1)); // Initial add, so it's ok.
         attributeUpdates.add(new AttributeUpdate(attributeAccumulate, AttributeUpdateType.Accumulate, 1));
         attributeUpdates.add(new AttributeUpdate(attributeReplace, AttributeUpdateType.Replace, 1));
         attributeUpdates.add(new AttributeUpdate(attributeReplaceIfGreater, AttributeUpdateType.ReplaceIfGreater, 1));
         attributeUpdates.add(new AttributeUpdate(attributeReplaceIfEquals, AttributeUpdateType.Replace, 1)); // Need to initialize to something.
         val expectedValues = attributeUpdates.stream().collect(Collectors.toMap(AttributeUpdate::getAttributeId, AttributeUpdate::getValue));
+        expectedValues.put(Attributes.ATTRIBUTE_SEGMENT_TYPE, DEFAULT_TYPE.getValue());
 
         Operation op = createOperation.apply(attributeUpdates);
         txn.preProcessOperation(op);
@@ -324,7 +494,7 @@ public class ContainerMetadataUpdateTransactionTests {
         verifyAttributeUpdates("after acceptOperation (2)", txn, attributeUpdates, expectedValues);
 
         // Update #3: after commit, verify that attributes are committed when they need to.
-        val previousAcceptedValues = new HashMap<UUID, Long>(expectedValues);
+        val previousAcceptedValues = new HashMap<>(expectedValues);
         txn.commit(metadata);
         attributeUpdates.clear();
         attributeUpdates.add(new AttributeUpdate(attributeAccumulate, AttributeUpdateType.Accumulate, 1)); // 2 + 1 = 3
@@ -350,24 +520,69 @@ public class ContainerMetadataUpdateTransactionTests {
                 expectedValues, metadata.getStreamSegmentMetadata(SEGMENT_ID));
     }
 
-    private void testWithBadAttributes(Function<Collection<AttributeUpdate>, Operation> createOperation) throws Exception {
-        final UUID attributeNoUpdate = UUID.randomUUID();
-        final UUID attributeReplaceIfGreater = UUID.randomUUID();
-        final UUID attributeReplaceIfEquals = UUID.randomUUID();
-        final UUID attributeReplaceIfEqualsNullValue = UUID.randomUUID();
+    private void testWithAttributesByReference(Function<AttributeUpdateCollection, Operation> createOperation) throws Exception {
+        final AttributeId referenceAttributeId = AttributeId.randomUUID();
+        final AttributeId attributeSegmentLength = AttributeId.randomUUID();
+        final long initialAttributeValue = 1234567;
+
+        UpdateableContainerMetadata metadata = createMetadata();
+        metadata.getStreamSegmentMetadata(SEGMENT_ID)
+                .updateAttributes(ImmutableMap.of(referenceAttributeId, initialAttributeValue));
+
+        val txn = createUpdateTransaction(metadata);
+
+        // Update #1.
+        AttributeUpdateCollection attributeUpdates = AttributeUpdateCollection.from(
+                new AttributeUpdate(referenceAttributeId, AttributeUpdateType.Accumulate, 2),
+                new DynamicAttributeUpdate(attributeSegmentLength, AttributeUpdateType.None, DynamicAttributeValue.segmentLength(5)));
+
+        Map<AttributeId, Long> expectedValues = ImmutableMap.of(
+                Attributes.ATTRIBUTE_SEGMENT_TYPE, DEFAULT_TYPE.getValue(),
+                referenceAttributeId, initialAttributeValue + 2,
+                attributeSegmentLength, SEGMENT_LENGTH + 5);
+
+        Operation op = createOperation.apply(attributeUpdates);
+        txn.preProcessOperation(op);
+        txn.acceptOperation(op);
+
+        // Verify result.
+        verifyAttributeUpdates("after acceptOperation", txn, attributeUpdates, expectedValues);
+        txn.commit(metadata);
+        SegmentMetadataComparer.assertSameAttributes("Unexpected attributes in segment metadata after final commit.",
+                expectedValues, metadata.getStreamSegmentMetadata(SEGMENT_ID));
+    }
+
+    private void testWithBadAttributes(Function<AttributeUpdateCollection, Operation> createOperation) throws Exception {
+        testWithBadAttributes(createOperation, null, null);
+    }
+
+    private void testWithBadAttributes(Function<AttributeUpdateCollection, Operation> createOperation,
+                                       Consumer<Operation> checkAfterSuccess, Consumer<Operation> checkAfterRejection) throws Exception {
+        final AttributeId attributeNoUpdate = AttributeId.randomUUID();
+        final AttributeId attributeReplaceIfGreater = AttributeId.randomUUID();
+        final AttributeId attributeReplaceIfEquals = AttributeId.randomUUID();
+        final AttributeId attributeReplaceIfEqualsNullValue = AttributeId.randomUUID();
+        if (checkAfterSuccess == null) {
+            checkAfterSuccess = TestUtils::doNothing;
+        }
+        if (checkAfterRejection == null) {
+            checkAfterRejection = TestUtils::doNothing;
+        }
 
         UpdateableContainerMetadata metadata = createMetadata();
         val txn = createUpdateTransaction(metadata);
         BiFunction<Throwable, Boolean, Boolean> exceptionChecker = (ex, expectNoPreviousValue) ->
-            (ex instanceof BadAttributeUpdateException) && ((BadAttributeUpdateException) ex).isPreviousValueMissing() == expectNoPreviousValue;
+                (ex instanceof BadAttributeUpdateException) && ((BadAttributeUpdateException) ex).isPreviousValueMissing() == expectNoPreviousValue;
 
         // Values not set
-        Collection<AttributeUpdate> attributeUpdates = new ArrayList<>();
+        AttributeUpdateCollection attributeUpdates = new AttributeUpdateCollection();
         attributeUpdates.add(new AttributeUpdate(attributeNoUpdate, AttributeUpdateType.ReplaceIfEquals, 0, 0));
+        val op1 = createOperation.apply(attributeUpdates);
         AssertExtensions.assertThrows(
                 "preProcessOperation accepted an operation that was trying to CAS-update an attribute with no previous value.",
-                () -> txn.preProcessOperation(createOperation.apply(attributeUpdates)),
+                () -> txn.preProcessOperation(op1),
                 ex -> exceptionChecker.apply(ex, true));
+        checkAfterRejection.accept(op1);
 
         // Append #1.
         attributeUpdates.clear();
@@ -376,42 +591,52 @@ public class ContainerMetadataUpdateTransactionTests {
         attributeUpdates.add(new AttributeUpdate(attributeReplaceIfEquals, AttributeUpdateType.Replace, 2)); // Initial Add.
         attributeUpdates.add(new AttributeUpdate(attributeReplaceIfEqualsNullValue, AttributeUpdateType.None, Attributes.NULL_ATTRIBUTE_VALUE));
         val expectedValues = attributeUpdates.stream().collect(Collectors.toMap(AttributeUpdate::getAttributeId, AttributeUpdate::getValue));
+        expectedValues.put(Attributes.ATTRIBUTE_SEGMENT_TYPE, DEFAULT_TYPE.getValue());
 
         Operation op = createOperation.apply(attributeUpdates);
         txn.preProcessOperation(op);
         txn.acceptOperation(op);
+        checkAfterSuccess.accept(op);
 
         // ReplaceIfEquals fails when the current attribute value is NULL_ATTRIBUTE_VALUE (this should not set the IsPreviousValueMissing flag).
         attributeUpdates.clear();
         attributeUpdates.add(new AttributeUpdate(attributeReplaceIfEqualsNullValue, AttributeUpdateType.ReplaceIfEquals, 1, 1));
+        val op2 = createOperation.apply(attributeUpdates);
         AssertExtensions.assertThrows(
                 "preProcessOperation accepted an operation that was trying to CAS-update an attribute with no previous value.",
-                () -> txn.preProcessOperation(createOperation.apply(attributeUpdates)),
+                () -> txn.preProcessOperation(op2),
                 ex -> exceptionChecker.apply(ex, false));
+        checkAfterRejection.accept(op2);
 
         // Append #2: Try to update attribute that cannot be updated.
         attributeUpdates.clear();
         attributeUpdates.add(new AttributeUpdate(attributeNoUpdate, AttributeUpdateType.None, 3));
+        val op3 = createOperation.apply(attributeUpdates);
         AssertExtensions.assertThrows(
                 "preProcessOperation accepted an operation that was trying to update an unmodifiable attribute.",
-                () -> txn.preProcessOperation(createOperation.apply(attributeUpdates)),
+                () -> txn.preProcessOperation(op3),
                 ex -> exceptionChecker.apply(ex, false));
+        checkAfterRejection.accept(op2);
 
         // Append #3: Try to update attribute with bad value for ReplaceIfGreater attribute.
         attributeUpdates.clear();
         attributeUpdates.add(new AttributeUpdate(attributeReplaceIfGreater, AttributeUpdateType.ReplaceIfGreater, 1));
+        val op4 = createOperation.apply(attributeUpdates);
         AssertExtensions.assertThrows(
                 "preProcessOperation accepted an operation that was trying to update an attribute with the wrong value for ReplaceIfGreater.",
-                () -> txn.preProcessOperation(createOperation.apply(attributeUpdates)),
+                () -> txn.preProcessOperation(op4),
                 ex -> exceptionChecker.apply(ex, false));
+        checkAfterRejection.accept(op4);
 
         // Append #4: Try to update attribute with bad value for ReplaceIfEquals attribute.
         attributeUpdates.clear();
         attributeUpdates.add(new AttributeUpdate(attributeReplaceIfEquals, AttributeUpdateType.ReplaceIfEquals, 3, 3));
+        val op5 = createOperation.apply(attributeUpdates);
         AssertExtensions.assertThrows(
                 "preProcessOperation accepted an operation that was trying to update an attribute with the wrong comparison value for ReplaceIfGreater.",
-                () -> txn.preProcessOperation(createOperation.apply(attributeUpdates)),
+                () -> txn.preProcessOperation(op5),
                 ex -> exceptionChecker.apply(ex, false));
+        checkAfterRejection.accept(op5);
 
         // Reset the attribute update list to its original state so we can do the final verification.
         attributeUpdates.clear();
@@ -537,6 +762,7 @@ public class ContainerMetadataUpdateTransactionTests {
         txn.commit(metadata);
 
         // Check attributes.
+        DEFAULT_TYPE.intoAttributes(segmentAttributes);
         SegmentMetadataComparer.assertSameAttributes("Unexpected set of attributes after commit.", segmentAttributes, segmentMetadata);
     }
 
@@ -817,8 +1043,19 @@ public class ContainerMetadataUpdateTransactionTests {
         metadata.enterRecoveryMode();
         val txn1 = createUpdateTransaction(metadata);
 
-        // Brand new StreamSegment.
-        StreamSegmentMapOperation mapOp = createMap();
+        // Brand new Table Segment. Play around with Segment Type to verify that it is properly propagated to the SegmentMetadata.
+        val initialAttributes = createAttributes();
+        DEFAULT_TYPE.intoAttributes(initialAttributes);
+        initialAttributes.put(TableAttributes.INDEX_OFFSET, 0L);
+        val expectedSegmentType = SegmentType.builder(DEFAULT_TYPE).tableSegment().build();
+        val mapOp = new StreamSegmentMapOperation(StreamSegmentInformation.builder()
+                .name(SEGMENT_NAME)
+                .length(SEGMENT_LENGTH)
+                .startOffset(SEGMENT_LENGTH / 2)
+                .sealed(true)
+                .attributes(initialAttributes)
+                .build());
+
         txn1.preProcessOperation(mapOp);
         Assert.assertEquals("preProcessOperation did modify the StreamSegmentId on the operation in recovery mode.",
                 ContainerMetadata.NO_STREAM_SEGMENT_ID, mapOp.getStreamSegmentId());
@@ -856,8 +1093,11 @@ public class ContainerMetadataUpdateTransactionTests {
 
         val segmentMetadata = metadata.getStreamSegmentMetadata(mapOp.getStreamSegmentId());
         Assert.assertFalse("Not expecting segment to be pinned yet.", segmentMetadata.isPinned());
+
+        val expectedAttributes = new HashMap<>(mapOp.getAttributes());
+        expectedSegmentType.intoAttributes(expectedAttributes);
         AssertExtensions.assertMapEquals("Unexpected attributes in SegmentMetadata after call to commit().",
-                mapOp.getAttributes(), segmentMetadata.getAttributes());
+                expectedAttributes, segmentMetadata.getAttributes());
 
         // StreamSegmentName already exists (metadata) and we try to map with new id.
         AssertExtensions.assertThrows(
@@ -907,6 +1147,21 @@ public class ContainerMetadataUpdateTransactionTests {
         txn2.commit(metadata);
         val pinnedMetadata = metadata.getStreamSegmentMetadata(metadata.getStreamSegmentId(pinnedMap.getStreamSegmentName(), false));
         Assert.assertTrue("Unexpected isPinned for pinned map.", pinnedMetadata.isPinned());
+
+        // Truncate offset is beyond the length.
+        val truncateMap = new StreamSegmentMapOperation(StreamSegmentInformation
+                .builder()
+                .name(mapOp.getStreamSegmentName() + "_truncate")
+                .length(storageLength)
+                .startOffset(storageLength) // StreamSegmentInformation does not allow us to exceed Length for this value.
+                .sealed(true)
+                .attributes(createAttributes())
+                .build());
+        txn2.preProcessOperation(truncateMap);
+        txn2.acceptOperation(truncateMap);
+        txn2.commit(metadata);
+        val truncatedMetadata = metadata.getStreamSegmentMetadata(metadata.getStreamSegmentId(truncateMap.getStreamSegmentName(), false));
+        Assert.assertEquals("Unexpected startOffset for over-zealously truncated segment.", truncatedMetadata.getLength(), truncatedMetadata.getStartOffset());
     }
 
     /**
@@ -996,7 +1251,7 @@ public class ContainerMetadataUpdateTransactionTests {
         processOperation(new StreamSegmentAppendOperation(mapOp.getStreamSegmentId(), DEFAULT_APPEND_DATA, extendedAttributeUpdates), txn, seqNo::incrementAndGet);
 
         // Add a Core Attribute.
-        val coreAttributeUpdates = Collections.singletonList(new AttributeUpdate(Attributes.EVENT_COUNT, AttributeUpdateType.Replace, 1));
+        val coreAttributeUpdates = AttributeUpdateCollection.from(new AttributeUpdate(Attributes.EVENT_COUNT, AttributeUpdateType.Replace, 1));
         processOperation(new StreamSegmentAppendOperation(mapOp.getStreamSegmentId(), DEFAULT_APPEND_DATA, coreAttributeUpdates),
                 txn, seqNo::incrementAndGet);
         val checkpoint2Contents = processCheckpointOperation(checkpoint2, txn, seqNo::incrementAndGet);
@@ -1242,7 +1497,7 @@ public class ContainerMetadataUpdateTransactionTests {
         Assert.assertEquals("commit() seems to have modified the metadata sequence number while not in recovery mode.",
                 ContainerMetadata.INITIAL_OPERATION_SEQUENCE_NUMBER, targetMetadata.nextOperationSequenceNumber() - 1);
 
-        long expectedLength = SEGMENT_LENGTH + appendCount * DEFAULT_APPEND_DATA.length + SEALED_SOURCE_LENGTH;
+        long expectedLength = SEGMENT_LENGTH + appendCount * DEFAULT_APPEND_DATA.getLength() + SEALED_SOURCE_LENGTH;
 
         SegmentMetadata parentMetadata = targetMetadata.getStreamSegmentMetadata(SEGMENT_ID);
         Assert.assertEquals("Unexpected Length in metadata after commit.", expectedLength, parentMetadata.getLength());
@@ -1252,9 +1507,11 @@ public class ContainerMetadataUpdateTransactionTests {
         SegmentMetadata transactionMetadata = targetMetadata.getStreamSegmentMetadata(SEALED_SOURCE_ID);
         Assert.assertTrue("Unexpected value for isSealed in Source metadata after commit.", transactionMetadata.isSealed());
         Assert.assertTrue("Unexpected value for isMerged in Source metadata after commit.", transactionMetadata.isMerged());
-        int expectedParentAttributeCount = appendAttributeCount + (baseMetadata == targetMetadata ? 1 : 0);
+        int expectedParentAttributeCount = appendAttributeCount + (baseMetadata == targetMetadata ? 1 : 0) + 1;
         Assert.assertEquals("Unexpected number of attributes for Target segment.", expectedParentAttributeCount, parentMetadata.getAttributes().size());
-        Assert.assertEquals("Unexpected number of attributes for Source.", 0, transactionMetadata.getAttributes().size());
+        Assert.assertEquals(DEFAULT_TYPE.getValue(), (long) parentMetadata.getAttributes().get(Attributes.ATTRIBUTE_SEGMENT_TYPE));
+        Assert.assertEquals("Unexpected number of attributes for Source.", 1, transactionMetadata.getAttributes().size());
+        Assert.assertEquals(DEFAULT_TYPE.getValue(), (long) transactionMetadata.getAttributes().get(Attributes.ATTRIBUTE_SEGMENT_TYPE));
         checkLastKnownSequenceNumber("Unexpected lastUsed for Source after commit.", expectedLastUsedTransaction, transactionMetadata);
     }
 
@@ -1314,7 +1571,7 @@ public class ContainerMetadataUpdateTransactionTests {
 
         txn.clear();
 
-        long expectedLength = SEGMENT_LENGTH + DEFAULT_APPEND_DATA.length;
+        long expectedLength = SEGMENT_LENGTH + DEFAULT_APPEND_DATA.getLength();
 
         // Verify metadata is untouched and that the updater has truly rolled back.
         SegmentMetadata parentMetadata = metadata.getStreamSegmentMetadata(SEGMENT_ID);
@@ -1390,6 +1647,89 @@ public class ContainerMetadataUpdateTransactionTests {
                 expected + 2, txn2.getActiveSegmentCount());
     }
 
+    @Test
+    public void testOperationConcurrentSerializationDeletion() throws ContainerException, StreamSegmentException {
+        CompletableFuture<Void> deletion = new CompletableFuture<>();
+
+        InstrumentedContainerMetadata metadata = new InstrumentedContainerMetadata(CONTAINER_ID, 1000, deletion);
+        // Add some segments to the metadata.
+        populateMetadata(metadata);
+
+        metadata.getGetAllStreamSegmentIdsFuture().thenRun(() -> {
+            // Cannot call getStreamSegmentMetadata because it is instrumented and will block, so we must manually construct it.
+            UpdateableSegmentMetadata segment = new StreamSegmentMetadata(SEGMENT_NAME, SEGMENT_ID, 0);
+            // Ensures it is eligible for eviction.
+            segment.markDeleted();
+            metadata.cleanup(Set.of(segment), SEGMENT_LENGTH);
+        }).thenRun(() -> {
+            deletion.complete(null);
+        });
+
+        ContainerMetadataUpdateTransaction transaction = createUpdateTransaction(metadata);
+        StorageMetadataCheckpointOperation checkpoint = createStorageMetadataCheckpoint();
+
+        // If successful this operation should not throw a NullPointerException.
+        transaction.preProcessOperation(checkpoint);
+    }
+
+    /**
+     * Tests that a Transient Segment may only have {@link SegmentMetadataUpdateTransaction#TRANSIENT_ATTRIBUTE_LIMIT}
+     * or fewer Extended Attributes.
+     */
+    @Test
+    public void testTransientSegmentExtendedAttributeLimit() throws ContainerException, StreamSegmentException {
+       // Create base metadata with one Transient Segment.
+       UpdateableContainerMetadata metadata = createMetadataTransient();
+       int expected = 1;
+        Assert.assertEquals("Unexpected initial Active Segment Count for base metadata.",
+                expected, metadata.getActiveSegmentCount());
+
+        // Create an UpdateTransaction containing updates for Extended Attributes on the Transient Segment -- it should succeed.
+        val txn1 = new ContainerMetadataUpdateTransaction(metadata, metadata, 0);
+        Assert.assertEquals("Unexpected Active Segment Count for first transaction.",
+                expected, txn1.getActiveSegmentCount());
+        // Subtract one from remaining due to Segment Type Attribute.
+        long id = SegmentMetadataUpdateTransaction.TRANSIENT_ATTRIBUTE_LIMIT - (TRANSIENT_ATTRIBUTE_REMAINING - 1);
+        AttributeUpdateCollection attributes = AttributeUpdateCollection.from(
+                // The new entry.
+                new AttributeUpdate(AttributeId.uuid(Attributes.CORE_ATTRIBUTE_ID_PREFIX + 1, id), AttributeUpdateType.None, id),
+                // Update two old entries.
+                new AttributeUpdate(AttributeId.uuid(Attributes.CORE_ATTRIBUTE_ID_PREFIX + 1, 0), AttributeUpdateType.Replace, (long) 1),
+                new AttributeUpdate(AttributeId.uuid(Attributes.CORE_ATTRIBUTE_ID_PREFIX + 1, 1), AttributeUpdateType.Replace, (long) 2)
+        );
+        val map1 = createTransientAppend(TRANSIENT_SEGMENT_ID, attributes);
+        txn1.preProcessOperation(map1);
+        map1.setSequenceNumber(metadata.nextOperationSequenceNumber());
+        txn1.acceptOperation(map1);
+
+        int expectedExtendedAttributes = SegmentMetadataUpdateTransaction.TRANSIENT_ATTRIBUTE_LIMIT - (TRANSIENT_ATTRIBUTE_REMAINING - 1);
+        SegmentMetadata segmentMetadata = txn1.getStreamSegmentMetadata(TRANSIENT_SEGMENT_ID);
+        Assert.assertEquals("Unexpected Extended Attribute count after first transaction.",
+                expectedExtendedAttributes, segmentMetadata.getAttributes().size());
+
+        val txn2 = new ContainerMetadataUpdateTransaction(txn1, metadata, 1);
+        // Add two new Extended Attributes which should exceed the set limit.
+        attributes = AttributeUpdateCollection.from(
+                new AttributeUpdate(AttributeId.uuid(Attributes.CORE_ATTRIBUTE_ID_PREFIX + 1, ++id), AttributeUpdateType.None, (long) 0),
+                new AttributeUpdate(AttributeId.uuid(Attributes.CORE_ATTRIBUTE_ID_PREFIX + 1, ++id ), AttributeUpdateType.None, (long) 0)
+        );
+        // Should not fail as there was space before the operation, so accept any new additions.
+        val map2 = createTransientAppend(TRANSIENT_SEGMENT_ID, attributes);
+        txn2.preProcessOperation(map2);
+        txn2.acceptOperation(map2);
+        // Since we are now over the limit, enforce that no new Extended Attributes may be added.
+        val txn3 = new ContainerMetadataUpdateTransaction(txn2, metadata, 2);
+        // Expect another Attribute addition to fail as the limit has been exceeded.
+        val map3 = createTransientAppend(TRANSIENT_SEGMENT_ID, AttributeUpdateCollection.from(
+            new AttributeUpdate(AttributeId.uuid(Attributes.CORE_ATTRIBUTE_ID_PREFIX + 1, ++id), AttributeUpdateType.None, (long) 0)
+        ));
+        AssertExtensions.assertThrows(
+                "Exception was not thrown when too many Extended Attributes were registered.",
+                () -> txn3.preProcessOperation(map3),
+                ex -> ex instanceof MetadataUpdateException
+        );
+    }
+
     //endregion
 
     //region Helpers
@@ -1398,21 +1738,46 @@ public class ContainerMetadataUpdateTransactionTests {
         return new MetadataBuilder(CONTAINER_ID).build();
     }
 
-    private UpdateableContainerMetadata createMetadata() {
-        UpdateableContainerMetadata metadata = createBlankMetadata();
+    private UpdateableContainerMetadata populateMetadata(UpdateableContainerMetadata metadata) {
         UpdateableSegmentMetadata segmentMetadata = metadata.mapStreamSegmentId(SEGMENT_NAME, SEGMENT_ID);
         segmentMetadata.setLength(SEGMENT_LENGTH);
         segmentMetadata.setStorageLength(SEGMENT_LENGTH - 1); // Different from Length.
+        segmentMetadata.refreshDerivedProperties();
 
         segmentMetadata = metadata.mapStreamSegmentId(SEALED_SOURCE_NAME, SEALED_SOURCE_ID);
         segmentMetadata.setLength(SEALED_SOURCE_LENGTH);
         segmentMetadata.setStorageLength(SEALED_SOURCE_LENGTH);
         segmentMetadata.markSealed();
+        segmentMetadata.refreshDerivedProperties();
 
         segmentMetadata = metadata.mapStreamSegmentId(NOTSEALED_SOURCE_NAME, NOTSEALED_SOURCE_ID);
         segmentMetadata.setLength(0);
         segmentMetadata.setStorageLength(0);
+        segmentMetadata.refreshDerivedProperties();
 
+        return metadata;
+    }
+
+    private UpdateableContainerMetadata createMetadataTransient() {
+        UpdateableContainerMetadata metadata = createBlankMetadata();
+        UpdateableSegmentMetadata segmentMetadata = metadata.mapStreamSegmentId(TRANSIENT_SEGMENT_NAME, TRANSIENT_SEGMENT_ID);
+        segmentMetadata.setLength(SEGMENT_LENGTH);
+        segmentMetadata.setStorageLength(SEGMENT_LENGTH - 1);
+
+        Map<AttributeId, Long> attributes = new HashMap<>();
+        attributes.put(Attributes.ATTRIBUTE_SEGMENT_TYPE, SegmentType.TRANSIENT_SEGMENT.getValue());
+        for (long i = 0; i < SegmentMetadataUpdateTransaction.TRANSIENT_ATTRIBUTE_LIMIT - (TRANSIENT_ATTRIBUTE_REMAINING + 1); i++) {
+            attributes.put(AttributeId.uuid(Attributes.CORE_ATTRIBUTE_ID_PREFIX + 1, i), i);
+        }
+        segmentMetadata.updateAttributes(attributes);
+        segmentMetadata.refreshDerivedProperties();
+
+        return metadata;
+    }
+
+    private UpdateableContainerMetadata createMetadata() {
+        UpdateableContainerMetadata metadata = createBlankMetadata();
+        populateMetadata(metadata);
         return metadata;
     }
 
@@ -1428,15 +1793,15 @@ public class ContainerMetadataUpdateTransactionTests {
         return new StreamSegmentAppendOperation(SEGMENT_ID, offset, DEFAULT_APPEND_DATA, createAttributeUpdates());
     }
 
-    private Collection<AttributeUpdate> createAttributeUpdates() {
+    private AttributeUpdateCollection createAttributeUpdates() {
         return Arrays.stream(ATTRIBUTE_UPDATE_TYPES)
-                     .map(ut -> new AttributeUpdate(UUID.randomUUID(), ut, NEXT_ATTRIBUTE_VALUE.get()))
-                     .collect(Collectors.toList());
+                     .map(ut -> new AttributeUpdate(AttributeId.randomUUID(), ut, NEXT_ATTRIBUTE_VALUE.get()))
+                     .collect(Collectors.toCollection(AttributeUpdateCollection::new));
     }
 
-    private Map<UUID, Long> createAttributes() {
+    private Map<AttributeId, Long> createAttributes() {
         return Arrays.stream(ATTRIBUTE_UPDATE_TYPES)
-                     .collect(Collectors.toMap(a -> UUID.randomUUID(), a -> NEXT_ATTRIBUTE_VALUE.get()));
+                     .collect(Collectors.toMap(a -> AttributeId.randomUUID(), a -> NEXT_ATTRIBUTE_VALUE.get()));
     }
 
     private StreamSegmentSealOperation createSeal() {
@@ -1477,6 +1842,10 @@ public class ContainerMetadataUpdateTransactionTests {
                                         .sealed(true)
                                         .attributes(createAttributes())
                                         .build());
+    }
+
+    private StreamSegmentAppendOperation createTransientAppend(long id,  AttributeUpdateCollection attributes) {
+        return new StreamSegmentAppendOperation(id,  new ByteArraySegment(new byte[10]), attributes);
     }
 
     private MetadataCheckpointOperation createMetadataCheckpoint() {
@@ -1549,15 +1918,15 @@ public class ContainerMetadataUpdateTransactionTests {
         }
     }
 
-    private void verifyAttributeUpdates(String stepName, ContainerMetadata containerMetadata, Collection<AttributeUpdate> attributeUpdates, Map<UUID, Long> expectedValues) {
+    private void verifyAttributeUpdates(String stepName, ContainerMetadata containerMetadata, Collection<AttributeUpdate> attributeUpdates, Map<AttributeId, Long> expectedValues) {
         // Verify that the Attribute Updates have their expected values and that the updater has internalized the attribute updates.
         val transactionMetadata = containerMetadata.getStreamSegmentMetadata(SEGMENT_ID);
-        val expectedTransactionAttributes = new HashMap<UUID, Long>(expectedValues);
+        val expectedTransactionAttributes = new HashMap<>(expectedValues);
         attributeUpdates.forEach(au -> expectedTransactionAttributes.put(au.getAttributeId(), au.getValue()));
         SegmentMetadataComparer.assertSameAttributes("Unexpected attributes in transaction metadata " + stepName + ".",
                 expectedTransactionAttributes, transactionMetadata);
         for (AttributeUpdate au : attributeUpdates) {
-            Assert.assertEquals("Unexpected updated value for AttributeUpdate[" + au.getUpdateType() + "] " + stepName,
+            Assert.assertEquals("Unexpected updated value for [" + au + "] " + stepName,
                     (long) expectedValues.get(au.getAttributeId()), au.getValue());
         }
     }
@@ -1568,4 +1937,47 @@ public class ContainerMetadataUpdateTransactionTests {
     }
 
     //endregion
+
+    private static class InstrumentedContainerMetadata extends StreamSegmentContainerMetadata {
+
+        // This future is provided by the caller to ensure that the getStreamSegmentMetadata call will not make progress
+        // until the caller performs its intended duties.
+        CompletableFuture<Void> deletion;
+
+        // This future is made visible to allow the caller to ensure that it does not make progress until the
+        // getAllStreamSegmentIds call is complete.
+        final CompletableFuture<Void> getAllStreamSegmentIdsFuture = new CompletableFuture<>();
+
+        /**
+         * Creates a new instance of the StreamSegmentContainerMetadata.
+         *
+         * @param streamSegmentContainerId The ID of the StreamSegmentContainer.
+         * @param maxActiveSegmentCount    The maximum number of segments that can be registered in this metadata at any given time.
+         */
+        public InstrumentedContainerMetadata(int streamSegmentContainerId, int maxActiveSegmentCount, CompletableFuture<Void> deletion) {
+            super(streamSegmentContainerId, maxActiveSegmentCount);
+            this.deletion = deletion;
+        }
+
+        public CompletableFuture<Void> getGetAllStreamSegmentIdsFuture() {
+            return this.getAllStreamSegmentIdsFuture;
+        }
+
+        @Override
+        public Collection<Long> getAllStreamSegmentIds() {
+            Collection<Long> ids = super.getAllStreamSegmentIds();
+            // Complete the future to signal this event has happened.
+            getAllStreamSegmentIdsFuture.complete(null);
+
+            return ids;
+        }
+
+        @Override
+        public UpdateableSegmentMetadata getStreamSegmentMetadata(long streamSegmentId) {
+            // Wait for the deletion event to happen.
+            return deletion.thenApply(empty -> super.getStreamSegmentMetadata(streamSegmentId)).join();
+        }
+
+    }
+
 }

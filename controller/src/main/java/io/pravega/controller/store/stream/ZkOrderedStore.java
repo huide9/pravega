@@ -1,11 +1,17 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.controller.store.stream;
 
@@ -13,10 +19,12 @@ import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Charsets;
 import io.pravega.common.Exceptions;
 import io.pravega.common.concurrent.Futures;
+import io.pravega.common.tracing.TagLogger;
+import io.pravega.controller.store.ZKStoreHelper;
 import lombok.AllArgsConstructor;
 import lombok.Data;
-import lombok.extern.slf4j.Slf4j;
 import org.apache.curator.utils.ZKPaths;
+import org.slf4j.LoggerFactory;
 
 import java.util.Collection;
 import java.util.Collections;
@@ -42,8 +50,8 @@ import static io.pravega.controller.store.stream.ZKStreamMetadataStore.DATA_NOT_
  * Overall we can create Integer.Max new collections. This means overall we have approximately Long.Max entries that 
  * each ordered collection can support in its lifetime. 
  */
-@Slf4j
 class ZkOrderedStore {
+    private static final TagLogger log = new TagLogger(LoggerFactory.getLogger(ZkOrderedStore.class));
     private static final String COLLECTIONS_NODE = "collections";
     private static final String SEALED_NODE = "sealed";
     private static final String ENTITIES_NODE = "entities";
@@ -88,41 +96,47 @@ class ZkOrderedStore {
      * @param scope scope
      * @param stream stream 
      * @param entity entity to add
+     * @param requestId
      * @return CompletableFuture which when completed returns the position where the entity is added to the set. 
      */
-    CompletableFuture<Long> addEntity(String scope, String stream, String entity) {
+    CompletableFuture<Long> addEntity(String scope, String stream, String entity, long requestId) {
         // add persistent sequential node to the latest collection number 
         // if collectionNum is sealed, increment collection number and write the entity there. 
         return getLatestCollection(scope, stream)
-                .thenCompose(latestcollectionNum ->
-                        storeHelper.createPersistentSequentialZNode(getEntitySequentialPath(scope, stream, latestcollectionNum),
-                                entity.getBytes(Charsets.UTF_8))
-                                   .thenCompose(positionPath -> {
-                                       int position = getPositionFromPath(positionPath);
-                                       if (position > rollOverAfter) {
-                                           // if newly created position exceeds rollover limit, we need to delete that entry 
-                                           // and roll over. 
-                                           // 1. delete newly created path
-                                           return storeHelper.deletePath(positionPath, false)
-                                                             // 2. seal latest collection
-                                                             .thenCompose(v -> storeHelper.createZNodeIfNotExist(
-                                                                     getCollectionSealedPath(scope, stream, latestcollectionNum)))
-                                                             // 3. call addEntity recursively
-                                                             .thenCompose(v -> addEntity(scope, stream, entity))
-                                                             // 4. delete empty sealed collection path
-                                                             .thenCompose(orderedPosition -> 
-                                                                     tryDeleteSealedCollection(scope, stream, latestcollectionNum)
-                                                                     .thenApply(v -> orderedPosition));
-
-                                       } else {
-                                           return CompletableFuture.completedFuture(Position.toLong(latestcollectionNum, position));
-                                       }
-                                   }))
+                .thenCompose(latestcollectionNum -> {
+                    return storeHelper.createPersistentSequentialZNode(getEntitySequentialPath(scope, stream, latestcollectionNum), entity.getBytes(Charsets.UTF_8))
+                        .thenCompose(positionPath -> {
+                            int position = getPositionFromPath(positionPath);
+                            if (position > rollOverAfter) {
+                                // if newly created position exceeds rollover limit, we need to delete that entry 
+                                // and roll over. 
+                                // 1. delete newly created path
+                                return storeHelper.deletePath(positionPath, false)
+                                                  // 2. seal latest collection
+                                                  .thenCompose(v -> storeHelper.createZNodeIfNotExist(
+                                                          getCollectionSealedPath(scope, stream, latestcollectionNum)))
+                                                  // 3. create new collection and put the entity in
+                                                  .thenCompose(v -> {
+                                                      String path = getEntitySequentialPath(scope, stream, latestcollectionNum + 1);
+                                                      return storeHelper.createPersistentSequentialZNode(path, entity.getBytes(Charsets.UTF_8));
+                                                  })
+                                                  .thenApply(newPositionPath -> Position.toLong(latestcollectionNum + 1, getPositionFromPath(newPositionPath)))
+                                                  // 4. delete empty sealed collection path
+                                                  .thenCompose(orderedPosition -> {
+                                                      return tryDeleteSealedCollection(scope, stream, latestcollectionNum).thenApply(v -> orderedPosition);
+                                                  });
+                            } else {
+                                return CompletableFuture.completedFuture(Position.toLong(latestcollectionNum, position));
+                            }
+                        });
+                    })
                 .whenComplete((r, e) -> {
                     if (e != null) {
-                        log.error("error encountered while trying to add entity {} for stream {}/{}", entity, scope, stream, e);
+                        log.error(requestId, 
+                                "error encountered while trying to add entity {} for stream {}/{}", entity, scope, stream, e);
                     } else {
-                        log.debug("entity {} added for stream {}/{} at position {}", entity, scope, stream, r);
+                        log.debug(requestId, 
+                                "entity {} added for stream {}/{} at position {}", entity, scope, stream, r);
                     }
                 });
     }
@@ -167,34 +181,38 @@ class ZkOrderedStore {
      */
     CompletableFuture<Map<Long, String>> getEntitiesWithPosition(String scope, String stream) {
         Map<Long, String> result = new ConcurrentHashMap<>();
-        return Futures.exceptionallyExpecting(storeHelper.getChildren(getCollectionsPath(scope, stream)), DATA_NOT_FOUND_PREDICATE, Collections.emptyList())
-                          .thenCompose(children -> {
-                              // start with smallest collection and collect records
-                              List<Integer> iterable = children.stream().map(Integer::parseInt).collect(Collectors.toList());
-                              
-                              return Futures.loop(iterable, collectionNumber -> {
-                                  return Futures.exceptionallyExpecting(storeHelper.getChildren(getEntitiesPath(scope, stream, collectionNumber)),
-                                                    DATA_NOT_FOUND_PREDICATE, Collections.emptyList())
-                                                    .thenCompose(entities -> Futures.allOf(
-                                                                    entities.stream().map(x -> {
-                                                                        int pos = getPositionFromPath(x);
-                                                                        return storeHelper.getData(getEntityPath(scope, stream, collectionNumber, pos),
-                                                                                m -> new String(m, Charsets.UTF_8))
-                                                                                          .thenAccept(r -> {
-                                                                                              result.put(Position.toLong(collectionNumber, pos),
-                                                                                                      r.getObject());
-                                                                                          });
-                                                                    }).collect(Collectors.toList()))
-                                                    ).thenApply(v -> true);
-                              }, executor);
-                          }).thenApply(v -> result)
-                      .whenComplete((r, e) -> {
-                          if (e != null) {
-                              log.error("error encountered while trying to retrieve entities for stream {}/{}", scope, stream, e);
-                          } else {
-                              log.debug("entities at positions {} retrieved for stream {}/{}", r, scope, stream);
-                          }
-                      });
+        String collectionsPath = getCollectionsPath(scope, stream);
+        return storeHelper.sync(collectionsPath)
+                          .thenCompose(z -> {
+                    return Futures.exceptionallyExpecting(storeHelper.getChildren(collectionsPath), DATA_NOT_FOUND_PREDICATE, Collections.emptyList())
+                                  .thenCompose(children -> {
+                                      // start with smallest collection and collect records
+                                      List<Integer> iterable = children.stream().map(Integer::parseInt).collect(Collectors.toList());
+
+                                      return Futures.loop(iterable, collectionNumber -> {
+                                          return Futures.exceptionallyExpecting(storeHelper.getChildren(getEntitiesPath(scope, stream, collectionNumber)),
+                                                  DATA_NOT_FOUND_PREDICATE, Collections.emptyList())
+                                                        .thenCompose(entities -> Futures.allOf(
+                                                                entities.stream().map(x -> {
+                                                                    int pos = getPositionFromPath(x);
+                                                                    return storeHelper.getData(getEntityPath(scope, stream, collectionNumber, pos),
+                                                                            m -> new String(m, Charsets.UTF_8))
+                                                                                      .thenAccept(r -> {
+                                                                                          result.put(Position.toLong(collectionNumber, pos),
+                                                                                                  r.getObject());
+                                                                                      });
+                                                                }).collect(Collectors.toList()))
+                                                        ).thenApply(v -> true);
+                                      }, executor);
+                                  }).thenApply(v -> result)
+                                  .whenComplete((r, e) -> {
+                                      if (e != null) {
+                                          log.error("error encountered while trying to retrieve entities for stream {}/{}", scope, stream, e);
+                                      } else {
+                                          log.debug("entities at positions {} retrieved for stream {}/{}", r, scope, stream);
+                                      }
+                                  });
+                });
 
     }
 

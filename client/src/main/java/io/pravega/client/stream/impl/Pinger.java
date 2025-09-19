@@ -1,18 +1,27 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.client.stream.impl;
 
 import com.google.common.annotations.VisibleForTesting;
-import io.pravega.client.stream.EventWriterConfig;
+import io.grpc.Status;
+import io.grpc.StatusRuntimeException;
+import io.pravega.client.control.impl.Controller;
 import io.pravega.client.stream.Stream;
 import io.pravega.client.stream.Transaction;
+import io.pravega.common.Exceptions;
 import java.util.HashSet;
 import java.util.Set;
 import java.util.UUID;
@@ -30,15 +39,12 @@ import static io.pravega.common.Exceptions.unwrap;
 
 /**
  * Pinger is used to send pings to renew the transaction lease for active transactions.
- * It invokes io.pravega.client.stream.impl.Controller#pingTransaction() on the controller to renew the lease of active
+ * It invokes io.pravega.client.control.impl.Controller#pingTransaction() on the controller to renew the lease of active
  * transactions. Incase of a controller instance not being reachable the controller client takes care of retrying on a
- * different controller instance see io.pravega.client.stream.impl.ControllerResolverFactory for details.
+ * different controller instance see io.pravega.client.control.impl.ControllerResolverFactory for details.
  */
 @Slf4j
 public class Pinger implements AutoCloseable {
-    private static final double PING_INTERVAL_FACTOR = 0.5; //ping interval = factor * txn lease time.
-    private static final long MINIMUM_PING_INTERVAL_MS = TimeUnit.SECONDS.toMillis(10);
-
     private final Stream stream;
     private final Controller controller;
     private final long txnLeaseMillis;
@@ -54,9 +60,9 @@ public class Pinger implements AutoCloseable {
     private final AtomicBoolean isStarted = new AtomicBoolean();
     private final AtomicReference<ScheduledFuture<?>> scheduledFuture = new AtomicReference<>();
 
-    Pinger(EventWriterConfig config, Stream stream, Controller controller, ScheduledExecutorService executor) {
-        this.txnLeaseMillis = config.getTransactionTimeoutTime();
-        this.pingIntervalMillis = getPingInterval(txnLeaseMillis);
+    Pinger(long txnLeaseMillis, Stream stream, Controller controller, ScheduledExecutorService executor) {
+        this.txnLeaseMillis = txnLeaseMillis;
+        this.pingIntervalMillis = getPingInterval();
         this.stream = stream;
         this.controller = controller;
         this.executor = executor;
@@ -75,13 +81,11 @@ public class Pinger implements AutoCloseable {
         }
     }
 
-    private long getPingInterval(long txnLeaseMillis) {
-        double pingInterval = txnLeaseMillis * PING_INTERVAL_FACTOR;
-        if (pingInterval < MINIMUM_PING_INTERVAL_MS) {
-            log.warn("Transaction ping interval is less than 10 seconds(lower bound)");
-        }
-        //Ping interval cannot be less than KeepAlive task interval of 10seconds.
-        return Math.max(MINIMUM_PING_INTERVAL_MS, (long) pingInterval);
+    private long getPingInterval() {
+        //Provides a good number of attempts: 1 for <4s, 2 for <9s, 3 for <16s, 4 for <25s, ... 10 for <100s
+        //while at the same time allowing the interval to grow as the timeout gets larger.
+        double targetNumPings = Math.max(1, Math.sqrt(txnLeaseMillis / 1000.0));
+        return Math.round(txnLeaseMillis / targetNumPings);
     }
 
     private void startPeriodicPingTxn() {
@@ -107,6 +111,12 @@ public class Pinger implements AutoCloseable {
                     controller.pingTransaction(stream, uuid, txnLeaseMillis)
                               .whenComplete((status, e) -> {
                                   if (e != null) {
+                                      Throwable unwrap = Exceptions.unwrap(e);
+                                      if (unwrap instanceof StatusRuntimeException && 
+                                              ((StatusRuntimeException) unwrap).getStatus().equals(Status.NOT_FOUND)) {
+                                          log.info("Ping Transaction for txn ID:{} did not find the transaction", uuid);
+                                          completedTxns.add(uuid);
+                                      }
                                       log.warn("Ping Transaction for txn ID:{} failed", uuid, unwrap(e));
                                   } else if (Transaction.PingStatus.ABORTED.equals(status) || Transaction.PingStatus.COMMITTED.equals(status)) {
                                       completedTxns.add(uuid);

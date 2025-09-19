@@ -1,20 +1,26 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright Pravega Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package io.pravega.segmentstore.server.tables;
 
 import io.pravega.common.TimeoutTimer;
 import io.pravega.common.util.ByteArraySegment;
-import io.pravega.common.util.HashedArray;
 import io.pravega.segmentstore.contracts.tables.TableEntry;
 import io.pravega.segmentstore.contracts.tables.TableKey;
 import io.pravega.segmentstore.server.DirectSegmentAccess;
+import io.pravega.segmentstore.server.SegmentMock;
 import io.pravega.test.common.AssertExtensions;
 import io.pravega.test.common.ThreadPooledTestSuite;
 import java.time.Duration;
@@ -63,7 +69,7 @@ public class TableBucketReaderTests extends ThreadPooledTestSuite {
 
         // Generate our test data and append it to the segment.
         val data = generateData();
-        segment.append(data.serialization, null, TIMEOUT).join();
+        segment.append(new ByteArraySegment(data.serialization), null, TIMEOUT).join();
         val reader = TableBucketReader.key(segment,
                 (s, offset, timeout) -> CompletableFuture.completedFuture(data.getBackpointer(offset)),
                 executorService());
@@ -72,7 +78,7 @@ public class TableBucketReaderTests extends ThreadPooledTestSuite {
         val validKey = data.entries.get(1).getKey();
         val validResult = reader.find(validKey.getKey(), data.getBucketOffset(), new TimeoutTimer(TIMEOUT)).get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
         Assert.assertEquals("Unexpected version from valid key.", data.getEntryOffset(1), validResult.getVersion());
-        Assert.assertTrue("Unexpected 'valid' key returned.", HashedArray.arrayEquals(validKey.getKey(), validResult.getKey()));
+        Assert.assertEquals("Unexpected 'valid' key returned.", validKey.getKey(), validResult.getKey());
 
         // Check a key that does not exist.
         val invalidKey = data.unlinkedEntry.getKey();
@@ -89,7 +95,7 @@ public class TableBucketReaderTests extends ThreadPooledTestSuite {
 
         // Generate our test data and append it to the segment.
         val data = generateData();
-        segment.append(data.serialization, null, TIMEOUT).join();
+        segment.append(new ByteArraySegment(data.serialization), null, TIMEOUT).join();
         val reader = TableBucketReader.entry(segment,
                 (s, offset, timeout) -> CompletableFuture.completedFuture(data.getBackpointer(offset)),
                 executorService());
@@ -98,8 +104,8 @@ public class TableBucketReaderTests extends ThreadPooledTestSuite {
         val validEntry = data.entries.get(1);
         val validResult = reader.find(validEntry.getKey().getKey(), data.getBucketOffset(), new TimeoutTimer(TIMEOUT)).get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
         Assert.assertEquals("Unexpected version from valid key.", data.getEntryOffset(1), validResult.getKey().getVersion());
-        Assert.assertTrue("Unexpected 'valid' key returned.", HashedArray.arrayEquals(validEntry.getKey().getKey(), validResult.getKey().getKey()));
-        Assert.assertTrue("Unexpected 'valid' key returned.", HashedArray.arrayEquals(validEntry.getValue(), validResult.getValue()));
+        Assert.assertEquals("Unexpected 'valid' key returned.", validEntry.getKey().getKey(), validResult.getKey().getKey());
+        Assert.assertEquals("Unexpected 'valid' key returned.", validEntry.getValue(), validResult.getValue());
 
         // Check a key that does not exist.
         val invalidKey = data.unlinkedEntry.getKey();
@@ -120,15 +126,14 @@ public class TableBucketReaderTests extends ThreadPooledTestSuite {
 
         // Deleted key (that was previously indexed).
         val deletedKey = entries.get(0).getKey();
-        byte[] data = new byte[es.getRemovalLength(deletedKey)];
-        es.serializeRemoval(Collections.singleton(deletedKey), data);
+        val data = es.serializeRemoval(Collections.singleton(deletedKey));
         segment.append(data, null, TIMEOUT).join();
         val reader = TableBucketReader.entry(segment,
                 (s, offset, timeout) -> CompletableFuture.completedFuture(-1L), // No backpointers.
                 executorService());
 
         val deletedResult = reader.find(deletedKey.getKey(), 0L, new TimeoutTimer(TIMEOUT)).get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
-        Assert.assertNull("Expecting a TableEntry with null value for deleted key..", deletedResult.getValue());
+        Assert.assertNull("Expecting a TableEntry with null value for deleted key.", deletedResult.getValue());
 
         // Inexistent key (that did not exist previously).
         val inexistentKey = entries.get(1).getKey();
@@ -158,13 +163,12 @@ public class TableBucketReaderTests extends ThreadPooledTestSuite {
 
         // Generate our test data and append it to the segment.
         val data = generateData();
-        segment.append(data.serialization, null, TIMEOUT).join();
+        segment.append(new ByteArraySegment(data.serialization), null, TIMEOUT).join();
 
         // Generate a deleted key and append it to the segment.
         val deletedKey = data.entries.get(0).getKey();
         val es = new EntrySerializer();
-        byte[] deletedData = new byte[es.getRemovalLength(deletedKey)];
-        es.serializeRemoval(Collections.singleton(deletedKey), deletedData);
+        val deletedData = es.serializeRemoval(Collections.singleton(deletedKey));
         long newBucketOffset = segment.append(deletedData, null, TIMEOUT).join();
         data.backpointers.put(newBucketOffset, data.getBucketOffset());
 
@@ -187,8 +191,7 @@ public class TableBucketReaderTests extends ThreadPooledTestSuite {
         val s = new EntrySerializer();
         val entries = generateEntries(s);
         val length = entries.stream().mapToInt(s::getUpdateLength).sum();
-        byte[] serialization = new byte[length];
-        s.serializeUpdate(entries, serialization);
+        val serialization = s.serializeUpdate(entries).getCopy();
         val backpointers = new HashMap<Long, Long>();
 
         // The first entry is not linked; we use that to search for inexistent keys.
